@@ -12,6 +12,14 @@ pub struct Calendar {
     pub id: String,
     /// Server path to the collection, e.g. `/1234/calendars/home/`.
     pub href: String,
+    /// Absolute URL to address the collection.
+    ///
+    /// Kept separately from `href` because it is not always
+    /// `server_url + href`: iCloud shards accounts onto partition hosts, so a
+    /// calendar discovered via `caldav.icloud.com` actually lives on
+    /// `pNN-caldav.icloud.com`. Requests must use this.
+    #[serde(default)]
+    pub url: String,
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -84,8 +92,13 @@ pub struct Event {
     pub calendar: String,
     /// Path to the calendar collection.
     pub calendar_href: String,
-    /// Path to the `.ics` resource itself, used for PUT/DELETE.
+    /// Path to the `.ics` resource itself.
     pub href: String,
+    /// Absolute URL of the `.ics` resource, used for PUT/DELETE. Distinct from
+    /// `url`, which is the event's own `URL` property. See [`Calendar::url`]
+    /// for why this isn't derived from `href`.
+    #[serde(default)]
+    pub resource_url: String,
     #[serde(default)]
     pub etag: Option<String>,
     #[serde(default)]
@@ -105,6 +118,11 @@ pub struct Event {
     /// Raw `RRULE` value, e.g. `FREQ=WEEKLY;BYDAY=MO`.
     #[serde(default)]
     pub recurrence: Option<String>,
+    /// The recurrence properties (`DTSTART`, `RRULE`, `RDATE`, `EXDATE`) as
+    /// they appeared on the wire, ready to hand to the expander. Not
+    /// serialised — `recurrence` is the human-facing rule.
+    #[serde(skip)]
+    pub recur_source: Option<String>,
     /// Set on a single occurrence of a recurring series — either an expanded
     /// instance or a server-side override. The `id` stays the series `UID`, so
     /// `recurrenceId` is what distinguishes one occurrence from another.
@@ -234,6 +252,7 @@ mod tests {
             calendar: "Home".into(),
             calendar_href: "/cal/home/".into(),
             href: "/cal/home/uid-1.ics".into(),
+            resource_url: "https://dav.test/cal/home/uid-1.ics".into(),
             etag: None,
             summary: Some("Standup".into()),
             description: None,
@@ -250,6 +269,7 @@ mod tests {
             end: EventTime::default(),
             all_day: date.is_some(),
             recurrence: None,
+            recur_source: None,
             recurrence_id: None,
             organizer: None,
             attendees: vec![],

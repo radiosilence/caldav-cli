@@ -667,3 +667,203 @@ async fn discovery_runs_once_per_client() {
     // root, the principal, and the calendar home — not four per call.
     assert_eq!(propfinds, 4);
 }
+
+/// iCloud shards accounts onto partition hosts: you authenticate against
+/// `caldav.icloud.com` but your calendar home comes back on
+/// `pNN-caldav.icloud.com`, and every subsequent request must address *that*
+/// host. Two mock servers stand in for the two hosts.
+#[tokio::test]
+async fn follows_the_calendar_home_onto_a_different_host() {
+    let entry = MockServer::start().await;
+    let partition = MockServer::start().await;
+
+    // Entry host: answers the principal lookup, and nothing else.
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ok(PRINCIPAL_XML))
+        .mount(&entry)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/principal/"))
+        .respond_with(ok(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<multistatus xmlns="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <response><href>/1234/principal/</href><propstat><prop>
+    <c:calendar-home-set><href>{}/1234/calendars/</href></c:calendar-home-set>
+  </prop><status>HTTP/1.1 200 OK</status></propstat></response>
+</multistatus>"#,
+            partition.uri()
+        )))
+        .mount(&entry)
+        .await;
+
+    // Partition host: everything from the home set onward lives here.
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ok(CALENDARS_XML))
+        .mount(&partition)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .respond_with(ok(&events_xml(STANDUP_ICS)))
+        .mount(&partition)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/team/"))
+        .respond_with(ok(EMPTY_MULTISTATUS))
+        .mount(&partition)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/1234/calendars/home/evt-1.ics"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&partition)
+        .await;
+
+    // The client is only ever told about the entry host.
+    let client = CalDavClient::new(entry.uri(), "me@example.com".into(), "app-password".into());
+    let (start, end) = window();
+
+    let events = client
+        .events_in_range(None, start, end, true, 50)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1, "reads must follow onto the partition host");
+
+    // Writes too — the PUT is only mounted on the partition host.
+    let updated = client
+        .update_event(
+            "evt-1",
+            None,
+            &EventFields {
+                summary: Some("Moved"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.summary.as_deref(), Some("Moved"));
+
+    // The entry host must have seen discovery only — no calendar traffic.
+    let entry_paths: Vec<String> = entry
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r: &Request| r.url.path().to_string())
+        .collect();
+    assert!(
+        !entry_paths.iter().any(|p| p.contains("/calendars/")),
+        "calendar traffic leaked to the entry host: {entry_paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn sends_a_user_agent() {
+    // iCloud returns 403 to a request with no User-Agent, and reqwest sends
+    // none unless asked.
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+
+    client(&server).list_calendars().await.unwrap();
+
+    let ua = server.received_requests().await.unwrap()[0]
+        .headers
+        .get("user-agent")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert!(
+        ua.as_deref().is_some_and(|v| v.starts_with("caldav-cli/")),
+        "expected a caldav-cli User-Agent, got {ua:?}"
+    );
+}
+
+const WEEKLY_ICS: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:standup\r\nSUMMARY:Standup\r\n\
+DTSTART;TZID=Europe/London:20260706T090000\r\nDTEND;TZID=Europe/London:20260706T093000\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR";
+
+/// The important half of the expansion story: when a server refuses
+/// `<C:expand>` (iCloud is unreliable here), the caller still gets one result
+/// per occurrence — expanded client-side — not a lone master event.
+#[tokio::test]
+async fn expansion_falls_back_to_the_client_and_still_yields_occurrences() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .and(body_string_contains("<c:expand"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("expand not supported"))
+        .mount(&server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .respond_with(ok(&events_xml(WEEKLY_ICS)))
+        .mount(&server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/team/"))
+        .respond_with(ok(EMPTY_MULTISTATUS))
+        .mount(&server)
+        .await;
+
+    let events = client(&server)
+        .events_in_range(
+            None,
+            Utc.with_ymd_and_hms(2026, 7, 6, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 21, 0, 0, 0).unwrap(),
+            true,
+            50,
+        )
+        .await
+        .unwrap();
+
+    // Three Mondays, each an occurrence of the same series.
+    assert_eq!(events.len(), 3);
+    assert!(events.iter().all(|e| e.id == "standup"));
+    let starts: Vec<&str> = events
+        .iter()
+        .map(|e| e.start.date_time.as_deref().unwrap())
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            "2026-07-06T08:00:00Z",
+            "2026-07-13T08:00:00Z",
+            "2026-07-20T08:00:00Z"
+        ]
+    );
+}
+
+/// With expansion off, the same series comes back as the single master event
+/// carrying its rule — what you need before editing the series.
+#[tokio::test]
+async fn unexpanded_queries_return_the_master_event() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .respond_with(ok(&events_xml(WEEKLY_ICS)))
+        .mount(&server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/team/"))
+        .respond_with(ok(EMPTY_MULTISTATUS))
+        .mount(&server)
+        .await;
+
+    let events = client(&server)
+        .events_in_range(
+            None,
+            Utc.with_ymd_and_hms(2026, 7, 6, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 21, 0, 0, 0).unwrap(),
+            false,
+            50,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].recurrence.as_deref(),
+        Some("FREQ=WEEKLY;BYDAY=MO")
+    );
+    assert!(events[0].recurrence_id.is_none());
+}

@@ -7,6 +7,7 @@
 //! Nextcloud alike.
 
 pub mod ical;
+pub mod recur;
 
 use chrono::{DateTime, Duration, Utc};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -57,6 +58,10 @@ impl CalDavClient {
     pub fn new(base: String, username: String, password: String) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            // iCloud rejects requests with no User-Agent outright (403), and
+            // reqwest sends none by default. Identifying ourselves is also
+            // just good manners toward the servers we talk to.
+            .user_agent(concat!("caldav-cli/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
         Self {
@@ -150,7 +155,9 @@ impl CalDavClient {
                 Err(_) => continue,
             };
             if let Some(href) = first_href_under(&xml, DAV_NS, "current-user-principal") {
-                return Ok(util::href_path(&href));
+                // Resolve against the URL we just queried, not `self.base` —
+                // discovery can hand us a different host (see `calendar_home`).
+                return Ok(util::resolve_url(&url, &href));
             }
         }
         Err(rejected.unwrap_or(Error::Discovery("current-user-principal")))
@@ -166,18 +173,22 @@ impl CalDavClient {
 </d:propfind>"#;
 
                 let principal = self.principal().await?;
-                let url = util::resolve_url(&self.base, &principal);
                 let xml = self
                     .dav(
                         "PROPFIND",
-                        &url,
+                        &principal,
                         Some("0"),
                         "application/xml",
                         Some(BODY.into()),
                     )
                     .await?;
+                // iCloud shards accounts across partition hosts: the home set
+                // for a given user comes back on `pNN-caldav.icloud.com`, not
+                // the `caldav.icloud.com` we asked. Everything from here on
+                // must address that host, so keep the absolute URL rather than
+                // reducing it to a path and re-resolving against `self.base`.
                 first_href_under(&xml, CALDAV_NS, "calendar-home-set")
-                    .map(|href| util::href_path(&href))
+                    .map(|href| util::resolve_url(&principal, &href))
                     .ok_or(Error::Discovery("calendar-home-set"))
             })
             .await
@@ -202,9 +213,8 @@ impl CalDavClient {
 </d:propfind>"#;
 
                 let home = self.calendar_home().await?;
-                let url = util::resolve_url(&self.base, home);
                 let xml = self
-                    .dav("PROPFIND", &url, Some("1"), "application/xml", Some(BODY.into()))
+                    .dav("PROPFIND", home, Some("1"), "application/xml", Some(BODY.into()))
                     .await?;
                 let mut calendars = parse_calendars(&xml, home);
                 calendars.sort_by_key(|c| c.name.to_lowercase());
@@ -254,6 +264,52 @@ impl CalDavClient {
         end: DateTime<Utc>,
         expand: bool,
     ) -> Result<Vec<Event>> {
+        let body = self.query_body(start, end, expand);
+
+        let xml = match self
+            .dav(
+                "REPORT",
+                &calendar.url,
+                Some("1"),
+                "application/xml",
+                Some(body),
+            )
+            .await
+        {
+            Ok(xml) => xml,
+            // Not every server implements <expand> — iCloud is unreliable
+            // here. Retry without it and expand client-side below, so the
+            // caller gets occurrences either way.
+            Err(e) if expand => {
+                debug!(error = %e, calendar = %calendar.name, "expand unsupported, retrying");
+                let retry = self.query_body(start, end, false);
+                self.dav(
+                    "REPORT",
+                    &calendar.url,
+                    Some("1"),
+                    "application/xml",
+                    Some(retry),
+                )
+                .await?
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut events = parse_event_responses(&xml, calendar);
+        if expand {
+            // Idempotent: anything the server already expanded arrives without
+            // an RRULE and passes straight through.
+            events = recur::expand_all(events, start, end);
+        }
+        // Expansion can hand back instances just outside the window; the range
+        // the caller asked for is the range they get.
+        events.retain(|e| overlaps(e, start, end));
+        events.sort_by_key(|e| e.start.sort_key());
+        Ok(events)
+    }
+
+    /// The `calendar-query` REPORT body for a time range.
+    fn query_body(&self, start: DateTime<Utc>, end: DateTime<Utc>, expand: bool) -> String {
         let range = format!(
             r#"<c:time-range start="{}" end="{}"/>"#,
             util::format_ical_utc(start),
@@ -268,8 +324,7 @@ impl CalDavClient {
         } else {
             "<c:calendar-data/>".to_string()
         };
-
-        let body = format!(
+        format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <d:prop><d:getetag/>{calendar_data}</d:prop>
@@ -279,29 +334,7 @@ impl CalDavClient {
     </c:comp-filter>
   </c:filter>
 </c:calendar-query>"#
-        );
-
-        let url = util::resolve_url(&self.base, &calendar.href);
-        let xml = match self
-            .dav("REPORT", &url, Some("1"), "application/xml", Some(body))
-            .await
-        {
-            Ok(xml) => xml,
-            // Not every server implements <expand>. Retry unexpanded rather
-            // than failing the whole query.
-            Err(e) if expand => {
-                debug!(error = %e, calendar = %calendar.name, "expand unsupported, retrying");
-                return Box::pin(self.list_events(calendar, start, end, false)).await;
-            }
-            Err(e) => return Err(e),
-        };
-
-        let mut events = parse_event_responses(&xml, calendar);
-        // Expansion can hand back instances just outside the window; the range
-        // the caller asked for is the range they get.
-        events.retain(|e| overlaps(e, start, end));
-        events.sort_by_key(|e| e.start.sort_key());
-        Ok(events)
+        )
     }
 
     /// Events across every calendar (or just `calendar`, when named).
@@ -370,11 +403,10 @@ impl CalDavClient {
         };
 
         for cal in &targets {
-            let url = util::resolve_url(&self.base, &cal.href);
             let Ok(xml) = self
                 .dav(
                     "REPORT",
-                    &url,
+                    &cal.url,
                     Some("1"),
                     "application/xml",
                     Some(body.clone()),
@@ -443,9 +475,8 @@ impl CalDavClient {
         );
 
         let home = self.calendar_home().await?;
-        let url = util::resolve_url(&self.base, home);
         if let Ok(text) = self
-            .dav("REPORT", &url, Some("1"), "application/xml", Some(body))
+            .dav("REPORT", home, Some("1"), "application/xml", Some(body))
             .await
         {
             let periods = ical::parse_freebusy(&text);
@@ -526,12 +557,9 @@ impl CalDavClient {
             stamp: Utc::now(),
         });
 
-        let href = format!(
-            "{}{}.ics",
-            ensure_trailing_slash(&cal.href),
-            utf8_percent_encode(&uid, PATH_SEGMENT)
-        );
-        let url = util::resolve_url(&self.base, &href);
+        let file = format!("{}.ics", utf8_percent_encode(&uid, PATH_SEGMENT));
+        let url = format!("{}{}", ensure_trailing_slash(&cal.url), file);
+        let href = format!("{}{}", ensure_trailing_slash(&cal.href), file);
         debug!(%url, "creating event");
 
         let request = self
@@ -547,6 +575,10 @@ impl CalDavClient {
         ical::parse_events(&ics, &cal.name, &cal.href, &href, None)
             .into_iter()
             .next()
+            .map(|mut e| {
+                e.resource_url = url.clone();
+                e
+            })
             .ok_or_else(|| Error::Server("built an event the parser rejected".into()))
     }
 
@@ -626,7 +658,7 @@ impl CalDavClient {
             stamp: Utc::now(),
         });
 
-        let url = util::resolve_url(&self.base, &existing.href);
+        let url = existing.resource_url.clone();
         debug!(%url, "updating event");
 
         let mut request = self
@@ -661,7 +693,7 @@ impl CalDavClient {
             .await?
             .ok_or_else(|| Error::EventNotFound(uid.to_string()))?;
 
-        let url = util::resolve_url(&self.base, &existing.href);
+        let url = existing.resource_url.clone();
         debug!(%url, "deleting event");
 
         let mut request = self
@@ -920,6 +952,9 @@ fn parse_calendars(xml: &str, home: &str) -> Vec<Calendar> {
 
         out.push(Calendar {
             id: util::last_segment(&href),
+            // Resolve against the home URL, which carries the partition host
+            // iCloud redirected us to — not the URL the user configured.
+            url: util::resolve_url(home, &href),
             href,
             name,
             description: text_of(CALDAV_NS, "calendar-description"),
@@ -959,13 +994,14 @@ fn parse_event_responses(xml: &str, calendar: &Calendar) -> Vec<Event> {
             continue;
         };
 
-        out.extend(ical::parse_events(
-            data,
-            &calendar.name,
-            &calendar.href,
-            href,
-            etag,
-        ));
+        out.extend(
+            ical::parse_events(data, &calendar.name, &calendar.href, href, etag)
+                .into_iter()
+                .map(|mut e| {
+                    e.resource_url = util::resolve_url(&calendar.url, href);
+                    e
+                }),
+        );
     }
     out
 }

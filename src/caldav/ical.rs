@@ -277,6 +277,22 @@ fn parse_attendee(line: &ContentLine) -> Attendee {
     }
 }
 
+/// Re-render a parsed content line. Used to hand the recurrence properties to
+/// the `rrule` crate in the form it parses — including the `TZID` parameter,
+/// without which a weekly series would drift an hour across a DST boundary.
+fn render_line(line: &ContentLine) -> String {
+    let mut out = String::from(&line.name);
+    for (k, v) in &line.params {
+        out.push(';');
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+    }
+    out.push(':');
+    out.push_str(&line.value);
+    out
+}
+
 /// Split an iCalendar document into the content lines of each `BEGIN:VEVENT`
 /// block, skipping nested components such as `VALARM` and `VTIMEZONE`.
 fn vevent_blocks(lines: &[String]) -> Vec<Vec<ContentLine>> {
@@ -367,6 +383,9 @@ fn build_event(
     let mut created = None;
     let mut last_modified = None;
     let mut sequence = 0u32;
+    // DTSTART + RRULE/RDATE/EXDATE/EXRULE, verbatim — the input `rrule` wants.
+    let mut recur_lines: Vec<String> = Vec::new();
+    let mut has_rule = false;
 
     for line in &block {
         match line.name.as_str() {
@@ -376,10 +395,22 @@ fn build_event(
             "LOCATION" => location = Some(unescape_text(&line.value)),
             "URL" => url = Some(line.value.trim().to_string()),
             "STATUS" => status = Some(line.value.trim().to_ascii_uppercase()),
-            "DTSTART" => start = Some(parse_time(line, default_tz)),
+            "DTSTART" => {
+                start = Some(parse_time(line, default_tz));
+                recur_lines.insert(0, render_line(line));
+            }
             "DTEND" => end = Some(parse_time(line, default_tz)),
             "DURATION" => duration = parse_duration(&line.value),
-            "RRULE" => recurrence = Some(line.value.trim().to_string()),
+            "RRULE" => {
+                recurrence = Some(line.value.trim().to_string());
+                recur_lines.push(render_line(line));
+                has_rule = true;
+            }
+            "RDATE" => {
+                recur_lines.push(render_line(line));
+                has_rule = true;
+            }
+            "EXDATE" | "EXRULE" => recur_lines.push(render_line(line)),
             "RECURRENCE-ID" => recurrence_id = Some(parse_time(line, default_tz)),
             "ORGANIZER" => organizer = Some(parse_attendee(line)),
             "ATTENDEE" => attendees.push(parse_attendee(line)),
@@ -423,6 +454,9 @@ fn build_event(
         calendar: calendar.to_string(),
         calendar_href: util::href_path(calendar_href),
         href: util::href_path(href),
+        // Callers that addressed a specific host (the client) overwrite this
+        // with the absolute URL; parsing alone only knows the path.
+        resource_url: String::new(),
         etag: etag.map(str::to_string),
         summary,
         description,
@@ -433,6 +467,8 @@ fn build_event(
         end,
         all_day,
         recurrence,
+        // Only a series carries an expandable rule; a lone DTSTART is not one.
+        recur_source: has_rule.then(|| recur_lines.join("\n")),
         recurrence_id: recurrence_id.and_then(|t| t.date_time.or(t.date)),
         organizer,
         attendees,

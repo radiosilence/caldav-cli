@@ -166,9 +166,20 @@ move without the user seeing it described first.
 occurrence in the window comes back as its own result carrying a
 `recurrenceId`. All occurrences of a series share the series `id` (its UID).
 
+Server-side expansion is unreliable in practice — iCloud especially — so
+anything the server hands back unexpanded is expanded **client-side** instead,
+and the result is the same shape either way. `RRULE`/`EXDATE`/`RDATE`
+evaluation is done by the [`rrule`](https://crates.io/crates/rrule) crate
+rather than hand-rolled; recurrence is a large corner of RFC 5545 and getting
+it subtly wrong means silently showing someone the wrong day. Occurrences are
+expanded in the series' own timezone, so a weekly 09:00 meeting stays at 09:00
+across a DST boundary.
+
+Server-side overrides are respected: an edited occurrence replaces its
+generated slot, and one marked `CANCELLED` removes it.
+
 To **edit** a series, fetch it unexpanded (`events(expand: false)` or
-`caldav-cli list --no-expand`) and update the master event. Servers that don't
-implement `<expand>` are detected and the query is retried unexpanded.
+`caldav-cli list --no-expand`) and update the master event.
 
 ### Hosted mode
 
@@ -190,12 +201,36 @@ This is the transport `jaritanet-mcp-gateway` puts behind OAuth. Because
 CalDAV needs three values rather than one bearer token, the gateway stores a
 credential *set* for this MCP.
 
+## Apple / iCloud
+
+Apple publishes **no** REST API, SDK, OAuth flow, or developer program for
+iCloud Calendar — CalDAV is the only programmatic access, and it isn't
+officially documented. `EventKit` exists but is local-only (an app running on
+the user's Mac or iPhone), so it's no help to a server-side tool. That makes
+CalDAV the target by necessity, not preference.
+
+Apple's server is a fork of the discontinued Apple CalendarServer and has
+drifted. The quirks that actually bite, and what this client does about them:
+
+| Quirk | Handling |
+| --- | --- |
+| **Partition hosts.** You authenticate against `caldav.icloud.com`, but your `calendar-home-set` comes back on a per-account shard like `p42-caldav.icloud.com`, and every later request must address *that* host. | Discovery keeps absolute URLs and resolves each href against the response it came from, never against the configured server URL. |
+| **Requires a `User-Agent`.** A request without one is refused outright — and most HTTP clients (reqwest included) send none by default. | Every request identifies as `caldav-cli/<version>`. |
+| **`<C:expand>` is unreliable**, so an agenda can come back as master events at the wrong times. | Expansion falls back to client-side, transparently. |
+| **No free/busy.** iCloud doesn't answer the free-busy REPORT for a personal calendar home. | Falls back to deriving busy periods from the events. |
+| **App-specific passwords only** — the Apple ID password is rejected, and there is no OAuth. | `auth` verifies credentials against the server before storing them, so a wrong password fails immediately with a clear message instead of a confusing discovery error. |
+| **Eventual consistency** — a write is not always visible on the next read. | Writes return the event as written rather than re-reading it. |
+
+Fastmail, Nextcloud, and Radicale are better-behaved and work through the same
+code path; iCloud is simply the one that needs the accommodations.
+
 ## Design notes
 
-- **iCalendar is hand-rolled.** We touch a small, well-specified subset
-  (VEVENT and VFREEBUSY); a full library would bring far more surface than the
-  job needs. Folding, parameter quoting, TEXT escaping, and `VALUE=DATE` vs
-  `TZID` vs UTC forms are all covered by tests.
+- **iCalendar parsing is hand-rolled; recurrence is not.** The VEVENT and
+  VFREEBUSY subset is small and well-specified, so folding, parameter quoting,
+  TEXT escaping, and `VALUE=DATE`/`TZID`/UTC time forms are handled here and
+  covered by tests. Recurrence *rules* are a different matter — that is
+  delegated to `rrule`, which is mature and widely used.
 - **Discovery is the portable walk**: `current-user-principal` →
   `calendar-home-set` → collections, with an RFC 6764 well-known bootstrap
   first. It is memoised per client, so the three round trips happen once.
@@ -213,7 +248,7 @@ credential *set* for this MCP.
 ## Development
 
 ```bash
-cargo test          # 118 tests, including an end-to-end suite against a mock server
+cargo test          # 137 tests, including an end-to-end suite against a mock server
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```

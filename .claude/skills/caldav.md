@@ -109,9 +109,11 @@ whenever the user means a local wall-clock time** — otherwise "9am" becomes
 
 ## Recurring events
 
-`agenda` and `list` expand series server-side: each occurrence in the window is
-its own result with a `recurrenceId`. All occurrences share the series `id`
-(the UID).
+`agenda` and `list` return one result per occurrence, each with a
+`recurrenceId`. All occurrences share the series `id` (the UID). Expansion is
+asked of the server and redone client-side when the server won't do it (iCloud
+often won't) — the output shape is the same either way, and occurrences keep
+their local wall-clock time across DST.
 
 To edit a series, fetch the master first:
 
@@ -170,7 +172,7 @@ applies it. Show the user the preview before confirming — always.
 
 | Message                        | Cause                                                |
 | ------------------------------ | ---------------------------------------------------- |
-| `Invalid credentials`          | Wrong username or a non-app-specific password         |
+| `Invalid credentials`          | Wrong username or a non-app-specific password. iCloud has no OAuth — an app-specific password from appleid.apple.com is required |
 | `CalDAV discovery failed`      | Wrong server URL, or the host isn't a CalDAV server   |
 | `calendar '...' is read-only`  | Shared/subscribed calendar; pick a writable one       |
 | `changed on the server`        | Someone else edited it — re-read the event and retry  |
