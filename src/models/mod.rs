@@ -28,6 +28,12 @@ pub struct Calendar {
     pub color: Option<String>,
     /// True when the current principal may not write to this collection.
     pub read_only: bool,
+    /// The account's own default calendar, as advertised by the server's
+    /// `schedule-default-calendar-URL` (RFC 6638) — what the user's calendar
+    /// app drops a new event into. Servers that don't publish it leave every
+    /// calendar `false`.
+    #[serde(default)]
+    pub is_default: bool,
     /// False for collections that hold only VTODO/VJOURNAL — we skip those.
     pub supports_events: bool,
 }

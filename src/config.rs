@@ -25,6 +25,9 @@ pub struct CoreConfig {
     /// App-specific password. iCloud rejects the primary account password for
     /// CalDAV; generate one at appleid.apple.com.
     pub app_password: Option<String>,
+    /// Calendar new events land in. Unset defers to the server's own default
+    /// calendar, which is what the user's calendar app writes to.
+    pub calendar: Option<String>,
 }
 
 impl Config {
@@ -119,6 +122,16 @@ impl Config {
             .app_password
             .clone()
             .ok_or(Error::NotAuthenticated)
+    }
+
+    /// Chosen calendar for new events, preferring `CALDAV_CALENDAR`.
+    pub fn get_calendar(&self) -> Option<String> {
+        std::env::var("CALDAV_CALENDAR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.core.calendar.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     pub fn set_credentials(&mut self, server_url: String, username: String, app_password: String) {
@@ -222,11 +235,13 @@ mod tests {
                 server_url: Some("https://caldav.icloud.com".into()),
                 username: Some("me@icloud.com".into()),
                 app_password: Some("abcd-efgh".into()),
+                calendar: Some("Personal".into()),
             },
         };
         let toml_str = toml::to_string(&config).unwrap();
         let round: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(round.core.username.as_deref(), Some("me@icloud.com"));
         assert_eq!(round.core.app_password.as_deref(), Some("abcd-efgh"));
+        assert_eq!(round.core.calendar.as_deref(), Some("Personal"));
     }
 }

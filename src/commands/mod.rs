@@ -35,6 +35,13 @@ pub(crate) fn make_client() -> Result<CalDavClient> {
     ))
 }
 
+/// Where a write lands: the `--calendar` flag, else the configured default.
+/// `None` leaves it to the account's own default calendar.
+pub(crate) fn default_calendar(flag: Option<&str>) -> Option<String> {
+    flag.map(str::to_string)
+        .or_else(|| Config::load().ok().and_then(|c| c.get_calendar()))
+}
+
 /// The time window a read command operates over.
 ///
 /// Explicit `start`/`end` win; otherwise it's `days` (default 7) starting from

@@ -96,11 +96,12 @@ pub fn parse_attendee_spec(spec: &str) -> Attendee {
 /// Create an event. `--summary` and `--start` are required.
 pub async fn create_event(calendar: Option<&str>, args: &EventArgs) -> anyhow::Result<()> {
     let client = super::make_client()?;
+    let calendar = super::default_calendar(calendar);
     let attendees = args.parsed_attendees();
     let categories = args.parsed_categories();
     let fields = args.fields(attendees.as_deref(), categories.as_deref());
 
-    let event = client.create_event(calendar, &fields).await?;
+    let event = client.create_event(calendar.as_deref(), &fields).await?;
     Output::success(event).print();
     Ok(())
 }

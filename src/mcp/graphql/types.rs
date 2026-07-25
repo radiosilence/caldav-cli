@@ -22,6 +22,9 @@ pub struct GqlCalendar {
     pub read_only: bool,
     /// False for task-only collections, which hold no events.
     pub supports_events: bool,
+    /// The account's own default calendar, per the server. New events land
+    /// here unless the user picked another one or `calendar` is given.
+    pub is_default: bool,
 }
 
 impl From<Calendar> for GqlCalendar {
@@ -34,6 +37,7 @@ impl From<Calendar> for GqlCalendar {
             color: c.color,
             read_only: c.read_only,
             supports_events: c.supports_events,
+            is_default: c.is_default,
         }
     }
 }

@@ -20,6 +20,11 @@ pub type CalDavSchema = Schema<QueryRoot, MutationRoot, async_graphql::EmptySubs
 /// take `&self`, so no lock is needed.
 pub type SharedClient = std::sync::Arc<crate::caldav::CalDavClient>;
 
+/// The calendar the user picked for new events, injected per request alongside
+/// the client. `None` falls through to the server's own default calendar.
+/// Reads are never scoped by it — "what's on today" must span the account.
+pub struct DefaultCalendar(pub Option<String>);
+
 /// Build the GraphQL schema with only the process-shared preview-nonce store.
 ///
 /// The CalDAV client is **not** baked in — it is supplied per request via

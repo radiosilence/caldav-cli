@@ -61,10 +61,16 @@ Config lands in `~/.config/caldav-cli/config.toml` (dir `0700`, file `0600`):
 server_url = "https://caldav.icloud.com"
 username = "you@icloud.com"
 app_password = "abcd-efgh-ijkl-mnop"
+calendar = "Personal"
 ```
 
 Environment variables override the file: `CALDAV_SERVER_URL`,
-`CALDAV_USERNAME`, `CALDAV_APP_PASSWORD`.
+`CALDAV_USERNAME`, `CALDAV_APP_PASSWORD`, `CALDAV_CALENDAR`.
+
+`calendar` is where new events go when none is named. Leave it unset and the
+account's own default calendar wins — the one the server advertises via
+`schedule-default-calendar-URL` and your calendar app writes to, flagged as
+`isDefault` in `caldav-cli calendars`.
 
 Debug the wire traffic with `RUST_LOG=debug caldav-cli [cmd]`.
 
@@ -192,6 +198,7 @@ upstream after authenticating the user:
 | `X-CalDAV-Username`  | yes      | Account username                     |
 | `X-CalDAV-Password`  | yes      | App-specific password                |
 | `X-CalDAV-Url`       | no       | Server base URL; defaults to iCloud  |
+| `X-CalDAV-Calendar`  | no       | Calendar for new events; defaults to the account's own |
 
 Username and password must both arrive as headers to be used — a partial
 header set never mixes with configured credentials, which would otherwise
