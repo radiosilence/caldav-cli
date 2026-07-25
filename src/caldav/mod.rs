@@ -16,7 +16,7 @@ use tokio::sync::OnceCell;
 use tracing::{debug, instrument};
 
 use crate::error::{Error, Result};
-use crate::models::{BusyPeriod, Calendar, Event, EventFields};
+use crate::models::{BusyPeriod, Calendar, CalendarFields, Event, EventFields};
 use crate::util;
 
 use ical::{TimeSpec, VEventSpec};
@@ -52,6 +52,76 @@ pub const MAX_EVENTS: usize = 500;
 /// a 30-calendar account from opening 30 connections at a server that would
 /// rather it didn't.
 pub const MAX_CONCURRENT_REQUESTS: usize = 6;
+
+/// One WebDAV property in a PROPPATCH.
+///
+/// Constructed rather than written out because the two halves are escaped
+/// differently — a display name is text, a default-calendar URL is a `DAV:href`
+/// — and getting that wrong is a silent per-property rejection.
+pub struct DavProp<'a> {
+    ns: &'a str,
+    name: &'a str,
+    /// The element's body, already XML. `None` removes the property.
+    body: Option<String>,
+}
+
+impl<'a> DavProp<'a> {
+    /// A text-valued property, e.g. `DAV:displayname`.
+    pub fn text(ns: &'a str, name: &'a str, value: &str) -> Self {
+        Self {
+            ns,
+            name,
+            body: Some(xml_escape(value)),
+        }
+    }
+
+    /// A property whose value is a `DAV:href`, as RFC 6638 defines
+    /// `schedule-default-calendar-URL`.
+    pub fn href(ns: &'a str, name: &'a str, href: &str) -> Self {
+        Self {
+            ns,
+            name,
+            body: Some(format!("<d:href>{}</d:href>", xml_escape(href))),
+        }
+    }
+
+    /// Unset the property. Distinct from setting it empty: a server may accept
+    /// one and refuse the other.
+    pub fn remove(ns: &'a str, name: &'a str) -> Self {
+        Self {
+            ns,
+            name,
+            body: None,
+        }
+    }
+
+    /// The property as an XML element, using the prefix its namespace is bound
+    /// to by [`PROP_NAMESPACES`]. `None` for a namespace the document doesn't
+    /// declare, which can't be addressed and so must not be silently emitted
+    /// unqualified.
+    fn element(&self) -> Option<String> {
+        let prefix = PROP_NAMESPACES
+            .iter()
+            .find(|(_, ns)| *ns == self.ns)
+            .map(|(prefix, _)| prefix)?;
+        Some(match &self.body {
+            Some(body) => format!("<{prefix}:{0}>{body}</{prefix}:{0}>", self.name),
+            None => format!("<{prefix}:{}/>", self.name),
+        })
+    }
+}
+
+/// The namespaces a property-writing document declares, as `(prefix, uri)`.
+/// One list so the declarations and [`DavProp::element`]'s prefixes cannot drift.
+const PROP_NAMESPACES: [(&str, &str); 3] = [("d", DAV_NS), ("c", CALDAV_NS), ("ic", APPLE_NS)];
+
+/// `xmlns:` declarations for [`PROP_NAMESPACES`].
+fn xmlns_decls() -> String {
+    PROP_NAMESPACES
+        .iter()
+        .map(|(prefix, ns)| format!(r#" xmlns:{prefix}="{ns}""#))
+        .collect()
+}
 
 /// Run `tasks` concurrently, at most [`MAX_CONCURRENT_REQUESTS`] at a time,
 /// returning their outputs in the order the tasks were given.
@@ -295,6 +365,271 @@ impl CalDavClient {
     /// where my calendar app would".
     pub async fn find_calendar(&self, name: Option<&str>) -> Result<Calendar> {
         resolve_calendar(&self.list_calendars().await?, name)
+    }
+
+    /// The address this client authenticates as, used to pick your own row out
+    /// of an event's attendee list.
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    // ---- Writing properties ----
+
+    /// Set or remove properties on a collection (RFC 4918 §9.2).
+    ///
+    /// A PROPPATCH answers `207` whichever properties it accepted: the real
+    /// outcome is the status inside each `propstat`, so a server that refused
+    /// every property still looks successful at the HTTP layer. This reads the
+    /// propstats and fails on any that isn't 2xx, naming the properties — a
+    /// silent no-op is the worst possible outcome for a write.
+    #[instrument(skip(self, props))]
+    pub async fn proppatch(&self, url: &str, props: &[DavProp<'_>]) -> Result<()> {
+        let render = |want_set: bool| -> String {
+            props
+                .iter()
+                .filter(|p| p.body.is_some() == want_set)
+                .filter_map(DavProp::element)
+                .collect()
+        };
+        let (set, remove) = (render(true), render(false));
+        if set.is_empty() && remove.is_empty() {
+            return Ok(());
+        }
+
+        let wrap = |tag: &str, inner: String| match inner.is_empty() {
+            true => String::new(),
+            false => format!("<d:{tag}><d:prop>{inner}</d:prop></d:{tag}>"),
+        };
+        let body = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propertyupdate{}>
+{}{}</d:propertyupdate>"#,
+            xmlns_decls(),
+            wrap("set", set),
+            wrap("remove", remove)
+        );
+
+        let xml = self
+            .dav("PROPPATCH", url, Some("0"), "application/xml", Some(body))
+            .await?;
+        match proppatch_failures(&xml) {
+            failures if failures.is_empty() => Ok(()),
+            failures => Err(Error::Server(format!(
+                "the server refused {}: {}",
+                if failures.len() == 1 {
+                    "a property"
+                } else {
+                    "some properties"
+                },
+                failures.join("; ")
+            ))),
+        }
+    }
+
+    // ---- Calendar collections ----
+
+    /// Create a calendar collection with `MKCALENDAR` (RFC 4791 §5.3.1).
+    ///
+    /// The collection's path segment is derived from the name, so a calendar
+    /// called "Work Trips" lives at `.../work-trips/` — readable, and the id the
+    /// rest of this tool addresses it by. A name that collides with an existing
+    /// collection is refused by the server rather than worked around: two
+    /// calendars with one name is a worse outcome than an error.
+    #[instrument(skip(self, fields))]
+    pub async fn create_calendar(
+        &self,
+        name: &str,
+        fields: &CalendarFields<'_>,
+    ) -> Result<Calendar> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::Server("a calendar needs a name".into()));
+        }
+        let slug = slugify(name);
+        let home = self.calendar_home().await?;
+        let url = format!(
+            "{}{}/",
+            ensure_trailing_slash(home),
+            utf8_percent_encode(&slug, PATH_SEGMENT)
+        );
+
+        // Properties go in the MKCALENDAR body rather than a follow-up
+        // PROPPATCH so the calendar is never briefly visible unnamed.
+        let props = [
+            Some(DavProp::text(DAV_NS, "displayname", name)),
+            fields
+                .description
+                .map(|v| DavProp::text(CALDAV_NS, "calendar-description", v)),
+            fields
+                .color
+                .map(|v| DavProp::text(APPLE_NS, "calendar-color", v)),
+            fields
+                .order
+                .map(|v| DavProp::text(APPLE_NS, "calendar-order", &v.to_string())),
+        ];
+        let inner: String = props
+            .iter()
+            .flatten()
+            .filter_map(DavProp::element)
+            .collect();
+        let body = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<c:mkcalendar{}>
+  <d:set><d:prop>{inner}</d:prop></d:set>
+</c:mkcalendar>"#,
+            xmlns_decls()
+        );
+        debug!(%url, "creating calendar");
+        self.dav("MKCALENDAR", &url, None, "application/xml", Some(body))
+            .await
+            .map_err(|e| match e {
+                // 405 is what RFC 4791 §5.3.1.2 mandates for an occupied path.
+                Error::Dav { status: 405, .. } => Error::Server(format!(
+                    "a collection already exists at {slug:?} — pick a different name"
+                )),
+                other => other,
+            })?;
+
+        // Re-read rather than assume: the server decides the final display name,
+        // whether it took the colour, and what privileges it granted.
+        self.find_calendar(Some(&slug)).await
+    }
+
+    /// Rename, recolour, or re-describe a calendar via PROPPATCH.
+    ///
+    /// A `Some("")` field removes the property; `None` leaves it alone.
+    #[instrument(skip(self, fields))]
+    pub async fn update_calendar(
+        &self,
+        calendar: &str,
+        fields: &CalendarFields<'_>,
+    ) -> Result<Calendar> {
+        let existing = self.find_calendar(Some(calendar)).await?;
+        if existing.read_only {
+            return Err(Error::Server(format!(
+                "calendar '{}' is read-only",
+                existing.name
+            )));
+        }
+
+        // Clearing a display name would leave the calendar addressable only by
+        // id, in every client the user owns.
+        let name = fields.name.map(str::trim).filter(|s| !s.is_empty());
+        let order = fields.order.map(|v| v.to_string());
+        let prop = |ns, name, value: &str| match value.is_empty() {
+            true => DavProp::remove(ns, name),
+            false => DavProp::text(ns, name, value),
+        };
+        let props: Vec<DavProp<'_>> = [
+            name.map(|v| DavProp::text(DAV_NS, "displayname", v)),
+            fields
+                .description
+                .map(|v| prop(CALDAV_NS, "calendar-description", v)),
+            fields.color.map(|v| prop(APPLE_NS, "calendar-color", v)),
+            order
+                .as_deref()
+                .map(|v| prop(APPLE_NS, "calendar-order", v)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        if props.is_empty() {
+            return Ok(existing);
+        }
+        self.proppatch(&existing.url, &props).await?;
+        self.find_calendar(Some(&existing.id)).await
+    }
+
+    /// Delete a calendar collection and everything in it.
+    ///
+    /// Returns the calendar as it was, since after this there is nothing left to
+    /// read it back from.
+    #[instrument(skip(self))]
+    pub async fn delete_calendar(&self, calendar: &str) -> Result<Calendar> {
+        let existing = self.find_calendar(Some(calendar)).await?;
+        if existing.read_only {
+            return Err(Error::Server(format!(
+                "calendar '{}' is read-only",
+                existing.name
+            )));
+        }
+        if existing.is_default {
+            return Err(Error::Server(format!(
+                "calendar '{}' is the account's default calendar — point the default \
+                 at another calendar first",
+                existing.name
+            )));
+        }
+        debug!(url = %existing.url, "deleting calendar");
+        let request = self
+            .client
+            .delete(&existing.url)
+            .basic_auth(&self.username, Some(&self.password));
+        self.send_write(request, "DELETE", &existing.url).await?;
+        Ok(existing)
+    }
+
+    /// Point the account's default calendar at `calendar` (RFC 6638 §9.2).
+    ///
+    /// This is the property the user's own calendar apps read to decide where a
+    /// new event goes, so it changes behaviour well beyond this tool. It lives on
+    /// the scheduling inbox, not on the calendar — an account without scheduling
+    /// support has nowhere to store it and gets a plain error.
+    #[instrument(skip(self))]
+    pub async fn set_default_calendar(&self, calendar: &str) -> Result<Calendar> {
+        let target = self.find_calendar(Some(calendar)).await?;
+        if target.read_only {
+            return Err(Error::Server(format!(
+                "calendar '{}' is read-only, so new events could not be written to it",
+                target.name
+            )));
+        }
+        if !target.supports_events {
+            return Err(Error::Server(format!(
+                "calendar '{}' holds no events, so nothing would ever land in it",
+                target.name
+            )));
+        }
+
+        let inbox = self.scheduling_inbox().await?;
+        self.proppatch(
+            &inbox,
+            &[DavProp::href(
+                CALDAV_NS,
+                "schedule-default-calendar-URL",
+                &target.href,
+            )],
+        )
+        .await?;
+        self.find_calendar(Some(&target.id)).await
+    }
+
+    /// The scheduling inbox collection (RFC 6638 §2.2.1), the one place the spec
+    /// requires the default-calendar property to live.
+    async fn scheduling_inbox(&self) -> Result<String> {
+        const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:resourcetype/></d:prop>
+</d:propfind>"#;
+
+        let home = self.calendar_home().await?;
+        let xml = self
+            .dav(
+                "PROPFIND",
+                home,
+                Some("1"),
+                "application/xml",
+                Some(BODY.into()),
+            )
+            .await?;
+        parse_inbox_href(&xml, home).ok_or_else(|| {
+            Error::Server(
+                "this account has no scheduling inbox, so it has no default-calendar \
+                 property to set"
+                    .into(),
+            )
+        })
     }
 
     // ---- Reading events ----
@@ -653,6 +988,8 @@ impl CalDavClient {
             url: fields.url,
             status: fields.status,
             recurrence: fields.recurrence,
+            // A new event has no history to preserve.
+            recur_extra: &[],
             attendees: &attendees,
             organizer: None,
             categories: &categories,
@@ -742,6 +1079,12 @@ impl CalDavClient {
             Some(c) => c.to_vec(),
             None => existing.categories.clone(),
         };
+        // A caller replacing the RRULE is redefining the series, so the
+        // exceptions to the old rule no longer describe anything.
+        let recur_extra = match fields.recurrence {
+            Some(_) => Vec::new(),
+            None => ical::recur_extra_lines(existing.recur_source.as_deref()),
+        };
 
         let ics = ical::build_vcalendar(&VEventSpec {
             uid,
@@ -753,6 +1096,9 @@ impl CalDavClient {
             url: fields.url.or(existing.url.as_deref()),
             status: fields.status.or(existing.status.as_deref()),
             recurrence: fields.recurrence.or(existing.recurrence.as_deref()),
+            // Carried across untouched. Dropping them used to resurrect every
+            // occurrence the user had already cancelled.
+            recur_extra: &recur_extra,
             attendees: &attendees,
             organizer: existing.organizer.as_ref(),
             categories: &categories,
@@ -785,6 +1131,313 @@ impl CalDavClient {
         )
         .into_iter()
         .next()
+        .ok_or_else(|| Error::Server("built an event the parser rejected".into()))
+    }
+
+    /// Move an event into another calendar, keeping its UID.
+    ///
+    /// Tries WebDAV `MOVE` first because it is lossless — the stored iCalendar
+    /// object is relocated byte for byte, alarms, attachments and override
+    /// components included. Servers that refuse it fall back to copying the raw
+    /// resource across and deleting the original, which is lossless for the same
+    /// reason: the bytes are never round-tripped through our model.
+    #[instrument(skip(self))]
+    pub async fn move_event(&self, uid: &str, from: Option<&str>, to: &str) -> Result<Event> {
+        let existing = self
+            .get_event(uid, from)
+            .await?
+            .ok_or_else(|| Error::EventNotFound(uid.to_string()))?;
+        let target = self.find_calendar(Some(to)).await?;
+
+        if target.href == existing.calendar_href {
+            return Err(Error::Server(format!(
+                "the event is already in '{}'",
+                target.name
+            )));
+        }
+        if target.read_only {
+            return Err(Error::Server(format!(
+                "calendar '{}' is read-only",
+                target.name
+            )));
+        }
+        if !target.supports_events {
+            return Err(Error::Server(format!(
+                "calendar '{}' does not hold events",
+                target.name
+            )));
+        }
+
+        let file = util::last_segment(&existing.href);
+        let dest_url = format!("{}{}", ensure_trailing_slash(&target.url), file);
+        let dest_href = format!("{}{}", ensure_trailing_slash(&target.href), file);
+        let source_url = existing.resource_url.clone();
+        debug!(%source_url, %dest_url, "moving event");
+
+        let moved = self
+            .client
+            .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &source_url)
+            .basic_auth(&self.username, Some(&self.password))
+            .header("Destination", &dest_url)
+            // Never silently replace an unrelated event already at that path.
+            .header("Overwrite", "F")
+            .send()
+            .await;
+
+        match moved {
+            Ok(response) if response.status().is_success() => {}
+            // A refusal here is the server saying it doesn't implement MOVE
+            // across collections; a 412 is it saying something is already there,
+            // which copying would hit too.
+            Ok(response) if response.status().as_u16() == 412 => {
+                return Err(Error::Server(format!(
+                    "something already exists at {dest_url} — the event was not moved"
+                )));
+            }
+            Ok(response) => {
+                let status = response.status().as_u16();
+                debug!(status, "MOVE refused, falling back to copy and delete");
+                self.copy_then_delete(&source_url, &dest_url, existing.etag.as_deref())
+                    .await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        Ok(Event {
+            calendar: target.name.clone(),
+            calendar_href: target.href.clone(),
+            href: util::href_path(&dest_href),
+            resource_url: dest_url,
+            // The etag belonged to the resource at the old path.
+            etag: None,
+            ..existing
+        })
+    }
+
+    /// Fallback for [`CalDavClient::move_event`]: transfer the resource verbatim,
+    /// then remove the original.
+    ///
+    /// The write goes first. If the delete then fails the event exists in both
+    /// calendars, which is recoverable and visible; deleting first and failing to
+    /// write would lose it outright.
+    async fn copy_then_delete(
+        &self,
+        source_url: &str,
+        dest_url: &str,
+        etag: Option<&str>,
+    ) -> Result<()> {
+        let body = self.get_raw(source_url).await?;
+
+        let put = self
+            .client
+            .put(dest_url)
+            .basic_auth(&self.username, Some(&self.password))
+            .header("Content-Type", "text/calendar; charset=utf-8")
+            .header("If-None-Match", "*")
+            .body(body);
+        self.send_write(put, "PUT", dest_url).await?;
+
+        let mut delete = self
+            .client
+            .delete(source_url)
+            .basic_auth(&self.username, Some(&self.password));
+        if let Some(etag) = etag {
+            delete = delete.header("If-Match", etag);
+        }
+        self.send_write(delete, "DELETE", source_url)
+            .await
+            .map_err(|e| {
+                Error::Server(format!(
+                    "the event was copied to {dest_url} but the original at {source_url} \
+                     could not be removed, so it now exists twice: {e}"
+                ))
+            })
+    }
+
+    /// GET a resource's body unchanged.
+    async fn get_raw(&self, url: &str) -> Result<String> {
+        let response = self
+            .client
+            .get(url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        match status.as_u16() {
+            401 | 403 => Err(Error::InvalidCredentials(
+                "server rejected the username/app password",
+            )),
+            429 => Err(Error::RateLimited),
+            _ if status.is_success() => Ok(text),
+            code => Err(Error::Dav {
+                method: "GET".into(),
+                url: url.to_string(),
+                status: code,
+                body: truncate(&text, 400),
+            }),
+        }
+    }
+
+    /// Cancel one occurrence of a recurring series by adding an `EXDATE`, leaving
+    /// the rest of the series intact.
+    ///
+    /// `occurrence` may name a bare date, in which case it resolves against the
+    /// single occurrence falling on that day. Anything ambiguous is reported with
+    /// the candidates rather than guessed at — cancelling the wrong meeting is
+    /// not a recoverable mistake.
+    #[instrument(skip(self))]
+    pub async fn exclude_occurrence(
+        &self,
+        uid: &str,
+        calendar: Option<&str>,
+        occurrence: &str,
+    ) -> Result<Event> {
+        let existing = self
+            .get_event(uid, calendar)
+            .await?
+            .ok_or_else(|| Error::EventNotFound(uid.to_string()))?;
+        if existing.recurrence.is_none() {
+            return Err(Error::Server(format!(
+                "event {uid} is not a recurring series — delete it outright instead"
+            )));
+        }
+
+        let tzid = existing.start.tzid.as_deref();
+        let at = resolve_occurrence(&existing, occurrence, tzid)?;
+        let tz = util::resolve_tz(tzid)?;
+        if ical::excluded_instants(existing.recur_source.as_deref(), tz).contains(&at) {
+            return Err(Error::Server(format!(
+                "the occurrence at {} is already cancelled",
+                util::format_rfc3339(at)
+            )));
+        }
+
+        let exdate = TimeSpec {
+            instant: at,
+            all_day: existing.all_day,
+            tzid: tzid.filter(|_| !existing.all_day),
+        }
+        .render("EXDATE");
+
+        let mut recur_extra = ical::recur_extra_lines(existing.recur_source.as_deref());
+        recur_extra.push(exdate);
+        self.put_event(&existing, &existing.attendees, &recur_extra)
+            .await
+    }
+
+    /// Set your own `PARTSTAT` on an event you were invited to (RFC 6638 §3.2.5).
+    ///
+    /// Writing the reply to your own copy of the event is how CalDAV scheduling
+    /// works: the server notices the changed participation status and delivers
+    /// the reply to the organiser. `attendee` picks which row to update when the
+    /// address on the invitation differs from the login — common on iCloud, where
+    /// invitations arrive at an alias.
+    #[instrument(skip(self))]
+    pub async fn respond_to_invite(
+        &self,
+        uid: &str,
+        calendar: Option<&str>,
+        partstat: &str,
+        attendee: Option<&str>,
+    ) -> Result<Event> {
+        let existing = self
+            .get_event(uid, calendar)
+            .await?
+            .ok_or_else(|| Error::EventNotFound(uid.to_string()))?;
+
+        let me = attendee.unwrap_or(&self.username);
+        let mut attendees = existing.attendees.clone();
+        let Some(row) = attendees
+            .iter_mut()
+            .find(|a| a.email.eq_ignore_ascii_case(me))
+        else {
+            let listed: Vec<&str> = existing
+                .attendees
+                .iter()
+                .map(|a| a.email.as_str())
+                .collect();
+            return Err(Error::Server(format!(
+                "{me} is not on the attendee list for {uid}, so there is no reply to send. \
+                 Invited: {}",
+                if listed.is_empty() {
+                    "nobody".to_string()
+                } else {
+                    listed.join(", ")
+                }
+            )));
+        };
+        row.status = Some(partstat.to_ascii_uppercase());
+
+        let recur_extra = ical::recur_extra_lines(existing.recur_source.as_deref());
+        self.put_event(&existing, &attendees, &recur_extra).await
+    }
+
+    /// Re-write a stored event, changing only the attendee list and the
+    /// recurrence properties this tool doesn't model.
+    ///
+    /// Shared by the writes that adjust one facet of an event rather than merging
+    /// a whole field set over it, so none of them has to restate how an event is
+    /// rebuilt and addressed.
+    async fn put_event(
+        &self,
+        existing: &Event,
+        attendees: &[crate::models::Attendee],
+        recur_extra: &[String],
+    ) -> Result<Event> {
+        let start = existing.start.instant.ok_or_else(|| {
+            Error::Server("stored event has an unparseable start; set --start to fix it".into())
+        })?;
+        let tzid = existing.start.tzid.as_deref();
+        let spec = |instant| TimeSpec {
+            instant,
+            all_day: existing.all_day,
+            tzid: tzid.filter(|_| !existing.all_day),
+        };
+
+        let ics = ical::build_vcalendar(&VEventSpec {
+            uid: &existing.id,
+            summary: existing.summary.as_deref().unwrap_or("(no title)"),
+            start: spec(start),
+            end: spec(existing.end.instant.unwrap_or(start)),
+            description: existing.description.as_deref(),
+            location: existing.location.as_deref(),
+            url: existing.url.as_deref(),
+            status: existing.status.as_deref(),
+            recurrence: existing.recurrence.as_deref(),
+            recur_extra,
+            attendees,
+            organizer: existing.organizer.as_ref(),
+            categories: &existing.categories,
+            sequence: existing.sequence.saturating_add(1),
+            stamp: Utc::now(),
+        });
+
+        let url = existing.resource_url.clone();
+        let mut request = self
+            .client
+            .put(&url)
+            .basic_auth(&self.username, Some(&self.password))
+            .header("Content-Type", "text/calendar; charset=utf-8")
+            .body(ics.clone());
+        if let Some(etag) = existing.etag.as_deref() {
+            request = request.header("If-Match", etag);
+        }
+        self.send_write(request, "PUT", &url).await?;
+
+        ical::parse_events(
+            &ics,
+            &existing.calendar,
+            &existing.calendar_href,
+            &existing.href,
+            None,
+        )
+        .into_iter()
+        .next()
+        .map(|mut e| {
+            e.resource_url = url;
+            e
+        })
         .ok_or_else(|| Error::Server("built an event the parser rejected".into()))
     }
 
@@ -943,6 +1596,137 @@ fn matches_query(event: &Event, needle: &str) -> bool {
                     .as_deref()
                     .is_some_and(|n| n.to_lowercase().contains(needle))
         })
+}
+
+/// Which occurrence of a series `occurrence` names, as an instant.
+///
+/// An exact instant match wins. Failing that, a value that lands on a day with
+/// exactly one occurrence resolves to it — which is what lets a caller say
+/// `2026-08-03` without knowing what time the series runs at. Anything genuinely
+/// ambiguous is refused with the candidates listed: guessing which of two
+/// meetings to cancel is not a mistake worth making silently.
+///
+/// Public because it reads nothing from the network: a preview can resolve which
+/// occurrence it is about to describe without writing, and get the same answer
+/// the write will.
+pub fn resolve_occurrence(
+    event: &Event,
+    occurrence: &str,
+    tzid: Option<&str>,
+) -> Result<DateTime<Utc>> {
+    let parsed = util::parse_datetime(occurrence, tzid)?;
+    // All-day times are anchored at UTC midnight so the date survives the round
+    // trip; resolving their "day" through a zone would move it.
+    let tz = match event.all_day {
+        true => util::resolve_tz(None)?,
+        false => util::resolve_tz(tzid)?,
+    };
+
+    // Expanded with its exclusions stripped: an occurrence the user already
+    // cancelled is still one they can name, and telling them so beats claiming
+    // the series never ran then. Whether it is live is the caller's question.
+    let rule_only = Event {
+        recur_source: ical::recur_source_without_exclusions(event.recur_source.as_deref()),
+        ..event.clone()
+    };
+    // A day either side covers the local day whatever zone the series is
+    // authored in, without having to reason about which one that is.
+    let occurrences: Vec<DateTime<Utc>> = recur::expand_all(
+        vec![rule_only],
+        parsed.instant - Duration::days(1),
+        parsed.instant + Duration::days(2),
+    )
+    .into_iter()
+    .filter_map(|e| e.start.instant)
+    .collect();
+
+    if occurrences.contains(&parsed.instant) {
+        return Ok(parsed.instant);
+    }
+
+    let day = |at: DateTime<Utc>| at.with_timezone(&tz).date_naive();
+    let wanted = day(parsed.instant);
+    let same_day: Vec<DateTime<Utc>> = occurrences
+        .iter()
+        .copied()
+        .filter(|at| day(*at) == wanted)
+        .collect();
+
+    match same_day.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(Error::Server(format!(
+            "the series has no occurrence at {occurrence:?}"
+        ))),
+        many => Err(Error::Server(format!(
+            "{occurrence:?} matches {} occurrences — name one exactly: {}",
+            many.len(),
+            many.iter()
+                .map(|at| util::format_rfc3339(*at))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// A URL path segment for a calendar named `name`.
+///
+/// Lowercase ASCII alphanumerics and dashes only. Anything else — spaces,
+/// punctuation, non-Latin scripts — collapses to a dash, so a name that reduces
+/// to nothing falls back to a UUID rather than an empty segment. The display name
+/// carries the real name; this only has to be a stable, addressable id.
+fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    for ch in name.chars() {
+        match ch {
+            c if c.is_ascii_alphanumeric() => slug.push(c.to_ascii_lowercase()),
+            _ if !slug.ends_with('-') => slug.push('-'),
+            _ => {}
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    match slug.is_empty() {
+        true => uuid::Uuid::new_v4().to_string(),
+        false => slug,
+    }
+}
+
+/// The properties a PROPPATCH refused, as `name: status`.
+///
+/// Empty for a success, and for the servers that answer a bare `200` with no
+/// body at all — nothing to object to is not the same as a silent failure, and
+/// only a propstat carrying a non-2xx status is evidence of one.
+fn proppatch_failures(xml: &str) -> Vec<String> {
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return Vec::new();
+    };
+    doc.descendants()
+        .filter(|n| n.has_tag_name((DAV_NS, "propstat")))
+        .filter_map(|propstat| {
+            let status = propstat
+                .children()
+                .find(|n| n.has_tag_name((DAV_NS, "status")))
+                .and_then(|n| n.text())?
+                .trim();
+            // "HTTP/1.1 403 Forbidden" — the code is the second token.
+            let code: u16 = status.split_whitespace().nth(1)?.parse().ok()?;
+            if (200..300).contains(&code) {
+                return None;
+            }
+            let names: Vec<String> = propstat
+                .children()
+                .filter(|n| n.has_tag_name((DAV_NS, "prop")))
+                .flat_map(|prop| prop.children().filter(|n| n.is_element()))
+                .map(|n| n.tag_name().name().to_string())
+                .collect();
+            Some(format!(
+                "{} ({status})",
+                match names.is_empty() {
+                    true => "unnamed property".to_string(),
+                    false => names.join(", "),
+                }
+            ))
+        })
+        .collect()
 }
 
 fn ensure_trailing_slash(href: &str) -> String {
@@ -1611,5 +2395,117 @@ END:VCALENDAR
     fn trailing_slash_is_added_once() {
         assert_eq!(ensure_trailing_slash("/a/b"), "/a/b/");
         assert_eq!(ensure_trailing_slash("/a/b/"), "/a/b/");
+    }
+
+    #[test]
+    fn slugs_are_readable_url_segments() {
+        assert_eq!(slugify("Work Trips"), "work-trips");
+        assert_eq!(slugify("Jane's  Stuff!"), "jane-s-stuff");
+        assert_eq!(slugify("  Trim me  "), "trim-me");
+        // Two separators in a row don't produce an empty path component.
+        assert_eq!(slugify("a // b"), "a-b");
+    }
+
+    #[test]
+    fn a_name_with_no_ascii_still_yields_an_addressable_segment() {
+        // An empty path segment would address the collection's parent.
+        let slug = slugify("日本語");
+        assert!(!slug.is_empty());
+        assert!(!slug.contains('/'));
+    }
+
+    #[test]
+    fn a_proppatch_that_accepted_everything_reports_no_failures() {
+        let xml = r#"<multistatus xmlns="DAV:"><response><href>/c/</href>
+            <propstat><prop><displayname/></prop><status>HTTP/1.1 200 OK</status></propstat>
+        </response></multistatus>"#;
+        assert!(proppatch_failures(xml).is_empty());
+    }
+
+    #[test]
+    fn a_refused_property_is_named_with_its_status() {
+        // The whole point: this arrives inside a 207, which looks like a success.
+        let xml = r#"<multistatus xmlns="DAV:" xmlns:ic="http://apple.com/ns/ical/">
+          <response><href>/c/</href>
+            <propstat><prop><displayname/></prop><status>HTTP/1.1 200 OK</status></propstat>
+            <propstat><prop><ic:calendar-color/></prop><status>HTTP/1.1 403 Forbidden</status></propstat>
+        </response></multistatus>"#;
+        let failures = proppatch_failures(xml);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("calendar-color"));
+        assert!(failures[0].contains("403"));
+    }
+
+    #[test]
+    fn a_bodiless_success_is_not_read_as_a_failure() {
+        // Plenty of servers answer PROPPATCH 200 with nothing at all.
+        assert!(proppatch_failures("").is_empty());
+        assert!(proppatch_failures("not xml at all").is_empty());
+    }
+
+    /// A daily series at 09:00 London, running from 24 July 2026.
+    fn daily_series() -> Event {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Standup\r\n\
+                   DTSTART;TZID=Europe/London:20260724T090000\r\n\
+                   DTEND;TZID=Europe/London:20260724T093000\r\n\
+                   RRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR";
+        ical::parse_events(ics, "Home", "/c/", "/c/s.ics", None)
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_bare_date_resolves_to_that_days_occurrence() {
+        // The caller doesn't have to know the series runs at 09:00 London.
+        let at = resolve_occurrence(&daily_series(), "2026-07-29", Some("Europe/London")).unwrap();
+        assert_eq!(util::format_rfc3339(at), "2026-07-29T08:00:00Z");
+    }
+
+    #[test]
+    fn an_exact_instant_resolves_to_itself() {
+        let at = resolve_occurrence(
+            &daily_series(),
+            "2026-07-29T08:00:00Z",
+            Some("Europe/London"),
+        )
+        .unwrap();
+        assert_eq!(util::format_rfc3339(at), "2026-07-29T08:00:00Z");
+    }
+
+    #[test]
+    fn a_time_that_misses_by_a_little_still_finds_the_days_only_occurrence() {
+        // Forgiving because the caller then sees the resolved instant in a
+        // preview before agreeing to anything.
+        let at =
+            resolve_occurrence(&daily_series(), "2026-07-29 17:00", Some("Europe/London")).unwrap();
+        assert_eq!(util::format_rfc3339(at), "2026-07-29T08:00:00Z");
+    }
+
+    #[test]
+    fn a_day_the_series_does_not_run_is_refused() {
+        // The series starts on the 24th.
+        let err = resolve_occurrence(&daily_series(), "2026-07-20", Some("Europe/London"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no occurrence"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn several_occurrences_in_one_day_are_refused_with_the_candidates() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Hourly\r\n\
+                   DTSTART:20260724T090000Z\r\nDTEND:20260724T093000Z\r\n\
+                   RRULE:FREQ=HOURLY;COUNT=6\r\nEND:VEVENT\r\nEND:VCALENDAR";
+        let event = ical::parse_events(ics, "Home", "/c/", "/c/s.ics", None)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let err = resolve_occurrence(&event, "2026-07-24", None)
+            .unwrap_err()
+            .to_string();
+        // Guessing which of six to cancel is not a recoverable mistake.
+        assert!(err.contains("matches 6 occurrences"), "unhelpful: {err}");
+        assert!(err.contains("2026-07-24T09:00:00Z"), "no candidates: {err}");
     }
 }

@@ -200,6 +200,26 @@ pub struct EventFields<'a> {
     pub categories: Option<&'a [String]>,
 }
 
+/// Properties for creating or updating a calendar collection.
+///
+/// `None` leaves a property alone. On update, `Some("")` removes it outright —
+/// distinct from setting it empty, which some servers accept and others refuse.
+///
+/// `calendar-timezone` is deliberately absent: setting it means embedding a
+/// `VTIMEZONE`, which this tool does not emit.
+#[derive(Debug, Clone, Default)]
+pub struct CalendarFields<'a> {
+    /// `DAV:displayname`. Cannot be cleared — a calendar with no name is
+    /// addressable only by id, in every client the user owns.
+    pub name: Option<&'a str>,
+    /// `CALDAV:calendar-description`.
+    pub description: Option<&'a str>,
+    /// Apple's `calendar-color`, as `#RRGGBB` or `#RRGGBBAA`.
+    pub color: Option<&'a str>,
+    /// Apple's `calendar-order` — position in a calendar app's sidebar.
+    pub order: Option<i32>,
+}
+
 /// Uniform JSON envelope for CLI output: `{"success": true, "data": {...}}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Output<T: Serialize> {

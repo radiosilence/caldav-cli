@@ -235,20 +235,25 @@ expensive-but-legitimate query leaves the caller guessing at a threshold it
 can't see. Depth is capped at 15, because the graph has cycles by design
 (`event → calendar → events`) and nothing else bounds them.
 
-### Creating is one step; changing is two
+### Adding is one step; changing is two
 
-`createEvent` writes immediately. A wrong new event is visible and deletable,
-so a confirmation round trip buys nothing that the user's own eyes don't — the
-model reports what it made and gets corrected if it guessed badly.
+`createEvent`, `createCalendar` and `setDefaultCalendar` write immediately. A
+wrong new event is visible and deletable, a wrong new calendar likewise, and a
+misdirected default is one call to put back — so a confirmation round trip buys
+nothing the user's own eyes don't. The model reports what it did and gets
+corrected if it guessed badly. `setDefaultCalendar` returns `previousDefault` so
+that correction is one call away.
 
 ```graphql
 mutation { createEvent(summary: "Coffee", start: "tomorrow 15:00",
     durationMinutes: 30, tz: "Europe/London") { event { id summary } } }
 ```
 
-`updateEvent` and `deleteEvent` take an `action`, because they overwrite or
-remove something that already exists and a delete can't be undone. `PREVIEW`
-renders what would change — a before → after diff, or the event about to go —
+Everything that overwrites or removes existing state takes an `action`:
+`updateEvent`, `deleteEvent`, `moveEvent`, `deleteOccurrence`,
+`respondToInvite`, `updateCalendar`, `deleteCalendar`. `PREVIEW` renders what
+would change — a before → after diff, the event about to go, the occurrence a
+bare date resolved to, how many events a calendar deletion would take with it —
 and returns a one-shot `confirmationToken`; `CONFIRM` applies it. The token is
 bound to a fingerprint of the arguments, so a confirm whose arguments drifted
 from its preview is rejected rather than silently doing something else.
@@ -259,6 +264,32 @@ mutation { deleteEvent(action: PREVIEW, id: "...") { preview confirmationToken }
 mutation { deleteEvent(action: CONFIRM, id: "...",
     confirmationToken: "...") { success } }
 ```
+
+`respondToInvite` is in that list because it sends a message to another person:
+the server turns your changed `PARTSTAT` into a reply delivered to the
+organiser. `attendee` picks which row is you when the invitation arrived at an
+alias rather than the login address, which is the normal case on iCloud.
+
+### Calendars, not just events
+
+Collections are writable too — `createCalendar`, `updateCalendar`,
+`deleteCalendar`, `setDefaultCalendar`. `updateCalendar` takes typed fields
+(`name`, `description`, `color`, `order`) rather than exposing raw DAV property
+names. That is deliberate: property names and their namespaces aren't in the
+SDL, so a caller can't discover them, and a PROPPATCH answers `207` whatever it
+accepted — the real verdict is the per-`propstat` status. A misnamed property
+would be a silent no-op. Those statuses are read, so a refusal is an error
+naming the property and the code.
+
+`setDefaultCalendar` writes `schedule-default-calendar-URL` on the scheduling
+inbox (RFC 6638), which is the property the user's *own* calendar apps read to
+decide where a new event goes — so it reaches well beyond this tool. Not every
+server lets it be set; iCloud generally refuses, and the refusal comes back in
+`error` rather than being swallowed.
+
+Note the distinction from the configured `calendar`: that one decides where
+*this tool* puts an event when the model doesn't name one, and comes from config
+or the `X-CalDAV-Calendar` header. `setDefaultCalendar` changes the account.
 
 ### Recurring events
 
@@ -282,6 +313,18 @@ To **edit** a series, fetch it unexpanded (`events(expand: false)` or
 `caldav-cli list --no-expand`) and update the master event. From an expanded
 occurrence, `series { ... }` walks to that master directly — a whole page of
 occurrences resolves through one `calendar-multiget`.
+
+To **cancel one occurrence**, use `deleteOccurrence`, which adds an `EXDATE` to
+the master rather than touching the series otherwise — `deleteEvent` would take
+the lot. `occurrence` accepts a bare date when the series runs once that day, so
+a caller needn't know what time it runs at; the `PREVIEW` names the instant it
+resolved to, and a date matching several occurrences is refused with them listed
+rather than guessed at.
+
+```graphql
+mutation { deleteOccurrence(action: PREVIEW, id: "...",
+    occurrence: "2026-08-03") { preview confirmationToken } }
+```
 
 `Event.occurrences` goes the other way: it evaluates the rule already in hand,
 so "where does this series actually fall over the next quarter" costs no
@@ -358,9 +401,10 @@ gets your calendar without needing a header at all.
 
 ## Coverage
 
-CalDAV is a large surface and most of it is calendar-management plumbing this
-tool has no use for. What's implemented is the read/write path for events;
-what's missing is missing on purpose unless marked otherwise.
+CalDAV is a large surface. What's implemented is the read/write path for events
+and the calendars holding them; what's missing is missing on purpose unless
+marked otherwise. Sync tokens, sharing, and the scheduling inbox/outbox are the
+notable absences.
 
 ### Protocol
 
@@ -374,10 +418,13 @@ what's missing is missing on purpose unless marked otherwise.
 | Free/busy REPORT | RFC 4791 §7.10 | Tried first, derived from events when refused |
 | Server-side `text-match` search | RFC 4791 §7.8.5 | **Not used** — per-property and inconsistently implemented, so search is client-side |
 | Optimistic concurrency | `ETag` / `If-Match` | Full on update and delete |
-| `calendar-multiget` | RFC 4791 §7.9 | Not implemented — the time-range query already returns the data |
+| `calendar-multiget` | RFC 4791 §7.9 | Full — the one place CalDAV batches, used to resolve a page of occurrences to their masters in one request |
 | Sync tokens / incremental sync | RFC 6578 | Not implemented; every read is a fresh window query |
-| Create/delete/rename calendars | `MKCALENDAR`, `PROPPATCH` | Not implemented |
-| Scheduling — invites, RSVP, inbox/outbox | RFC 6638 | Not implemented. Attendees and their `PARTSTAT` are read and written as event properties; whether that generates invitations is the server's implicit-scheduling behaviour, not something this client drives |
+| Create/delete/rename calendars | `MKCALENDAR`, `PROPPATCH`, `DELETE` | Full. Display name, description, colour and sidebar order; per-`propstat` statuses are read, so a refused property is an error rather than a silent no-op |
+| Default calendar | RFC 6638 §9.2 `schedule-default-calendar-URL` | Read, and settable via `PROPPATCH` on the scheduling inbox. Many servers — iCloud included — refuse the write; the refusal is reported |
+| Move a resource between collections | `MOVE` (RFC 4918 §9.9) | Full, falling back to a verbatim copy plus delete. Both paths move the stored bytes, so nothing outside our model is lost |
+| Scheduling — RSVP | RFC 6638 §3.2.5 | `respondToInvite` writes your own `PARTSTAT`, which is how a reply is generated. Whether the server actually delivers one is its implicit-scheduling behaviour |
+| Scheduling — inbox/outbox, `iTIP` freebusy | RFC 6638 | Not implemented. The inbox is located only to read and write the default-calendar property |
 | Sharing and ACLs | RFC 3744, Apple ext | Not implemented beyond the read-only flag |
 
 ### Event data
@@ -390,8 +437,10 @@ what's missing is missing on purpose unless marked otherwise.
 | Organizer, attendees, with `CN` / `ROLE` / `PARTSTAT` | Read and written |
 | All-day (`VALUE=DATE`) and `TZID` local times | Read and written |
 | `DURATION` as an alternative to `DTEND` | Read; always written as `DTEND` |
-| `RRULE`, `EXDATE`, `RDATE`, `EXRULE` | Read and expanded; only `RRULE` is settable |
+| `RRULE` | Read, expanded, and settable |
+| `EXDATE`, `RDATE`, `EXRULE` | Read, expanded, and preserved verbatim across an update. `EXDATE` is also writable through `deleteOccurrence`; `RDATE`/`EXRULE` are carried but not authored. Replacing the `RRULE` drops all three, since exceptions to a rule that no longer exists describe nothing |
 | `RECURRENCE-ID` overrides | Respected on read — an edited occurrence replaces its generated slot, a cancelled one disappears |
+| Cancelling a single occurrence | Supported via `deleteOccurrence`, which adds an `EXDATE` |
 | Editing a single occurrence of a series | **Not supported.** Updates target the master event and rewrite the whole resource, which drops sibling override components |
 | `VALARM` reminders | Not parsed and not written — **an update strips existing alarms** |
 | `ATTACH`, `GEO`, `CLASS`, `TRANSP`, `X-` properties | Not modelled — **also dropped on update** |
@@ -402,6 +451,10 @@ from the parsed model rather than patching the original text, so anything
 outside the model is lost. That is fine for events this tool created and lossy
 for events it didn't — worth knowing before pointing it at a calendar full of
 invitations with alarms on them.
+
+`moveEvent` is the exception, and deliberately so: it relocates the stored
+resource rather than rebuilding it, so an event with alarms survives a move even
+though it would not survive an edit.
 
 ## Apple / iCloud
 
@@ -422,6 +475,7 @@ drifted. The quirks that actually bite, and what this client does about them:
 | **No free/busy.** iCloud doesn't answer the free-busy REPORT for a personal calendar home. | Falls back to deriving busy periods from the events. |
 | **App-specific passwords only** — the Apple ID password is rejected, and there is no OAuth. | `auth` verifies credentials against the server before storing them, so a wrong password fails immediately with a clear message instead of a confusing discovery error. |
 | **Eventual consistency** — a write is not always visible on the next read. | Writes return the event as written rather than re-reading it. |
+| **Refuses to let the default calendar be set.** The `PROPPATCH` comes back `207` with a `403` inside, which looks like a success unless you read the propstats. | Propstat statuses are checked, so `setDefaultCalendar` reports the refusal instead of claiming to have worked. |
 
 Fastmail, Nextcloud, and Radicale are better-behaved and work through the same
 code path; iCloud is simply the one that needs the accommodations.
@@ -445,12 +499,22 @@ code path; iCloud is simply the one that needs the accommodations.
 - **Writes use optimistic concurrency.** Updates send `If-Match` with the etag
   that was read; a concurrent edit returns an error telling you to re-read
   rather than silently clobbering someone else's change.
+- **Property writes are checked per property, not per response.** A `PROPPATCH`
+  answers `207` whichever properties it accepted, with the real verdict inside
+  each `propstat` — so trusting the HTTP status turns a wholly-refused patch
+  into a reported success. The statuses are read and a refusal names the
+  property and the code.
+- **The mutation surface is typed, not a `PROPPATCH` passthrough.** A generic
+  property-setting mutation would be more powerful, but DAV property names and
+  namespaces don't appear in the SDL, so a model composing a query can't
+  discover them and a misnamed one is dropped without complaint. The generic
+  primitive lives in the client, where the callers know the names.
 - **One unreadable calendar doesn't sink the agenda** — it's logged and skipped.
 
 ## Development
 
 ```bash
-cargo test          # 137 tests, including an end-to-end suite against a mock server
+cargo test          # 251 tests, including an end-to-end suite against a mock server
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```

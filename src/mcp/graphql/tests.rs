@@ -778,3 +778,204 @@ async fn the_sdl_carries_the_guidance_that_replaced_the_prelude() {
         );
     }
 }
+
+// ============ Two-phase writes ============
+
+/// PREVIEW → CONFIRM in two requests, as a model does it: the token from the
+/// first is carried into the second.
+///
+/// Returns both results so a test can assert on the preview text as well as the
+/// outcome. `confirm` is the mutation with `$t` standing in for the token.
+async fn preview_then_confirm(h: &Harness, preview: &str, confirm: &str) -> (Value, Value) {
+    let first = h.run(preview).await;
+    let result = first
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .expect("no mutation field in the preview response");
+    let token = result["confirmationToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("preview issued no token: {result}"))
+        .to_string();
+    let second = h.run(&confirm.replace("$t", &token)).await;
+    (result.clone(), second)
+}
+
+/// Accept any PUT, so a write reaches the assertion rather than an HTTP error.
+async fn accept_writes(h: &Harness) {
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&h.server)
+        .await;
+}
+
+#[tokio::test]
+async fn confirming_without_a_token_is_refused_by_every_two_phase_mutation() {
+    let h = Harness::start().await;
+    accept_writes(&h).await;
+
+    // Each of these changes or removes something, so none may act on a CONFIRM
+    // the user was never shown.
+    for mutation in [
+        r#"updateEvent(action: CONFIRM, id: "standup", summary: "x")"#,
+        r#"deleteEvent(action: CONFIRM, id: "standup")"#,
+        r#"moveEvent(action: CONFIRM, id: "standup", toCalendar: "Team")"#,
+        r#"deleteOccurrence(action: CONFIRM, id: "standup", occurrence: "2026-08-03")"#,
+        r#"respondToInvite(action: CONFIRM, id: "review", response: ACCEPTED)"#,
+    ] {
+        let data = h
+            .run(&format!("mutation {{ m: {mutation} {{ success error }} }}"))
+            .await;
+        assert_eq!(data["m"]["success"], false, "{mutation} wrote unguarded");
+        assert!(
+            data["m"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("confirmationToken"),
+            "{mutation}: {:?}",
+            data["m"]["error"]
+        );
+    }
+
+    // And the calendar-shaped ones, which answer with a different result type.
+    for mutation in [
+        r#"updateCalendar(action: CONFIRM, id: "home", name: "x")"#,
+        r#"deleteCalendar(action: CONFIRM, id: "home")"#,
+    ] {
+        let data = h
+            .run(&format!("mutation {{ m: {mutation} {{ success error }} }}"))
+            .await;
+        assert_eq!(data["m"]["success"], false, "{mutation} wrote unguarded");
+    }
+}
+
+#[tokio::test]
+async fn cancelling_an_occurrence_previews_the_instant_it_resolved_to() {
+    let h = Harness::start().await;
+    accept_writes(&h).await;
+
+    let (preview, confirmed) = preview_then_confirm(
+        &h,
+        // A bare date. The series is weekly on Mondays from 27 July 2026.
+        r#"mutation { deleteOccurrence(action: PREVIEW, id: "standup", occurrence: "2026-08-03") { preview confirmationToken } }"#,
+        r#"mutation { deleteOccurrence(action: CONFIRM, id: "standup", occurrence: "2026-08-03", confirmationToken: "$t") { success error event { id } } }"#,
+    )
+    .await;
+
+    let text = preview["preview"].as_str().unwrap();
+    // The resolved instant is the whole point: a bare date is ambiguous, and the
+    // user has to see which occurrence they are agreeing to lose.
+    assert!(
+        text.contains("2026-08-03T09:00:00Z"),
+        "preview hides which occurrence: {text}"
+    );
+    assert!(text.contains("rest of the series is untouched"), "{text}");
+    assert_eq!(confirmed["deleteOccurrence"]["success"], true);
+
+    // The write added an EXDATE and kept the rule.
+    let put = h
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.method == "PUT")
+        .expect("nothing was written");
+    let body = String::from_utf8(put.body).unwrap();
+    assert!(body.contains("EXDATE:20260803T090000Z"), "{body}");
+    assert!(body.contains("RRULE:FREQ=WEEKLY;BYDAY=MO"), "{body}");
+}
+
+#[tokio::test]
+async fn a_confirm_naming_a_different_occurrence_than_the_preview_is_rejected() {
+    let h = Harness::start().await;
+    accept_writes(&h).await;
+
+    let preview = h
+        .run(
+            r#"mutation { deleteOccurrence(action: PREVIEW, id: "standup", occurrence: "2026-08-03") { confirmationToken } }"#,
+        )
+        .await;
+    let token = preview["deleteOccurrence"]["confirmationToken"]
+        .as_str()
+        .unwrap();
+
+    // Same token, different occurrence — the user approved losing the 3rd.
+    let data = h
+        .run(&format!(
+            r#"mutation {{ deleteOccurrence(action: CONFIRM, id: "standup", occurrence: "2026-08-10", confirmationToken: "{token}") {{ success error }} }}"#
+        ))
+        .await;
+
+    assert_eq!(data["deleteOccurrence"]["success"], false);
+    assert!(
+        data["deleteOccurrence"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Params changed"),
+        "{:?}",
+        data["deleteOccurrence"]["error"]
+    );
+    assert_eq!(h.count("PUT", "/calendars/").await, 0, "it wrote anyway");
+}
+
+#[tokio::test]
+async fn replying_to_an_invite_previews_the_status_change_and_the_organiser() {
+    let h = Harness::start().await;
+    accept_writes(&h).await;
+
+    // The Team fixture's review event has Alice on it and no PARTSTAT for us.
+    let data = h
+        .run(
+            r#"mutation { respondToInvite(action: PREVIEW, id: "review", response: DECLINED, attendee: "alice@example.com") { preview } }"#,
+        )
+        .await;
+
+    let text = data["respondToInvite"]["preview"].as_str().unwrap();
+    assert!(text.contains("NEEDS-ACTION → DECLINED"), "{text}");
+    // Sending a message to a human is exactly what needs saying out loud.
+    assert!(text.contains("organiser is notified"), "{text}");
+}
+
+#[tokio::test]
+async fn moving_an_event_previews_both_calendars() {
+    let h = Harness::start().await;
+
+    let data = h
+        .run(
+            r#"mutation { moveEvent(action: PREVIEW, id: "lunch", toCalendar: "Team") { preview } }"#,
+        )
+        .await;
+
+    let text = data["moveEvent"]["preview"].as_str().unwrap();
+    assert!(text.contains("From calendar: Home"), "{text}");
+    assert!(text.contains("To calendar: Team"), "{text}");
+}
+
+#[tokio::test]
+async fn deleting_a_calendar_previews_how_much_would_be_lost() {
+    let h = Harness::start().await;
+
+    let data = h
+        .run(r#"mutation { deleteCalendar(action: PREVIEW, id: "home") { preview } }"#)
+        .await;
+
+    let text = data["deleteCalendar"]["preview"].as_str().unwrap();
+    // "This deletes the calendar" says nothing about the scale of the loss.
+    assert!(text.contains("event(s)"), "no count of the loss: {text}");
+    assert!(text.contains("Every event in it is deleted too"), "{text}");
+    assert!(text.contains("cannot be undone"), "{text}");
+}
+
+#[tokio::test]
+async fn an_unknown_calendar_fails_the_preview_instead_of_issuing_a_token() {
+    let h = Harness::start().await;
+
+    let data = h
+        .run(r#"mutation { deleteCalendar(action: PREVIEW, id: "nope") { success error confirmationToken } }"#)
+        .await;
+
+    assert_eq!(data["deleteCalendar"]["success"], false);
+    assert!(data["deleteCalendar"]["confirmationToken"].is_null());
+}
