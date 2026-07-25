@@ -219,10 +219,46 @@ impl CalDavClient {
                     .await?;
                 let mut calendars = parse_calendars(&xml, home);
                 calendars.sort_by_key(|c| c.name.to_lowercase());
+
+                // Servers disagree on where they'll answer this. Most volunteer
+                // it in the listing above; RFC 6638 only requires it on the
+                // scheduling inbox. Ask there when the free answer is missing —
+                // one extra round trip, once per client, and only when needed.
+                let default = match parse_default_href(&xml) {
+                    Some(href) => Some(href),
+                    None => self.default_calendar_from_inbox(&xml, home).await,
+                };
+                if let Some(href) = default {
+                    mark_default(&mut calendars, &href);
+                }
                 Ok(calendars)
             })
             .await
             .map(Vec::as_slice)
+    }
+
+    /// Ask the scheduling inbox for the default calendar, the one place RFC
+    /// 6638 requires it to live. Best-effort: an account with no scheduling
+    /// support has no inbox, and a server may refuse the request outright.
+    async fn default_calendar_from_inbox(&self, listing: &str, home: &str) -> Option<String> {
+        const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><c:schedule-default-calendar-URL/></d:prop>
+</d:propfind>"#;
+
+        let inbox = parse_inbox_href(listing, home)?;
+        let xml = self
+            .dav(
+                "PROPFIND",
+                &inbox,
+                Some("0"),
+                "application/xml",
+                Some(BODY.into()),
+            )
+            .await
+            .inspect_err(|e| debug!(error = %e, "no default calendar from the scheduling inbox"))
+            .ok()?;
+        parse_default_href(&xml)
     }
 
     /// Resolve a calendar by id, display name, or href. With no name, the
@@ -896,6 +932,68 @@ fn pick_default(calendars: &[Calendar]) -> Option<&Calendar> {
         .or_else(|| calendars.first())
 }
 
+/// The account's default calendar for new events, from wherever the server
+/// chose to answer `schedule-default-calendar-URL`.
+///
+/// Servers disagree on shape, so read the value rather than a fixed structure:
+/// RFC 6638 wraps the URL in a `DAV:href`, iCloud puts the path straight in the
+/// element, and a server echoes the property back empty in the 404 propstat of
+/// every collection that hasn't got it — so the first element carrying the name
+/// is not necessarily the one carrying the value.
+fn parse_default_href(xml: &str) -> Option<String> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    doc.descendants()
+        .filter(|n| n.has_tag_name((CALDAV_NS, "schedule-default-calendar-URL")))
+        .find_map(|n| {
+            n.descendants()
+                .find(|c| c.has_tag_name((DAV_NS, "href")))
+                .and_then(|h| h.text())
+                .or_else(|| n.text())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .map(util::href_path)
+}
+
+/// The scheduling inbox collection, if this account has one.
+fn parse_inbox_href(xml: &str, home: &str) -> Option<String> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    doc.descendants()
+        .filter(|n| n.has_tag_name((DAV_NS, "response")))
+        .find(|response| {
+            response
+                .descendants()
+                .any(|n| n.has_tag_name((CALDAV_NS, "schedule-inbox")))
+        })?
+        .children()
+        .find(|n| n.has_tag_name((DAV_NS, "href")))?
+        .text()
+        .map(|href| util::resolve_url(home, href))
+}
+
+/// Flag the calendar `href` points at.
+///
+/// Matches on the full path first, then on the last segment alone: a server is
+/// free to answer with a different host or path prefix than the one it listed
+/// calendars under, and the collection id is what survives that.
+fn mark_default(calendars: &mut [Calendar], href: &str) {
+    let target = util::href_path(href);
+    let trimmed = target.trim_end_matches('/');
+    if let Some(c) = calendars
+        .iter_mut()
+        .find(|c| c.href.trim_end_matches('/') == trimmed)
+    {
+        c.is_default = true;
+        return;
+    }
+    let id = util::last_segment(&target);
+    if !id.is_empty()
+        && let Some(c) = calendars.iter_mut().find(|c| c.id == id)
+    {
+        c.is_default = true;
+    }
+}
+
 fn parse_calendars(xml: &str, home: &str) -> Vec<Calendar> {
     let Ok(doc) = roxmltree::Document::parse(xml) else {
         return Vec::new();
@@ -907,23 +1005,6 @@ fn parse_calendars(xml: &str, home: &str) -> Vec<Calendar> {
     // child of the calendar-home — so a Depth:1 listing carries it without an
     // extra round trip. The inbox is skipped as a calendar below (its
     // resourcetype is schedule-inbox), so scan the whole document for it.
-    // Two hazards here. iCloud echoes every requested property back, empty, in
-    // each collection's 404 propstat, so the first element carrying the name is
-    // not the one carrying the value. And where RFC 6638 wraps the URL in a
-    // DAV:href, iCloud puts it straight in the element as text.
-    let default_href = doc
-        .descendants()
-        .filter(|n| n.has_tag_name((CALDAV_NS, "schedule-default-calendar-URL")))
-        .find_map(|n| {
-            n.descendants()
-                .find(|c| c.has_tag_name((DAV_NS, "href")))
-                .and_then(|h| h.text())
-                .or_else(|| n.text())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })
-        .map(util::href_path);
-
     for response in doc
         .descendants()
         .filter(|n| n.has_tag_name((DAV_NS, "response")))
@@ -985,9 +1066,9 @@ fn parse_calendars(xml: &str, home: &str) -> Vec<Calendar> {
 
         out.push(Calendar {
             id: util::last_segment(&href),
-            is_default: default_href
-                .as_deref()
-                .is_some_and(|d| d.trim_end_matches('/') == href.trim_end_matches('/')),
+            // Set afterwards by `mark_default` — which collection is the
+            // default depends on a property that may not be in this document.
+            is_default: false,
             // Resolve against the home URL, which carries the partition host
             // iCloud redirected us to — not the URL the user configured.
             url: util::resolve_url(home, &href),
@@ -1096,8 +1177,17 @@ mod tests {
 </multistatus>"#;
 
     fn calendars() -> Vec<Calendar> {
-        let mut c = parse_calendars(CALENDARS_XML, "/1234/calendars/");
+        parse_listing(CALENDARS_XML)
+    }
+
+    /// The same pipeline `list_calendars` runs: parse, sort, then flag the
+    /// default the server named.
+    fn parse_listing(xml: &str) -> Vec<Calendar> {
+        let mut c = parse_calendars(xml, "/1234/calendars/");
         c.sort_by_key(|c| c.name.to_lowercase());
+        if let Some(href) = parse_default_href(xml) {
+            mark_default(&mut c, &href);
+        }
         c
     }
 
@@ -1111,7 +1201,7 @@ mod tests {
                 "<cal:schedule-default-calendar-URL><href>/1234/calendars/home/</href></cal:schedule-default-calendar-URL>",
                 "<cal:schedule-default-calendar-URL>/1234/calendars/home/</cal:schedule-default-calendar-URL>",
             );
-        let cals = parse_calendars(&xml, "/1234/calendars/");
+        let cals = parse_listing(&xml);
         let default: Vec<&str> = cals
             .iter()
             .filter(|c| c.is_default)
@@ -1169,11 +1259,40 @@ mod tests {
     #[test]
     fn no_default_property_leaves_every_calendar_unmarked() {
         let xml = CALENDARS_XML.replace("schedule-default-calendar-URL", "unrelated-prop");
-        assert!(
-            !parse_calendars(&xml, "/1234/calendars/")
-                .iter()
-                .any(|c| c.is_default)
+        assert!(!parse_listing(&xml).iter().any(|c| c.is_default));
+    }
+
+    #[test]
+    fn finds_the_scheduling_inbox_to_ask_when_the_listing_is_silent() {
+        // Servers that only answer on the inbox: we must be able to find it.
+        let inbox = parse_inbox_href(CALENDARS_XML, "https://p42.example.com/1234/calendars/");
+        assert_eq!(
+            inbox.as_deref(),
+            Some("https://p42.example.com/1234/calendars/inbox/")
         );
+    }
+
+    #[test]
+    fn matches_a_default_answered_on_another_host_or_prefix() {
+        // The inbox may name the calendar by a URL that shares nothing with the
+        // listing but the collection id.
+        let mut cals = calendars();
+        cals.iter_mut().for_each(|c| c.is_default = false);
+        mark_default(&mut cals, "https://p99.example.com/other/prefix/home/");
+        let default: Vec<&str> = cals
+            .iter()
+            .filter(|c| c.is_default)
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(default, ["home"]);
+    }
+
+    #[test]
+    fn an_unknown_default_marks_nothing() {
+        let mut cals = calendars();
+        cals.iter_mut().for_each(|c| c.is_default = false);
+        mark_default(&mut cals, "/1234/calendars/deleted-last-week/");
+        assert!(!cals.iter().any(|c| c.is_default));
     }
 
     #[test]
