@@ -2,6 +2,7 @@
 
 use async_graphql::{Context, Object, Result};
 
+use super::DefaultCalendar;
 use super::connection::{
     EventConnection, EventQuery, ListConnection, PageArgs, events_connection, page_complexity,
     paginate,
@@ -41,14 +42,18 @@ impl QueryRoot {
         )
     }
 
-    /// One calendar by id, display name, or path. Omit `id` for the account's
-    /// default — where a new event lands if you don't say otherwise.
+    /// One calendar by id, display name, or path. Omit `id` for where a new
+    /// event lands if you don't say otherwise: the calendar chosen for this
+    /// connection, else the account's own default.
     async fn calendar(
         &self,
         ctx: &Context<'_>,
         #[graphql(desc = "Calendar id, display name, or href. Omit for the default calendar.")]
         id: Option<String>,
     ) -> Result<GqlCalendar> {
+        // The same fallback `createEvent` applies, so asking where an event
+        // will go and then creating one can't disagree.
+        let id = id.or_else(|| ctx.data_opt::<DefaultCalendar>().and_then(|d| d.0.clone()));
         let calendars = all_calendars(ctx).await?;
         Ok(GqlCalendar::from(resolve_calendar(
             &calendars,

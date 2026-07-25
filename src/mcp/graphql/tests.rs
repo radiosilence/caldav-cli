@@ -212,6 +212,21 @@ impl Harness {
         response.data.into_json().unwrap()
     }
 
+    /// As `run`, but with a calendar chosen for the connection — what the
+    /// `X-CalDAV-Calendar` header sets in hosted mode.
+    async fn run_with_default(&self, query: &str, default: &str) -> Value {
+        let response = self
+            .schema
+            .execute(request(query, self.client(), Some(default.into())))
+            .await;
+        assert!(
+            response.errors.is_empty(),
+            "query failed: {:?}",
+            response.errors
+        );
+        response.data.into_json().unwrap()
+    }
+
     async fn run_expecting_error(&self, query: &str) -> String {
         let response = self
             .schema
@@ -978,4 +993,25 @@ async fn an_unknown_calendar_fails_the_preview_instead_of_issuing_a_token() {
 
     assert_eq!(data["deleteCalendar"]["success"], false);
     assert!(data["deleteCalendar"]["confirmationToken"].is_null());
+}
+/// `calendar` with no id is documented as "where a new event lands if you
+/// don't say otherwise" — so it has to apply the same fallback `createEvent`
+/// does. It didn't, and answered the account's default while a create with the
+/// same connection wrote somewhere else entirely.
+#[tokio::test]
+async fn the_calendar_query_agrees_with_where_an_event_would_land() {
+    let h = Harness::start().await;
+
+    let asked = h.run_with_default("{ calendar { name } }", "Team").await;
+    assert_eq!(asked["calendar"]["name"], "Team");
+
+    // And with nothing chosen, still the account's own default.
+    let unset = h.run("{ calendar { name } }").await;
+    assert_eq!(unset["calendar"]["name"], "Home");
+
+    // An explicit id still wins over the connection's choice.
+    let explicit = h
+        .run_with_default("{ calendar(id: \"Home\") { name } }", "Team")
+        .await;
+    assert_eq!(explicit["calendar"]["name"], "Home");
 }
