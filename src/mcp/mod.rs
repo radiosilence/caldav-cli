@@ -138,12 +138,16 @@ Times accept ISO 8601, 'YYYY-MM-DD HH:MM', 'today'/'tomorrow', and offsets like 
 time. `events` and `agenda` expand recurring series by default; to edit a \
 series, fetch it with `expand: false` and update the master event.
 
-## Writes are two-phase
+## Creating vs changing
 
-`action: PREVIEW` renders what would change and returns a one-shot \
-`confirmationToken`; `action: CONFIRM` with that token applies it. NEVER \
-confirm without reading the preview back to the user and getting approval. A \
-calendar is shared, visible state, and deletions cannot be undone.
+`createEvent` writes straight away. Don't ask first — create the event, then \
+tell the user what you made and where it landed, so they can correct you.
+
+`updateEvent` and `deleteEvent` are two-phase, because they destroy something \
+that is already there and a delete cannot be undone. `action: PREVIEW` renders \
+what would change and returns a one-shot `confirmationToken`; `action: CONFIRM` \
+with that token applies it. NEVER confirm without reading the preview back to \
+the user and getting approval.
 
 ## Examples
 
@@ -160,8 +164,10 @@ calendar is shared, visible state, and deletions cannot be undone.
 
 { freeBusy(start: \"today\", days: 3) { start end status } }
 
-mutation { createEvent(action: PREVIEW, summary: \"Coffee\", start: \"tomorrow 15:00\",
-    durationMinutes: 30, tz: \"Europe/London\") { preview confirmationToken } }
+mutation { createEvent(summary: \"Coffee\", start: \"tomorrow 15:00\",
+    durationMinutes: 30, tz: \"Europe/London\") { event { id summary } } }
+
+mutation { deleteEvent(action: PREVIEW, id: \"...\") { preview confirmationToken } }
 ```
 
 ## Schema
@@ -342,8 +348,8 @@ impl ServerHandler for CalDavMcp {
             .with_instructions(
                 "The user's calendars, as a small GraphQL API. Read the schema and its usage \
                  rules once with `calendar_schema`, then run queries and mutations with \
-                 `calendar`. Writes are preview-then-confirm; never confirm one the user \
-                 hasn't seen.",
+                 `calendar`. Creating an event needs no confirmation; updates and deletes \
+                 are preview-then-confirm, and never confirm one the user hasn't seen.",
             )
     }
 }

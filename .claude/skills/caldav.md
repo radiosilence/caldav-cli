@@ -163,9 +163,10 @@ In HTTP mode credentials come from `X-CalDAV-Username`, `X-CalDAV-Password`,
 and optionally `X-CalDAV-Url` — injected by a trusted upstream, never by the
 client. Both username and password must be present for the headers to be used.
 
-**All mutations are two-phase.** `action: PREVIEW` returns a description of the
-change plus a one-shot `confirmationToken`; `action: CONFIRM` with that token
-applies it. Show the user the preview before confirming — always.
+**Creating an event is one step** — write it, then say what you wrote.
+**Updates and deletes are two-phase**: `action: PREVIEW` returns a description
+of the change plus a one-shot `confirmationToken`; `action: CONFIRM` with that
+token applies it. Show the user the preview before confirming — always.
 
 ---
 
