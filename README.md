@@ -201,6 +201,53 @@ This is the transport `jaritanet-mcp-gateway` puts behind OAuth. Because
 CalDAV needs three values rather than one bearer token, the gateway stores a
 credential *set* for this MCP.
 
+## Coverage
+
+CalDAV is a large surface and most of it is calendar-management plumbing this
+tool has no use for. What's implemented is the read/write path for events;
+what's missing is missing on purpose unless marked otherwise.
+
+### Protocol
+
+| Feature | Spec | Status |
+| --- | --- | --- |
+| Principal + calendar-home discovery | RFC 4791 §6, RFC 6764 well-known | Full, memoised per client |
+| List collections, names, colours, descriptions | RFC 4791, Apple `ic:` ext | Full |
+| Read-only detection | `current-user-privilege-set` | Full; absent privileges assumed writable |
+| `calendar-query` time-range REPORT | RFC 4791 §7.8 | Full |
+| Server-side recurrence `<C:expand>` | RFC 4791 §9.6.5 | Requested, with client-side fallback |
+| Free/busy REPORT | RFC 4791 §7.10 | Tried first, derived from events when refused |
+| Server-side `text-match` search | RFC 4791 §7.8.5 | **Not used** — per-property and inconsistently implemented, so search is client-side |
+| Optimistic concurrency | `ETag` / `If-Match` | Full on update and delete |
+| `calendar-multiget` | RFC 4791 §7.9 | Not implemented — the time-range query already returns the data |
+| Sync tokens / incremental sync | RFC 6578 | Not implemented; every read is a fresh window query |
+| Create/delete/rename calendars | `MKCALENDAR`, `PROPPATCH` | Not implemented |
+| Scheduling — invites, RSVP, inbox/outbox | RFC 6638 | Not implemented. Attendees and their `PARTSTAT` are read and written as event properties; whether that generates invitations is the server's implicit-scheduling behaviour, not something this client drives |
+| Sharing and ACLs | RFC 3744, Apple ext | Not implemented beyond the read-only flag |
+
+### Event data
+
+| Feature | Status |
+| --- | --- |
+| `VEVENT` | Read and written |
+| `VTODO` / `VJOURNAL` | Not supported; collections holding only these are skipped on read |
+| Summary, description, location, URL, status, categories | Read and written |
+| Organizer, attendees, with `CN` / `ROLE` / `PARTSTAT` | Read and written |
+| All-day (`VALUE=DATE`) and `TZID` local times | Read and written |
+| `DURATION` as an alternative to `DTEND` | Read; always written as `DTEND` |
+| `RRULE`, `EXDATE`, `RDATE`, `EXRULE` | Read and expanded; only `RRULE` is settable |
+| `RECURRENCE-ID` overrides | Respected on read — an edited occurrence replaces its generated slot, a cancelled one disappears |
+| Editing a single occurrence of a series | **Not supported.** Updates target the master event and rewrite the whole resource, which drops sibling override components |
+| `VALARM` reminders | Not parsed and not written — **an update strips existing alarms** |
+| `ATTACH`, `GEO`, `CLASS`, `TRANSP`, `X-` properties | Not modelled — **also dropped on update** |
+| `VTIMEZONE` components | Not emitted. Writes reference an IANA `TZID` without defining it, which every tested server accepts but is not strictly conformant |
+
+The three bolded rows share one cause: an update rebuilds the iCalendar object
+from the parsed model rather than patching the original text, so anything
+outside the model is lost. That is fine for events this tool created and lossy
+for events it didn't — worth knowing before pointing it at a calendar full of
+invitations with alarms on them.
+
 ## Apple / iCloud
 
 Apple publishes **no** REST API, SDK, OAuth flow, or developer program for
