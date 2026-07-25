@@ -1,8 +1,12 @@
 //! MCP (Model Context Protocol) server for CalDAV.
 //!
 //! Exposes calendar functionality via two GraphQL tools:
-//! - `schema_sdl` — returns the full GraphQL SDL for introspection
-//! - `graphql` — executes a GraphQL query/mutation
+//! - `calendar_schema` — the SDL and the rules for using it
+//! - `calendar` — executes a query/mutation
+//!
+//! The schema is ~5k tokens, so it stays behind a tool call rather than riding
+//! in the always-loaded tool descriptions: a session that never mentions a
+//! calendar should pay close to nothing for having this server connected.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,7 +14,9 @@ use std::sync::Arc;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    },
     schemars,
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -121,6 +127,92 @@ pub struct GraphqlRequest {
     pub variables: Option<String>,
 }
 
+/// Prelude to the schema. It lives here rather than in the server instructions
+/// because instructions are loaded into every session, and most of them never
+/// touch a calendar — this is only paid by the ones that do.
+pub(crate) const USAGE: &str = "\
+# Calendar API
+
+Times accept ISO 8601, 'YYYY-MM-DD HH:MM', 'today'/'tomorrow', and offsets like \
+'+2h'. Pass `tz` (e.g. Europe/London) whenever the user means a local wall-clock \
+time. `events` and `agenda` expand recurring series by default; to edit a \
+series, fetch it with `expand: false` and update the master event.
+
+## Reading
+
+Every list is a connection: select `nodes { ... }` for the items, `totalCount` \
+for the match count (free — ask for it whenever the user wants a number), and \
+`pageInfo { hasNextPage endCursor }` plus `after:` to page. Default page is 25, \
+max 100.
+
+Ask for everything you need in one query rather than following up. Nested \
+fields are lazy and batched, so `calendar { ... }`, `conflicts { ... }` and \
+`occurrences { ... }` on a page of events cost one request between them, not \
+one each. `occurrences` costs nothing at all — it evaluates the rule already \
+fetched.
+
+Narrow with `filter`, which nests: scalars on one object AND together, and \
+`and`/`or`/`not` take further filters. Prefer `events(filter: { text: ... })` \
+over the deprecated `searchEvents`. Naming `calendar:` queries one collection \
+instead of every one.
+
+## Creating vs changing
+
+`createEvent` writes straight away. Don't ask first — create the event, then \
+tell the user what you made and where it landed, so they can correct you.
+
+`updateEvent` and `deleteEvent` are two-phase, because they destroy something \
+that is already there and a delete cannot be undone. `action: PREVIEW` renders \
+what would change and returns a one-shot `confirmationToken`; `action: CONFIRM` \
+with that token applies it. NEVER confirm without reading the preview back to \
+the user and getting approval.
+
+## Examples
+
+```graphql
+{ calendars { nodes { id name color readOnly isDefault } } }
+
+{ agenda(days: 1, tz: \"Europe/London\") {
+    totalCount
+    nodes { id summary location start { dateTime date allDay } end { dateTime } } } }
+
+# One query for a day, whose calendar each event is in, and what clashes.
+{ agenda(days: 1, tz: \"Europe/London\") {
+    nodes {
+      summary durationMinutes
+      calendar { name color }
+      conflicts { totalCount nodes { summary calendarName } } } } }
+
+{ events(start: \"2026-07-24\", days: 7, first: 25) {
+    totalCount pageInfo { hasNextPage endCursor }
+    nodes { id summary start { dateTime date } calendarName } } }
+
+{ events(filter: { text: \"dentist\" }, days: 90) {
+    nodes { id summary start { dateTime date } } } }
+
+# Filters nest: anything involving Alice either way, excluding all-day.
+{ events(days: 14, filter: {
+    status: CONFIRMED
+    or: [{ attendee: \"alice@example.com\" }, { organizer: \"alice@example.com\" }]
+    not: [{ allDay: true }] }) { totalCount nodes { summary } } }
+
+# A series and where it actually falls — no extra request for the occurrences.
+{ events(days: 1, expand: false, filter: { recurring: true }) {
+    nodes { id summary recurrence
+      occurrences(days: 90) { totalCount nodes { start { dateTime } } } } } }
+
+{ freeBusy(start: \"today\", days: 3) { nodes { start end status } } }
+
+mutation { createEvent(summary: \"Coffee\", start: \"tomorrow 15:00\",
+    durationMinutes: 30, tz: \"Europe/London\") { event { id summary } } }
+
+mutation { deleteEvent(action: PREVIEW, id: \"...\") { preview confirmationToken } }
+```
+
+## Schema
+
+```graphql";
+
 // ============ Server Implementation ============
 
 #[derive(Clone)]
@@ -212,26 +304,30 @@ impl CalDavMcp {
 #[tool_router]
 impl CalDavMcp {
     #[tool(
-        description = "Returns the full GraphQL SDL (Schema Definition Language) for the CalDAV API. Call this first to discover available queries, mutations, types, and their arguments. The schema covers calendars, events, agenda, search, free/busy, and event creation, updates, and deletion."
+        name = "calendar_schema",
+        title = "Calendar Schema",
+        description = "The calendar API's GraphQL schema and the rules for using it. Call once before the first `calendar` query."
     )]
-    async fn schema_sdl(&self, ctx: RequestContext<RoleServer>) -> ToolResult {
+    async fn calendar_schema(&self, ctx: RequestContext<RoleServer>) -> ToolResult {
         // The chosen calendar is per-request, so it can't live in the static
-        // server instructions. Prepending it here is the earliest the model
-        // sees it — it is told to call this tool first.
-        match self.resolve(&ctx).and_then(|r| r.calendar) {
-            Some(calendar) => Self::text_result(format!(
-                "# New events go to the user's chosen calendar, {calendar:?}, unless \
-                 createEvent is given a `calendar` argument.\n\n{}",
-                self.schema.sdl()
-            )),
-            None => Self::text_result(self.schema.sdl()),
-        }
+        // server instructions. Here is the earliest the model sees it — it is
+        // told to call this tool first.
+        let calendar = match self.resolve(&ctx).and_then(|r| r.calendar) {
+            Some(name) => format!(
+                "New events go to the user's chosen calendar, {name:?}, unless `createEvent` \
+                 is given a `calendar` argument.\n\n"
+            ),
+            None => String::new(),
+        };
+        Self::text_result(format!("{calendar}{USAGE}\n\n{}\n```\n", self.schema.sdl()))
     }
 
     #[tool(
-        description = "Execute a GraphQL query or mutation against the CalDAV API. Use `schema_sdl` first to discover the schema. Supports listing calendars, reading the agenda, searching events, checking free/busy, and creating, updating, or deleting events (with the preview/confirm pattern). Pass variables as a JSON string."
+        name = "calendar",
+        title = "Calendar",
+        description = "Execute a GraphQL query or mutation against the calendar API: calendars, agenda, event search, free/busy, and event writes. Get the schema from `calendar_schema` first. Variables are a JSON string."
     )]
-    async fn graphql(
+    async fn calendar(
         &self,
         ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<GraphqlRequest>,
@@ -278,42 +374,19 @@ impl ServerHandler for CalDavMcp {
             .with_website_url("https://github.com/radiosilence/caldav-cli");
 
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(rmcp::model::ProtocolVersion::V_2024_11_05)
+            // Only the fallback for a client asking for a version the SDK
+            // doesn't know; anything known is echoed back during negotiation.
+            .with_protocol_version(ProtocolVersion::LATEST)
             .with_server_info(server_info)
+            // Deliberately terse: instructions and tool descriptions are loaded
+            // into every session, most of which never touch a calendar. The
+            // schema and the rules for using it are a tool call away, paid only
+            // when a calendar is actually in play.
             .with_instructions(
-                "CalDAV MCP Server — GraphQL interface for calendar operations.\n\n\
-                ## Getting Started\n\
-                1. Call `schema_sdl` to get the full GraphQL schema\n\
-                2. Use `graphql` to execute queries and mutations\n\n\
-                ## Common Queries\n\
-                ```graphql\n\
-                # List calendars\n\
-                { calendars { id name color readOnly } }\n\n\
-                # What's on today\n\
-                { agenda(days: 1, tz: \"Europe/London\") { id summary location start { dateTime date allDay } end { dateTime } } }\n\n\
-                # A window of events\n\
-                { events(start: \"2026-07-24\", days: 7) { id summary start { dateTime date } calendar } }\n\n\
-                # Find something\n\
-                { searchEvents(query: \"dentist\", days: 90) { id summary start { dateTime date } } }\n\n\
-                # When am I busy?\n\
-                { freeBusy(start: \"today\", days: 3) { start end status } }\n\
-                ```\n\n\
-                ## Writing (ALWAYS preview first!)\n\
-                ```graphql\n\
-                # Step 1: Preview\n\
-                mutation { createEvent(action: PREVIEW, summary: \"Coffee\", start: \"tomorrow 15:00\", durationMinutes: 30, tz: \"Europe/London\") { preview confirmationToken } }\n\n\
-                # Step 2: After user approval, confirm with the token\n\
-                mutation { createEvent(action: CONFIRM, summary: \"Coffee\", start: \"tomorrow 15:00\", durationMinutes: 30, tz: \"Europe/London\", confirmationToken: \"...\") { event { id summary } } }\n\
-                ```\n\
-                `updateEvent` and `deleteEvent` follow the same two-step pattern.\n\n\
-                ## Notes\n\
-                - Times accept ISO 8601, 'YYYY-MM-DD HH:MM', 'today'/'tomorrow', and offsets like '+2h'.\n\
-                - Pass `tz` (e.g. Europe/London) whenever the user means a local wall-clock time.\n\
-                - `events`/`agenda` expand recurring series by default. To edit a series, fetch it with `expand: false` and update the master event.\n\n\
-                ## Safety Rules\n\
-                - NEVER create, update, or delete without showing the PREVIEW output first\n\
-                - NEVER confirm a write without explicit user approval\n\
-                - Deletions cannot be undone — read the preview back to the user verbatim",
+                "The user's calendars, as a small GraphQL API. Read the schema and its usage \
+                 rules once with `calendar_schema`, then run queries and mutations with \
+                 `calendar`. Creating an event needs no confirmation; updates and deletes \
+                 are preview-then-confirm, and never confirm one the user hasn't seen.",
             )
     }
 }

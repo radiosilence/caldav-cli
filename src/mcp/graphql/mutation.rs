@@ -110,46 +110,6 @@ fn describe_time(raw: &str, tz: Option<&str>) -> String {
     }
 }
 
-fn push_field(out: &mut Vec<String>, label: &str, value: Option<&str>) {
-    if let Some(v) = value.map(str::trim).filter(|s| !s.is_empty()) {
-        out.push(format!("{label}: {v}"));
-    }
-}
-
-/// Human-readable summary of a create.
-fn preview_create(input: &EventInput) -> String {
-    let mut lines = vec![format!(
-        "Create event in calendar: {}",
-        input
-            .calendar
-            .as_deref()
-            .unwrap_or("(your default calendar)")
-    )];
-    push_field(&mut lines, "Title", input.summary.as_deref());
-    if let Some(start) = input.start.as_deref() {
-        lines.push(format!(
-            "Start: {}",
-            describe_time(start, input.tz.as_deref())
-        ));
-    }
-    match (input.end.as_deref(), input.duration_minutes) {
-        (Some(end), _) => lines.push(format!("End: {}", describe_time(end, input.tz.as_deref()))),
-        (None, Some(mins)) => lines.push(format!("Duration: {mins} minutes")),
-        (None, None) => lines.push("Duration: 1 hour (default)".to_string()),
-    }
-    push_field(&mut lines, "Location", input.location.as_deref());
-    push_field(&mut lines, "Notes", input.description.as_deref());
-    push_field(&mut lines, "Repeats", input.recurrence.as_deref());
-    push_field(&mut lines, "Status", input.status.as_deref());
-    if let Some(attendees) = &input.attendees {
-        lines.push(format!("Invites: {}", join_or_none(attendees)));
-    }
-    if let Some(categories) = &input.categories {
-        lines.push(format!("Categories: {}", join_or_none(categories)));
-    }
-    lines.join("\n")
-}
-
 /// Human-readable before → after for an update, listing only what changes.
 fn preview_update(existing: &Event, input: &EventInput) -> String {
     let mut lines = vec![format!(
@@ -263,12 +223,11 @@ fn join_or_none(items: &[String]) -> String {
 #[Object]
 #[allow(clippy::too_many_arguments)]
 impl MutationRoot {
-    /// Create an event. ALWAYS call with action=PREVIEW first, show the user
-    /// what it says, then CONFIRM with the returned confirmationToken.
+    /// Create an event. Writes immediately — no preview step. Tell the user
+    /// what was created afterwards, including the calendar it landed in.
     async fn create_event(
         &self,
         ctx: &Context<'_>,
-        #[graphql(desc = "PREVIEW first, then CONFIRM to write")] action: WriteAction,
         #[graphql(desc = "Event title")] summary: String,
         #[graphql(desc = "Start: ISO 8601, 'YYYY-MM-DD [HH:MM]', 'tomorrow', or '+2h'")]
         start: String,
@@ -289,11 +248,7 @@ impl MutationRoot {
         #[graphql(desc = "Recurrence rule, e.g. FREQ=WEEKLY;BYDAY=MO")] recurrence: Option<String>,
         #[graphql(desc = "Attendees as 'email' or 'Name <email>'")] attendees: Option<Vec<String>>,
         #[graphql(desc = "Categories/tags")] categories: Option<Vec<String>>,
-        #[graphql(desc = "Token from the PREVIEW response — required for CONFIRM")]
-        confirmation_token: Option<String>,
     ) -> Result<GqlEventResult> {
-        // Resolved before the preview and the fingerprint, so the user sees the
-        // calendar the event will actually land in and CONFIRM writes there.
         let calendar =
             calendar.or_else(|| ctx.data_opt::<DefaultCalendar>().and_then(|d| d.0.clone()));
         let input = EventInput {
@@ -312,18 +267,6 @@ impl MutationRoot {
             attendees,
             categories,
         };
-
-        let nonce_store = ctx.data::<NonceStore>()?;
-        let parts = input.fingerprint_parts();
-        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
-
-        if action == WriteAction::Preview {
-            let token = issue_nonce(nonce_store, &refs).await;
-            return Ok(GqlEventResult::pending(preview_create(&input), token));
-        }
-        if let Err(msg) = consume_nonce(nonce_store, confirmation_token.as_deref(), &refs).await {
-            return Ok(GqlEventResult::failed(msg));
-        }
 
         let client = ctx.data::<SharedClient>()?;
         let attendees = input.parsed_attendees();
@@ -496,32 +439,24 @@ mod tests {
     }
 
     #[test]
-    fn create_preview_resolves_times_and_names_the_calendar() {
+    fn preview_resolves_times_into_the_instant_they_mean() {
         let input = EventInput {
-            calendar: Some("Work".into()),
-            summary: Some("Kickoff".into()),
             start: Some("2026-07-24 09:00".into()),
             tz: Some("Europe/London".into()),
-            location: Some("Room 4".into()),
             ..Default::default()
         };
-        let preview = preview_create(&input);
-        assert!(preview.contains("calendar: Work"));
-        assert!(preview.contains("Title: Kickoff"));
         // 09:00 BST resolves to 08:00Z, and the zone is shown.
+        let preview = preview_update(&existing_event(), &input);
         assert!(preview.contains("2026-07-24T08:00:00Z [Europe/London]"));
-        assert!(preview.contains("Duration: 1 hour (default)"));
-        assert!(preview.contains("Location: Room 4"));
     }
 
     #[test]
-    fn create_preview_flags_unparseable_times_instead_of_hiding_them() {
+    fn preview_flags_unparseable_times_instead_of_hiding_them() {
         let input = EventInput {
-            summary: Some("x".into()),
             start: Some("whenever".into()),
             ..Default::default()
         };
-        assert!(preview_create(&input).contains("unrecognised"));
+        assert!(preview_update(&existing_event(), &input).contains("unrecognised"));
     }
 
     #[test]

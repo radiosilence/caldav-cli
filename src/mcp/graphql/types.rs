@@ -506,8 +506,9 @@ impl From<BusyPeriod> for GqlBusyPeriod {
     }
 }
 
-/// Two-step guard on every write: PREVIEW returns a human-readable summary and
-/// a one-shot token; CONFIRM performs the change.
+/// Two-step guard on the destructive writes — updates and deletes: PREVIEW
+/// returns a human-readable summary and a one-shot token; CONFIRM performs the
+/// change. Creates don't take one; they just happen.
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 pub enum WriteAction {
     /// Describe what would happen and return a `confirmationToken`.

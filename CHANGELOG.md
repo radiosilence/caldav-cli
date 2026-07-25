@@ -42,8 +42,9 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without saying so.
 - **An override**, for accounts whose own default isn't where automation should
   write: `X-CalDAV-Calendar` per request in hosted mode, or `calendar` in
-  `config.toml` / `CALDAV_CALENDAR`. The MCP server announces the choice in its
-  `schema_sdl` output, so a model knows where it is writing before it writes.
+  `config.toml` / `CALDAV_CALENDAR`. The MCP server announces the choice in the
+  `calendar` tool description, so a model knows where it is writing before it
+  writes.
 - **Discovery that doesn't assume a server's shape**, which iCloud rewards:
   it answers `schedule-default-calendar-URL` as bare element text rather than
   the `DAV:href` RFC 6638 specifies, and echoes the property name back empty in
@@ -57,6 +58,26 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`createEvent` writes without a confirmation round trip**, dropping its
+  `action` and `confirmationToken` arguments. The two-phase guard exists for
+  changes that destroy state; a new event destroys nothing, is visible the
+  moment it lands, and is deletable — so the model creates it and says what it
+  created, and a wrong guess is corrected rather than pre-empted. `updateEvent`
+  and `deleteEvent` are unchanged: they overwrite or remove something already
+  there, and a delete can't be undone.
+- **MCP tools renamed** to `calendar_schema` and `calendar`, from `schema_sdl`
+  and `graphql` — clients render the tool name, and "Schema sdl" / "Graphql"
+  described the transport rather than what the tool reaches. Breaking for
+  anything naming the old tools; the queries themselves are unchanged.
+- **A near-free idle cost for the MCP server.** Instructions and tool
+  descriptions load into every session, most of which never mention a calendar,
+  so the usage rules and examples moved out of them and into the
+  `calendar_schema` response, alongside the SDL they annotate. Connecting the
+  server now costs ~230 tokens instead of ~750, and everything substantial is
+  paid only by sessions that touch a calendar.
+- **Protocol version follows the SDK** instead of pinning `2024-11-05`, so
+  clients get the newest version both ends know. Older clients are unaffected:
+  the server echoes back whatever version they ask for.
 - **Every read goes through a DataLoader.** No resolver touches the CalDAV
   client directly. `calendar-multiget` is the one genuine batch CalDAV offers —
   many hrefs, one REPORT — and `Event.series` uses it, so a page of occurrences
@@ -75,6 +96,11 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   composing the next page. CalDAV has no windowed query, so paging is slicing:
   `totalCount` is free and exact, and a cursor whose event has gone gives a
   "restart pagination" error rather than a quietly different page.
+- **The `calendar_schema` guidance matches the new schema** — examples updated
+  to connections, plus how to page, when `totalCount` is free, and that nested
+  fields batch so one query beats a follow-up. A test executes every documented
+  example against the real schema, since a stale example costs a model a failed
+  round trip.
 - **Query cost is guidance, not a cap.** Fields declare costs and the
   descriptions surface them, but nothing is refused for being expensive — a
   caller told "too complex" has to guess at a threshold it cannot see. Depth
