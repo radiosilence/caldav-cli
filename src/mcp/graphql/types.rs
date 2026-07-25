@@ -506,9 +506,10 @@ impl From<BusyPeriod> for GqlBusyPeriod {
     }
 }
 
-/// Two-step guard on the destructive writes — updates and deletes: PREVIEW
+/// Two-step guard on every write that changes or removes something: PREVIEW
 /// returns a human-readable summary and a one-shot token; CONFIRM performs the
-/// change. Creates don't take one; they just happen.
+/// change. The writes that only add (`createEvent`, `createCalendar`) or only
+/// record a preference (`setDefaultCalendar`) don't take one; they just happen.
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 pub enum WriteAction {
     /// Describe what would happen and return a `confirmationToken`.
@@ -559,6 +560,86 @@ impl GqlEventResult {
             event: None,
             preview: None,
             confirmation_token: None,
+            error: Some(msg.into()),
+        }
+    }
+}
+
+/// Your reply to an invitation — the `PARTSTAT` the organiser is told.
+///
+/// An enum rather than a string because the spec's set is closed and misspelling
+/// one is a write the server accepts and no human ever sees.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum InviteResponse {
+    /// You're going.
+    Accepted,
+    /// You're not.
+    Declined,
+    /// Probably, not confirmed.
+    Tentative,
+    /// Withdraw a previous reply, putting the invitation back in your court.
+    NeedsAction,
+}
+
+impl InviteResponse {
+    pub fn partstat(self) -> &'static str {
+        match self {
+            Self::Accepted => "ACCEPTED",
+            Self::Declined => "DECLINED",
+            Self::Tentative => "TENTATIVE",
+            Self::NeedsAction => "NEEDS-ACTION",
+        }
+    }
+}
+
+#[derive(SimpleObject)]
+#[graphql(name = "CalendarMutationResult")]
+pub struct GqlCalendarResult {
+    pub success: bool,
+    /// The calendar as it now stands. Null on PREVIEW and on failure; on
+    /// `deleteCalendar` it is the calendar as it was, since there is nothing left
+    /// to read it back from.
+    pub calendar: Option<GqlCalendar>,
+    /// Human-readable description of the pending change. Set on PREVIEW.
+    pub preview: Option<String>,
+    /// One-shot token to pass back with CONFIRM. Set on PREVIEW.
+    pub confirmation_token: Option<String>,
+    /// What the default calendar was before `setDefaultCalendar` changed it, so
+    /// the change can be described and undone. Null when nothing was displaced.
+    pub previous_default: Option<String>,
+    pub error: Option<String>,
+}
+
+impl GqlCalendarResult {
+    pub fn pending(text: String, token: String) -> Self {
+        Self {
+            success: true,
+            calendar: None,
+            preview: Some(text),
+            confirmation_token: Some(token),
+            previous_default: None,
+            error: None,
+        }
+    }
+
+    pub fn done(calendar: Calendar) -> Self {
+        Self {
+            success: true,
+            calendar: Some(calendar.into()),
+            preview: None,
+            confirmation_token: None,
+            previous_default: None,
+            error: None,
+        }
+    }
+
+    pub fn failed(msg: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            calendar: None,
+            preview: None,
+            confirmation_token: None,
+            previous_default: None,
             error: Some(msg.into()),
         }
     }

@@ -887,3 +887,782 @@ async fn unexpanded_queries_return_the_master_event() {
     );
     assert!(events[0].recurrence_id.is_none());
 }
+
+// ============ Recurrence exceptions ============
+
+/// A weekly series that already has one occurrence cancelled — the shape that
+/// used to lose its exception on every unrelated edit.
+const SERIES_ICS: &str = "BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:evt-1
+SUMMARY:Standup
+DTSTART;TZID=Europe/London:20260724T090000
+DTEND;TZID=Europe/London:20260724T093000
+RRULE:FREQ=DAILY
+EXDATE;TZID=Europe/London:20260727T090000
+END:VEVENT
+END:VCALENDAR";
+
+/// Mount discovery plus a series in Home, and capture what gets PUT back.
+async fn mount_series(server: &MockServer) {
+    mount_discovery(server).await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .respond_with(ok(&events_xml(SERIES_ICS)))
+        .mount(server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/team/"))
+        .respond_with(ok(EMPTY_MULTISTATUS))
+        .mount(server)
+        .await;
+}
+
+/// The body of the single PUT the test provoked.
+async fn put_body(server: &MockServer) -> String {
+    let requests = server.received_requests().await.unwrap();
+    let put = requests
+        .iter()
+        .find(|r| r.method == "PUT")
+        .expect("no PUT was made");
+    String::from_utf8(put.body.clone()).unwrap()
+}
+
+#[tokio::test]
+async fn an_unrelated_edit_keeps_the_occurrences_the_user_cancelled() {
+    let server = MockServer::start().await;
+    mount_series(&server).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let fields = EventFields {
+        location: Some("Room 5"),
+        ..Default::default()
+    };
+    client(&server)
+        .update_event("evt-1", None, &fields)
+        .await
+        .unwrap();
+
+    // Rebuilding the series without its EXDATE resurrected every cancelled
+    // occurrence — silently, on an edit that had nothing to do with recurrence.
+    let body = put_body(&server).await;
+    assert!(
+        body.contains("EXDATE;TZID=Europe/London:20260727T090000"),
+        "the exception was dropped: {body}"
+    );
+    assert!(body.contains("RRULE:FREQ=DAILY"));
+}
+
+#[tokio::test]
+async fn replacing_the_rule_drops_exceptions_to_the_old_one() {
+    let server = MockServer::start().await;
+    mount_series(&server).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let fields = EventFields {
+        recurrence: Some("FREQ=WEEKLY;BYDAY=TH"),
+        ..Default::default()
+    };
+    client(&server)
+        .update_event("evt-1", None, &fields)
+        .await
+        .unwrap();
+
+    // The old exception described a daily occurrence that no longer exists.
+    let body = put_body(&server).await;
+    assert!(body.contains("RRULE:FREQ=WEEKLY;BYDAY=TH"));
+    assert!(!body.contains("EXDATE"), "stale exception kept: {body}");
+}
+
+#[tokio::test]
+async fn cancelling_one_occurrence_adds_an_exdate_matching_the_series() {
+    let server = MockServer::start().await;
+    mount_series(&server).await;
+    Mock::given(method("PUT"))
+        .and(header("if-match", "\"etag-1\""))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    // A bare date: the series runs once that day, so it is unambiguous.
+    client(&server)
+        .exclude_occurrence("evt-1", None, "2026-07-29")
+        .await
+        .unwrap();
+
+    let body = put_body(&server).await;
+    // Written in the series' own zone and value type — servers ignore an EXDATE
+    // whose form doesn't match the DTSTART it qualifies.
+    assert!(
+        body.contains("EXDATE;TZID=Europe/London:20260729T090000"),
+        "wrong EXDATE form: {body}"
+    );
+    // And the one that was already there survives.
+    assert!(body.contains("EXDATE;TZID=Europe/London:20260727T090000"));
+    assert!(body.contains("RRULE:FREQ=DAILY"));
+}
+
+#[tokio::test]
+async fn cancelling_an_already_cancelled_occurrence_is_refused() {
+    let server = MockServer::start().await;
+    mount_series(&server).await;
+
+    let err = client(&server)
+        .exclude_occurrence("evt-1", None, "2026-07-27")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("already cancelled"), "unhelpful: {err}");
+}
+
+#[tokio::test]
+async fn cancelling_an_occurrence_of_a_one_off_is_refused() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .respond_with(ok(&events_xml(STANDUP_ICS)))
+        .mount(&server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/team/"))
+        .respond_with(ok(EMPTY_MULTISTATUS))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .exclude_occurrence("evt-1", None, "2026-07-24")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("not a recurring series"), "unhelpful: {err}");
+    // And nothing was written.
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.iter().any(|r| r.method == "PUT"));
+}
+
+#[tokio::test]
+async fn a_date_naming_no_occurrence_is_refused() {
+    let server = MockServer::start().await;
+    mount_series(&server).await;
+
+    // The series is daily from the 24th; nothing runs before it starts.
+    let err = client(&server)
+        .exclude_occurrence("evt-1", None, "2026-07-20")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("no occurrence"), "unhelpful: {err}");
+}
+
+// ============ Replying to invitations ============
+
+/// An invitation with two attendees, one of them us.
+const INVITE_ICS: &str = "BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:evt-1
+SUMMARY:Design review
+DTSTART:20260724T090000Z
+DTEND:20260724T100000Z
+ORGANIZER;CN=Alice:mailto:alice@example.com
+ATTENDEE;CN=Alice;PARTSTAT=ACCEPTED:mailto:alice@example.com
+ATTENDEE;CN=Me;PARTSTAT=NEEDS-ACTION:mailto:me@example.com
+END:VEVENT
+END:VCALENDAR";
+
+async fn mount_event(server: &MockServer, ics: &str) {
+    mount_discovery(server).await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .respond_with(ok(&events_xml(ics)))
+        .mount(server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/team/"))
+        .respond_with(ok(EMPTY_MULTISTATUS))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn replying_sets_only_your_own_partstat() {
+    let server = MockServer::start().await;
+    mount_event(&server, INVITE_ICS).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let event = client(&server)
+        .respond_to_invite("evt-1", None, "DECLINED", None)
+        .await
+        .unwrap();
+
+    let body = put_body(&server).await;
+    assert!(body.contains("PARTSTAT=DECLINED:mailto:me@example.com"));
+    // The organiser's own acceptance is not ours to change.
+    assert!(body.contains("PARTSTAT=ACCEPTED:mailto:alice@example.com"));
+    // SEQUENCE bumps so the organiser's client sees a new revision.
+    assert!(body.contains("SEQUENCE:1"));
+    let me = event
+        .attendees
+        .iter()
+        .find(|a| a.email == "me@example.com")
+        .unwrap();
+    assert_eq!(me.status.as_deref(), Some("DECLINED"));
+}
+
+#[tokio::test]
+async fn replying_as_an_alias_targets_that_row() {
+    let server = MockServer::start().await;
+    mount_event(&server, INVITE_ICS).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    // The login is me@example.com; reply as the organiser's row instead.
+    client(&server)
+        .respond_to_invite("evt-1", None, "TENTATIVE", Some("alice@example.com"))
+        .await
+        .unwrap();
+
+    let body = put_body(&server).await;
+    assert!(body.contains("PARTSTAT=TENTATIVE:mailto:alice@example.com"));
+    assert!(body.contains("PARTSTAT=NEEDS-ACTION:mailto:me@example.com"));
+}
+
+#[tokio::test]
+async fn replying_to_an_event_you_are_not_on_lists_who_is() {
+    let server = MockServer::start().await;
+    mount_event(&server, INVITE_ICS).await;
+
+    let err = client(&server)
+        .respond_to_invite("evt-1", None, "ACCEPTED", Some("nobody@example.com"))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    // The addresses are the actionable part: they're what the caller picks from.
+    assert!(err.contains("not on the attendee list"), "unhelpful: {err}");
+    assert!(err.contains("alice@example.com"), "no candidates: {err}");
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.iter().any(|r| r.method == "PUT"));
+}
+
+// ============ Moving events between calendars ============
+
+/// Home is writable, Team is read-only, so make a second writable target.
+const THREE_CALENDARS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<multistatus xmlns="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:ic="http://apple.com/ns/ical/">
+  <response>
+    <href>/1234/calendars/home/</href>
+    <propstat><prop>
+      <displayname>Home</displayname>
+      <resourcetype><collection/><c:calendar/></resourcetype>
+      <c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>
+      <current-user-privilege-set><privilege><read/></privilege><privilege><write/></privilege></current-user-privilege-set>
+    </prop></propstat>
+  </response>
+  <response>
+    <href>/1234/calendars/work/</href>
+    <propstat><prop>
+      <displayname>Work</displayname>
+      <resourcetype><collection/><c:calendar/></resourcetype>
+      <c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>
+      <current-user-privilege-set><privilege><read/></privilege><privilege><write/></privilege></current-user-privilege-set>
+    </prop></propstat>
+  </response>
+  <response>
+    <href>/1234/calendars/team/</href>
+    <propstat><prop>
+      <displayname>Team</displayname>
+      <resourcetype><collection/><c:calendar/></resourcetype>
+      <c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>
+      <current-user-privilege-set><privilege><read/></privilege></current-user-privilege-set>
+    </prop></propstat>
+  </response>
+</multistatus>"#;
+
+/// Discovery with three calendars, the event living in Home.
+async fn mount_for_move(server: &MockServer) {
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ok(PRINCIPAL_XML))
+        .mount(server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/principal/"))
+        .respond_with(ok(HOME_XML))
+        .mount(server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ok(THREE_CALENDARS_XML))
+        .mount(server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .respond_with(ok(&events_xml(STANDUP_ICS)))
+        .mount(server)
+        .await;
+    for empty in ["/1234/calendars/work/", "/1234/calendars/team/"] {
+        Mock::given(method("REPORT"))
+            .and(path(empty))
+            .respond_with(ok(EMPTY_MULTISTATUS))
+            .mount(server)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn moving_an_event_uses_webdav_move() {
+    let server = MockServer::start().await;
+    mount_for_move(&server).await;
+    Mock::given(method("MOVE"))
+        .and(path("/1234/calendars/home/evt-1.ics"))
+        .and(header(
+            "destination",
+            format!("{}/1234/calendars/work/evt-1.ics", server.uri()).as_str(),
+        ))
+        // Never silently replace whatever is already at the destination.
+        .and(header("overwrite", "F"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&server)
+        .await;
+
+    let event = client(&server)
+        .move_event("evt-1", None, "Work")
+        .await
+        .unwrap();
+
+    assert_eq!(event.calendar, "Work");
+    assert_eq!(event.href, "/1234/calendars/work/evt-1.ics");
+    // The UID and the contents are the point of moving rather than recreating.
+    assert_eq!(event.id, "evt-1");
+    assert_eq!(event.location.as_deref(), Some("Room 4"));
+    // The etag belonged to the old path; keeping it would break the next write.
+    assert!(event.etag.is_none());
+}
+
+#[tokio::test]
+async fn a_server_without_move_falls_back_to_copying_the_raw_resource() {
+    let server = MockServer::start().await;
+    mount_for_move(&server).await;
+    Mock::given(method("MOVE"))
+        .respond_with(ResponseTemplate::new(501))
+        .mount(&server)
+        .await;
+    // The fallback reads the stored bytes rather than rebuilding from the model,
+    // so anything we don't parse — here a VALARM — survives the move.
+    Mock::given(method("GET"))
+        .and(path("/1234/calendars/home/evt-1.ics"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(STANDUP_ICS.replace(
+                "END:VEVENT",
+                "BEGIN:VALARM\nTRIGGER:-PT15M\nACTION:DISPLAY\nEND:VALARM\nEND:VEVENT",
+            )),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/1234/calendars/work/evt-1.ics"))
+        .and(header("if-none-match", "*"))
+        .and(body_string_contains("BEGIN:VALARM"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/1234/calendars/home/evt-1.ics"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let event = client(&server)
+        .move_event("evt-1", None, "Work")
+        .await
+        .unwrap();
+    assert_eq!(event.calendar, "Work");
+}
+
+#[tokio::test]
+async fn a_copy_that_cannot_delete_the_original_says_the_event_exists_twice() {
+    let server = MockServer::start().await;
+    mount_for_move(&server).await;
+    Mock::given(method("MOVE"))
+        .respond_with(ResponseTemplate::new(501))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(STANDUP_ICS))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(423))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .move_event("evt-1", None, "Work")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    // A half-done move is recoverable, but only if we say so plainly.
+    assert!(err.contains("exists twice"), "unhelpful: {err}");
+}
+
+#[tokio::test]
+async fn moving_into_a_read_only_calendar_is_refused_before_anything_is_written() {
+    let server = MockServer::start().await;
+    mount_for_move(&server).await;
+
+    let err = client(&server)
+        .move_event("evt-1", None, "Team")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("read-only"), "unhelpful: {err}");
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.iter().any(|r| r.method == "MOVE"));
+}
+
+#[tokio::test]
+async fn moving_an_event_to_where_it_already_is_is_refused() {
+    let server = MockServer::start().await;
+    mount_for_move(&server).await;
+
+    let err = client(&server)
+        .move_event("evt-1", None, "Home")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("already in"), "unhelpful: {err}");
+}
+
+// ============ Calendar collections ============
+
+/// The scheduling inbox alongside the calendars, so the default-calendar
+/// property has somewhere to live.
+const WITH_INBOX_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<multistatus xmlns="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:ic="http://apple.com/ns/ical/">
+  <response>
+    <href>/1234/calendars/inbox/</href>
+    <propstat><prop>
+      <resourcetype><collection/><c:schedule-inbox/></resourcetype>
+    </prop></propstat>
+  </response>
+  <response>
+    <href>/1234/calendars/home/</href>
+    <propstat><prop>
+      <displayname>Home</displayname>
+      <resourcetype><collection/><c:calendar/></resourcetype>
+      <c:schedule-default-calendar-URL><href>/1234/calendars/home/</href></c:schedule-default-calendar-URL>
+      <c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>
+      <current-user-privilege-set><privilege><read/></privilege><privilege><write/></privilege></current-user-privilege-set>
+    </prop></propstat>
+  </response>
+  <response>
+    <href>/1234/calendars/work/</href>
+    <propstat><prop>
+      <displayname>Work</displayname>
+      <resourcetype><collection/><c:calendar/></resourcetype>
+      <c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>
+      <current-user-privilege-set><privilege><read/></privilege><privilege><write/></privilege></current-user-privilege-set>
+    </prop></propstat>
+  </response>
+</multistatus>"#;
+
+/// A PROPPATCH answering "yes" for every property in it.
+fn proppatch_ok(href: &str, props: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<multistatus xmlns="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:ic="http://apple.com/ns/ical/">
+  <response>
+    <href>{href}</href>
+    <propstat><prop>{props}</prop><status>HTTP/1.1 200 OK</status></propstat>
+  </response>
+</multistatus>"#
+    )
+}
+
+async fn mount_with_inbox(server: &MockServer) {
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ok(PRINCIPAL_XML))
+        .mount(server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/principal/"))
+        .respond_with(ok(HOME_XML))
+        .mount(server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ok(WITH_INBOX_XML))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn setting_the_default_calendar_patches_the_scheduling_inbox() {
+    let server = MockServer::start().await;
+    mount_with_inbox(&server).await;
+    Mock::given(method("PROPPATCH"))
+        .and(path("/1234/calendars/inbox/"))
+        // RFC 6638 wraps the value in a DAV:href, not bare text.
+        .and(body_string_contains(
+            "<c:schedule-default-calendar-URL><d:href>/1234/calendars/work/</d:href>",
+        ))
+        .respond_with(ok(&proppatch_ok(
+            "/1234/calendars/inbox/",
+            "<c:schedule-default-calendar-URL/>",
+        )))
+        .mount(&server)
+        .await;
+
+    let calendar = client(&server).set_default_calendar("Work").await.unwrap();
+    assert_eq!(calendar.id, "work");
+}
+
+#[tokio::test]
+async fn a_property_the_server_refuses_is_an_error_not_a_silent_no_op() {
+    let server = MockServer::start().await;
+    mount_with_inbox(&server).await;
+    // The trap this exists to catch: a PROPPATCH answers 207 whatever happens,
+    // and the real verdict is the status inside each propstat. iCloud refuses
+    // this property exactly like this.
+    Mock::given(method("PROPPATCH"))
+        .respond_with(ok(r#"<?xml version="1.0" encoding="UTF-8"?>
+<multistatus xmlns="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <response>
+    <href>/1234/calendars/inbox/</href>
+    <propstat>
+      <prop><c:schedule-default-calendar-URL/></prop>
+      <status>HTTP/1.1 403 Forbidden</status>
+    </propstat>
+  </response>
+</multistatus>"#))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .set_default_calendar("Work")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("refused"), "swallowed a refusal: {err}");
+    assert!(
+        err.contains("schedule-default-calendar-URL"),
+        "doesn't say which property: {err}"
+    );
+    assert!(err.contains("403"), "doesn't say why: {err}");
+}
+
+#[tokio::test]
+async fn setting_a_read_only_calendar_as_the_default_is_refused() {
+    let server = MockServer::start().await;
+    mount_for_move(&server).await;
+
+    let err = client(&server)
+        .set_default_calendar("Team")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    // Pointing the default at a calendar you can't write to would break every
+    // later create with a much more confusing error.
+    assert!(err.contains("read-only"), "unhelpful: {err}");
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.iter().any(|r| r.method == "PROPPATCH"));
+}
+
+#[tokio::test]
+async fn creating_a_calendar_derives_a_readable_id_from_the_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ok(PRINCIPAL_XML))
+        .mount(&server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/principal/"))
+        .respond_with(ok(HOME_XML))
+        .mount(&server)
+        .await;
+    Mock::given(method("MKCALENDAR"))
+        .and(path("/1234/calendars/work-trips/"))
+        .and(body_string_contains(
+            "<d:displayname>Work Trips</d:displayname>",
+        ))
+        .and(body_string_contains(
+            "<ic:calendar-color>#FF2968</ic:calendar-color>",
+        ))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&server)
+        .await;
+    // Re-read after creating: the server decides the final display name.
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ok(r#"<?xml version="1.0" encoding="UTF-8"?>
+<multistatus xmlns="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:ic="http://apple.com/ns/ical/">
+  <response>
+    <href>/1234/calendars/work-trips/</href>
+    <propstat><prop>
+      <displayname>Work Trips</displayname>
+      <resourcetype><collection/><c:calendar/></resourcetype>
+      <ic:calendar-color>#FF2968</ic:calendar-color>
+      <c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>
+      <current-user-privilege-set><privilege><read/></privilege><privilege><write/></privilege></current-user-privilege-set>
+    </prop></propstat>
+  </response>
+</multistatus>"#))
+        .mount(&server)
+        .await;
+
+    let fields = caldav_cli::models::CalendarFields {
+        color: Some("#FF2968"),
+        ..Default::default()
+    };
+    let calendar = client(&server)
+        .create_calendar("Work Trips", &fields)
+        .await
+        .unwrap();
+
+    assert_eq!(calendar.id, "work-trips");
+    assert_eq!(calendar.name, "Work Trips");
+}
+
+#[tokio::test]
+async fn a_name_colliding_with_an_existing_collection_is_refused_clearly() {
+    let server = MockServer::start().await;
+    mount_with_inbox(&server).await;
+    // RFC 4791 §5.3.1.2: 405 when the path is already occupied.
+    Mock::given(method("MKCALENDAR"))
+        .respond_with(ResponseTemplate::new(405))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .create_calendar("Work", &Default::default())
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("already exists"), "unhelpful: {err}");
+    assert!(err.contains("work"), "doesn't name the id: {err}");
+}
+
+#[tokio::test]
+async fn renaming_a_calendar_patches_only_what_changed() {
+    let server = MockServer::start().await;
+    mount_with_inbox(&server).await;
+    Mock::given(method("PROPPATCH"))
+        .and(path("/1234/calendars/work/"))
+        .and(body_string_contains(
+            "<d:displayname>Client work</d:displayname>",
+        ))
+        .respond_with(ok(&proppatch_ok(
+            "/1234/calendars/work/",
+            "<d:displayname/>",
+        )))
+        .mount(&server)
+        .await;
+
+    let fields = caldav_cli::models::CalendarFields {
+        name: Some("Client work"),
+        ..Default::default()
+    };
+    assert!(
+        client(&server)
+            .update_calendar("Work", &fields)
+            .await
+            .is_ok()
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let patch = requests.iter().find(|r| r.method == "PROPPATCH").unwrap();
+    let body = String::from_utf8(patch.body.clone()).unwrap();
+    // Nothing else was named, so nothing else is touched — and in particular
+    // no empty <d:remove> block, which some servers reject outright.
+    assert!(!body.contains("calendar-color"), "over-patched: {body}");
+    assert!(!body.contains("<d:remove>"), "spurious remove: {body}");
+}
+
+#[tokio::test]
+async fn clearing_a_calendar_property_removes_it_rather_than_setting_it_empty() {
+    let server = MockServer::start().await;
+    mount_with_inbox(&server).await;
+    Mock::given(method("PROPPATCH"))
+        .and(body_string_contains(
+            "<d:remove><d:prop><ic:calendar-color/>",
+        ))
+        .respond_with(ok(&proppatch_ok(
+            "/1234/calendars/work/",
+            "<ic:calendar-color/>",
+        )))
+        .mount(&server)
+        .await;
+
+    let fields = caldav_cli::models::CalendarFields {
+        color: Some(""),
+        ..Default::default()
+    };
+    assert!(
+        client(&server)
+            .update_calendar("Work", &fields)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn deleting_the_default_calendar_is_refused() {
+    let server = MockServer::start().await;
+    mount_with_inbox(&server).await;
+
+    // Home is the server-advertised default. Deleting it would leave the account
+    // with nowhere for a new event to go.
+    let err = client(&server)
+        .delete_calendar("Home")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("default calendar"), "unhelpful: {err}");
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.iter().any(|r| r.method == "DELETE"));
+}
+
+#[tokio::test]
+async fn deleting_a_calendar_removes_the_collection() {
+    let server = MockServer::start().await;
+    mount_with_inbox(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/1234/calendars/work/"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let gone = client(&server).delete_calendar("Work").await.unwrap();
+    // Returned as it was: there is nothing left to read it back from.
+    assert_eq!(gone.name, "Work");
+}

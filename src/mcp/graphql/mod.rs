@@ -50,10 +50,14 @@ pub fn build_schema() -> CalDavSchema {
     // it cannot see, which is a bad deal for a model composing a query.
     //
     // Depth stays capped: the graph has cycles, and nothing else bounds them.
-    Schema::build(QueryRoot, MutationRoot, async_graphql::EmptySubscription)
-        .data(types::NonceStore::default())
-        .limit_depth(MAX_DEPTH)
-        .finish()
+    Schema::build(
+        QueryRoot,
+        MutationRoot::default(),
+        async_graphql::EmptySubscription,
+    )
+    .data(types::NonceStore::default())
+    .limit_depth(MAX_DEPTH)
+    .finish()
 }
 
 /// Build a GraphQL request carrying everything a resolver may need: the CalDAV

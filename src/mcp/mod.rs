@@ -325,8 +325,9 @@ impl ServerHandler for CalDavMcp {
             .with_instructions(
                 "The user's calendars, as a small GraphQL API. Read the schema once with \
                  `calendar_schema`, then run queries and mutations with `calendar`. \
-                 Creating an event needs no confirmation; updates and deletes are \
-                 preview-then-confirm, and never confirm one the user hasn't seen.",
+                 Writes that only add something need no confirmation; everything that \
+                 changes or removes something is preview-then-confirm, and never confirm \
+                 one the user hasn't seen.",
             )
     }
 }
