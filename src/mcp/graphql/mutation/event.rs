@@ -1,20 +1,18 @@
-//! GraphQL mutation resolvers.
-//!
-//! Every write is two-phase: PREVIEW renders what would change and hands back a
-//! one-shot token, CONFIRM applies it. A calendar is shared, visible state —
-//! the model should never move or delete something without the user seeing the
-//! change described first.
+//! Writes to the contents of a calendar: events, their occurrences, and your own
+//! reply to an invitation.
 
 use async_graphql::{Context, Object, Result};
 
+use super::{join_or_none, show_time};
 use crate::commands::parse_attendee_spec;
 use crate::models::{Attendee, Event, EventFields};
 use crate::util;
 
-use super::types::*;
-use super::{DefaultCalendar, SharedClient};
+use super::super::types::*;
+use super::super::{DefaultCalendar, SharedClient};
 
-pub struct MutationRoot;
+#[derive(Default)]
+pub struct EventMutation;
 
 /// The write-shaped arguments, collected so preview, fingerprint, and apply all
 /// read from the same place.
@@ -205,24 +203,9 @@ fn preview_update(existing: &Event, input: &EventInput) -> String {
     lines.join("\n")
 }
 
-fn show_time(t: &crate::models::EventTime) -> String {
-    t.date
-        .clone()
-        .or_else(|| t.date_time.clone())
-        .unwrap_or_else(|| t.raw.clone())
-}
-
-fn join_or_none(items: &[String]) -> String {
-    if items.is_empty() {
-        "(none)".to_string()
-    } else {
-        items.join(", ")
-    }
-}
-
 #[Object]
 #[allow(clippy::too_many_arguments)]
-impl MutationRoot {
+impl EventMutation {
     /// Create an event. Writes immediately — no preview step. Tell the user
     /// what was created afterwards, including the calendar it landed in.
     async fn create_event(
@@ -393,6 +376,198 @@ impl MutationRoot {
         }
 
         match client.delete_event(&id, calendar.as_deref()).await {
+            Ok(event) => Ok(GqlEventResult::done(event)),
+            Err(e) => Ok(GqlEventResult::failed(e.to_string())),
+        }
+    }
+
+    /// Move an event into another calendar, keeping its UID and its contents.
+    ///
+    /// Lossless where `deleteEvent` + `createEvent` is not: the stored iCalendar
+    /// object is relocated rather than rebuilt, so alarms, attachments and
+    /// per-occurrence overrides survive. ALWAYS call with action=PREVIEW first.
+    async fn move_event(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "PREVIEW first, then CONFIRM to move")] action: WriteAction,
+        #[graphql(desc = "The event UID")] id: String,
+        #[graphql(desc = "Calendar name or id to move the event into")] to_calendar: String,
+        #[graphql(desc = "Restrict the lookup to one calendar — one request instead of a sweep.")]
+        calendar: Option<String>,
+        #[graphql(desc = "Token from the PREVIEW response — required for CONFIRM")]
+        confirmation_token: Option<String>,
+    ) -> Result<GqlEventResult> {
+        let client = ctx.data::<SharedClient>()?;
+        let nonce_store = ctx.data::<NonceStore>()?;
+        let parts = [
+            id.as_str(),
+            to_calendar.as_str(),
+            calendar.as_deref().unwrap_or(""),
+        ];
+
+        if action == WriteAction::Preview {
+            let Some(existing) = client.get_event(&id, calendar.as_deref()).await? else {
+                return Ok(GqlEventResult::failed(format!("Event not found: {id}")));
+            };
+            let token = issue_nonce(nonce_store, &parts).await;
+            let text = format!(
+                "Move event: {}\nStarts: {}\nFrom calendar: {}\nTo calendar: {to_calendar}",
+                existing.summary.as_deref().unwrap_or("(no title)"),
+                show_time(&existing.start),
+                existing.calendar
+            );
+            return Ok(GqlEventResult::pending(text, token));
+        }
+        if let Err(msg) = consume_nonce(nonce_store, confirmation_token.as_deref(), &parts).await {
+            return Ok(GqlEventResult::failed(msg));
+        }
+
+        match client
+            .move_event(&id, calendar.as_deref(), &to_calendar)
+            .await
+        {
+            Ok(event) => Ok(GqlEventResult::done(event)),
+            Err(e) => Ok(GqlEventResult::failed(e.to_string())),
+        }
+    }
+
+    /// Cancel one occurrence of a recurring series, leaving the rest intact.
+    ///
+    /// This is what `deleteEvent` is not: that removes the whole series. Adds an
+    /// `EXDATE` to the master event, so the occurrence stops appearing everywhere
+    /// the calendar is read.
+    ///
+    /// `occurrence` may be a bare date when only one occurrence falls on it;
+    /// otherwise give the exact start time. The PREVIEW names the instant it
+    /// resolved to — read that back before confirming. ALWAYS call with
+    /// action=PREVIEW first.
+    async fn delete_occurrence(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "PREVIEW first, then CONFIRM to cancel the occurrence")]
+        action: WriteAction,
+        #[graphql(desc = "The series UID")] id: String,
+        #[graphql(
+            desc = "Which occurrence: its start time, or a bare date when the series runs once that day"
+        )]
+        occurrence: String,
+        #[graphql(desc = "Restrict the lookup to one calendar")] calendar: Option<String>,
+        #[graphql(desc = "Token from the PREVIEW response — required for CONFIRM")]
+        confirmation_token: Option<String>,
+    ) -> Result<GqlEventResult> {
+        let client = ctx.data::<SharedClient>()?;
+        let nonce_store = ctx.data::<NonceStore>()?;
+        let parts = [
+            id.as_str(),
+            occurrence.as_str(),
+            calendar.as_deref().unwrap_or(""),
+        ];
+
+        if action == WriteAction::Preview {
+            let Some(existing) = client.get_event(&id, calendar.as_deref()).await? else {
+                return Ok(GqlEventResult::failed(format!("Event not found: {id}")));
+            };
+            // Resolving here rather than only on CONFIRM is the point of the
+            // preview: a bare date is ambiguous, and the user has to see which
+            // occurrence it landed on before agreeing to lose it.
+            let resolved = match crate::caldav::resolve_occurrence(
+                &existing,
+                &occurrence,
+                existing.start.tzid.as_deref(),
+            )
+            .map(util::format_rfc3339)
+            {
+                Ok(when) => when,
+                Err(e) => return Ok(GqlEventResult::failed(e.to_string())),
+            };
+            let token = issue_nonce(nonce_store, &parts).await;
+            let text = format!(
+                "Cancel one occurrence of: {} ({})\nOccurrence: {resolved}\nRepeats: {}\n\
+                 The rest of the series is untouched. This cannot be undone.",
+                existing.summary.as_deref().unwrap_or("(no title)"),
+                existing.calendar,
+                existing.recurrence.as_deref().unwrap_or("(not a series)")
+            );
+            return Ok(GqlEventResult::pending(text, token));
+        }
+        if let Err(msg) = consume_nonce(nonce_store, confirmation_token.as_deref(), &parts).await {
+            return Ok(GqlEventResult::failed(msg));
+        }
+
+        match client
+            .exclude_occurrence(&id, calendar.as_deref(), &occurrence)
+            .await
+        {
+            Ok(event) => Ok(GqlEventResult::done(event)),
+            Err(e) => Ok(GqlEventResult::failed(e.to_string())),
+        }
+    }
+
+    /// Reply to an invitation by setting your own participation status.
+    ///
+    /// The server turns the changed `PARTSTAT` into a reply delivered to the
+    /// organiser, so this is visible to other people — ALWAYS call with
+    /// action=PREVIEW first and get the user's approval.
+    ///
+    /// Only your own row changes. Use `updateEvent(attendees: [...])` to change
+    /// who is invited.
+    async fn respond_to_invite(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "PREVIEW first, then CONFIRM to send the reply")] action: WriteAction,
+        #[graphql(desc = "The event UID")] id: String,
+        #[graphql(desc = "Your reply")] response: InviteResponse,
+        #[graphql(
+            desc = "Which attendee row is you. Defaults to the account's own address — set it when the invitation went to an alias."
+        )]
+        attendee: Option<String>,
+        #[graphql(desc = "Restrict the lookup to one calendar")] calendar: Option<String>,
+        #[graphql(desc = "Token from the PREVIEW response — required for CONFIRM")]
+        confirmation_token: Option<String>,
+    ) -> Result<GqlEventResult> {
+        let client = ctx.data::<SharedClient>()?;
+        let nonce_store = ctx.data::<NonceStore>()?;
+        let partstat = response.partstat();
+        let parts = [
+            id.as_str(),
+            partstat,
+            attendee.as_deref().unwrap_or(""),
+            calendar.as_deref().unwrap_or(""),
+        ];
+
+        if action == WriteAction::Preview {
+            let Some(existing) = client.get_event(&id, calendar.as_deref()).await? else {
+                return Ok(GqlEventResult::failed(format!("Event not found: {id}")));
+            };
+            let me = attendee.as_deref().unwrap_or(client.username());
+            let current = existing
+                .attendees
+                .iter()
+                .find(|a| a.email.eq_ignore_ascii_case(me))
+                .and_then(|a| a.status.as_deref())
+                .unwrap_or("NEEDS-ACTION");
+            let token = issue_nonce(nonce_store, &parts).await;
+            let text = format!(
+                "Reply to: {}\nStarts: {}\nOrganiser: {}\nAs: {me}\nYour status: {current} → \
+                 {partstat}\nThe organiser is notified.",
+                existing.summary.as_deref().unwrap_or("(no title)"),
+                show_time(&existing.start),
+                existing
+                    .organizer
+                    .as_ref()
+                    .map(|o| o.email.as_str())
+                    .unwrap_or("(none)"),
+            );
+            return Ok(GqlEventResult::pending(text, token));
+        }
+        if let Err(msg) = consume_nonce(nonce_store, confirmation_token.as_deref(), &parts).await {
+            return Ok(GqlEventResult::failed(msg));
+        }
+
+        match client
+            .respond_to_invite(&id, calendar.as_deref(), partstat, attendee.as_deref())
+            .await
+        {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
         }

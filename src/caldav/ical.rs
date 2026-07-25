@@ -543,6 +543,78 @@ fn parse_utc_stamp(raw: &str) -> Option<DateTime<Utc>> {
         .map(|naive| Utc.from_utc_datetime(&naive))
 }
 
+/// The property name at the head of a content line.
+fn line_name(line: &str) -> &str {
+    line.split([';', ':']).next().unwrap_or_default()
+}
+
+/// The recurrence properties other than `DTSTART` and `RRULE` — `EXDATE`,
+/// `RDATE`, `EXRULE` — out of an [`crate::models::Event::recur_source`].
+///
+/// `DTSTART` and `RRULE` are excluded because they are rebuilt from the model;
+/// these are not modelled at all and so have to survive as text.
+pub fn recur_extra_lines(recur_source: Option<&str>) -> Vec<String> {
+    recur_source
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            matches!(
+                line_name(line).to_ascii_uppercase().as_str(),
+                "EXDATE" | "RDATE" | "EXRULE"
+            )
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The same recurrence source with its exclusions stripped, so expanding it
+/// yields every occurrence the rule generates rather than the ones still live.
+///
+/// Which occurrence a user *named* and which are still standing are different
+/// questions: "that one is already cancelled" is a far better answer than "no
+/// such occurrence", and only an unfiltered expansion can tell them apart.
+pub fn recur_source_without_exclusions(recur_source: Option<&str>) -> Option<String> {
+    recur_source.map(|src| {
+        src.lines()
+            .filter(|line| {
+                !matches!(
+                    line_name(line.trim()).to_ascii_uppercase().as_str(),
+                    "EXDATE" | "EXRULE"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+/// Every instant already excluded from a series by an `EXDATE`.
+///
+/// One property may carry a comma-separated list, and a series may carry several
+/// properties — so this flattens both rather than assuming one value each.
+pub fn excluded_instants(recur_source: Option<&str>, default_tz: Tz) -> Vec<DateTime<Utc>> {
+    recur_extra_lines(recur_source)
+        .iter()
+        .filter_map(|line| parse_content_line(line))
+        .filter(|line| line.name.eq_ignore_ascii_case("EXDATE"))
+        .flat_map(|line| {
+            split_unquoted(&line.value, ',')
+                .into_iter()
+                .filter_map(|value| {
+                    parse_time(
+                        &ContentLine {
+                            value: value.trim().to_string(),
+                            ..line.clone()
+                        },
+                        default_tz,
+                    )
+                    .instant
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// How a DTSTART/DTEND should be written back out.
 pub struct TimeSpec<'a> {
     pub instant: DateTime<Utc>,
@@ -553,7 +625,11 @@ pub struct TimeSpec<'a> {
 
 impl TimeSpec<'_> {
     /// Render as a full content line, e.g. `DTSTART;TZID=Europe/London:20260724T090000`.
-    fn render(&self, name: &str) -> String {
+    ///
+    /// Also used for `EXDATE`, which servers only honour when its value type and
+    /// `TZID` match the `DTSTART` of the series — writing both through here is
+    /// what keeps them in step.
+    pub fn render(&self, name: &str) -> String {
         if self.all_day {
             return format!("{name};VALUE=DATE:{}", util::format_ical_date(self.instant));
         }
@@ -581,6 +657,13 @@ pub struct VEventSpec<'a> {
     pub url: Option<&'a str>,
     pub status: Option<&'a str>,
     pub recurrence: Option<&'a str>,
+    /// The recurrence properties other than `RRULE` — `EXDATE`, `RDATE`,
+    /// `EXRULE` — as complete content lines, written back verbatim.
+    ///
+    /// These carry structured values this tool doesn't model, and rebuilding a
+    /// series without them silently resurrects every cancelled occurrence. Get
+    /// them from [`recur_extra_lines`].
+    pub recur_extra: &'a [String],
     pub attendees: &'a [Attendee],
     pub organizer: Option<&'a Attendee>,
     pub categories: &'a [String],
@@ -622,6 +705,9 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
         // RRULE is structured, not TEXT — it must not be escaped.
         lines.push(format!("RRULE:{}", v.trim_start_matches("RRULE:")));
     }
+    // Already complete content lines, straight off the wire — not escaped, and
+    // only meaningful next to the RRULE they qualify.
+    lines.extend(spec.recur_extra.iter().cloned());
     if !spec.categories.is_empty() {
         let joined: Vec<String> = spec.categories.iter().map(|c| escape_text(c)).collect();
         lines.push(format!("CATEGORIES:{}", joined.join(",")));
@@ -866,6 +952,7 @@ END:VCALENDAR\r\n";
             url: Some("https://x.test/e"),
             status: Some("confirmed"),
             recurrence: Some("FREQ=WEEKLY;BYDAY=MO"),
+            recur_extra: &[],
             attendees: &attendees,
             organizer: None,
             categories: &["work".to_string(), "planning".to_string()],
@@ -915,6 +1002,7 @@ END:VCALENDAR\r\n";
             url: None,
             status: None,
             recurrence: None,
+            recur_extra: &[],
             attendees: &[],
             organizer: None,
             categories: &[],
@@ -939,5 +1027,99 @@ END:VFREEBUSY\r\nEND:VCALENDAR\r\n";
         assert_eq!(periods[0].status, "BUSY");
         // Second period uses start/duration form.
         assert_eq!(periods[1].end, "2026-07-24T14:30:00Z");
+    }
+
+    /// A series with two kinds of exception on it, plus an unmodelled property.
+    const WITH_EXCEPTIONS: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\n\
+SUMMARY:Standup\r\nDTSTART;TZID=Europe/London:20260724T090000\r\n\
+DTEND;TZID=Europe/London:20260724T093000\r\nRRULE:FREQ=DAILY\r\n\
+EXDATE;TZID=Europe/London:20260727T090000,20260728T090000\r\n\
+RDATE;TZID=Europe/London:20260801T140000\r\nEND:VEVENT\r\nEND:VCALENDAR";
+
+    #[test]
+    fn recurrence_extras_are_kept_and_dtstart_and_rrule_are_not() {
+        let event = parse_one(WITH_EXCEPTIONS);
+        let extras = recur_extra_lines(event.recur_source.as_deref());
+
+        // DTSTART and RRULE are rebuilt from the model; re-emitting them here
+        // would duplicate them in the output.
+        assert_eq!(extras.len(), 2, "{extras:?}");
+        assert!(
+            extras
+                .iter()
+                .any(|l| l.starts_with("EXDATE;TZID=Europe/London:"))
+        );
+        assert!(
+            extras
+                .iter()
+                .any(|l| l.starts_with("RDATE;TZID=Europe/London:"))
+        );
+        assert!(!extras.iter().any(|l| l.starts_with("DTSTART")));
+        assert!(!extras.iter().any(|l| l.starts_with("RRULE")));
+    }
+
+    #[test]
+    fn a_comma_separated_exdate_yields_every_instant_in_it() {
+        let event = parse_one(WITH_EXCEPTIONS);
+        let excluded = excluded_instants(event.recur_source.as_deref(), Tz::UTC);
+
+        // One property, two values — reading only the first would let a
+        // re-cancel through as if it were new.
+        assert_eq!(excluded.len(), 2);
+        assert_eq!(util::format_rfc3339(excluded[0]), "2026-07-27T08:00:00Z");
+        assert_eq!(util::format_rfc3339(excluded[1]), "2026-07-28T08:00:00Z");
+    }
+
+    #[test]
+    fn stripping_exclusions_keeps_the_rule_and_the_extra_dates() {
+        let event = parse_one(WITH_EXCEPTIONS);
+        let stripped = recur_source_without_exclusions(event.recur_source.as_deref()).unwrap();
+
+        assert!(!stripped.contains("EXDATE"));
+        // RDATE adds occurrences rather than removing them, so it stays.
+        assert!(stripped.contains("RDATE"));
+        assert!(stripped.contains("RRULE:FREQ=DAILY"));
+        assert!(stripped.contains("DTSTART"));
+    }
+
+    #[test]
+    fn a_built_event_round_trips_its_exceptions() {
+        let event = parse_one(WITH_EXCEPTIONS);
+        let extras = recur_extra_lines(event.recur_source.as_deref());
+        let ics = build_vcalendar(&VEventSpec {
+            uid: "s",
+            summary: "Standup",
+            start: TimeSpec {
+                instant: event.start.instant.unwrap(),
+                all_day: false,
+                tzid: Some("Europe/London"),
+            },
+            end: TimeSpec {
+                instant: event.end.instant.unwrap(),
+                all_day: false,
+                tzid: Some("Europe/London"),
+            },
+            description: None,
+            location: None,
+            url: None,
+            status: None,
+            recurrence: Some("FREQ=DAILY"),
+            recur_extra: &extras,
+            attendees: &[],
+            organizer: None,
+            categories: &[],
+            sequence: 1,
+            stamp: Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap(),
+        });
+
+        // Re-reading what we wrote must yield the same exclusions we started
+        // with — this is the round trip an update depends on.
+        let reparsed = parse_one(&ics);
+        assert_eq!(
+            excluded_instants(reparsed.recur_source.as_deref(), Tz::UTC),
+            excluded_instants(event.recur_source.as_deref(), Tz::UTC)
+        );
+        assert_eq!(ics.matches("RRULE").count(), 1);
+        assert_eq!(ics.matches("DTSTART").count(), 1);
     }
 }
