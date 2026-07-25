@@ -27,11 +27,16 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **One MCP tool, `calendar`, replacing `schema_sdl` and `graphql`.** The SDL
-  now rides in the tool description, which costs ~2k tokens per session but
-  removes the introspection round trip before every first query — and drops the
-  failure mode where a model skips it and guesses at the schema. Breaking for
+- **MCP tools renamed** to `calendar_schema` and `calendar`, from `schema_sdl`
+  and `graphql` — clients render the tool name, and "Schema sdl" / "Graphql"
+  described the transport rather than what the tool reaches. Breaking for
   anything naming the old tools; the queries themselves are unchanged.
+- **A near-free idle cost for the MCP server.** Instructions and tool
+  descriptions load into every session, most of which never mention a calendar,
+  so the usage rules and examples moved out of them and into the
+  `calendar_schema` response, alongside the SDL they annotate. Connecting the
+  server now costs ~230 tokens instead of ~750, and everything substantial is
+  paid only by sessions that touch a calendar.
 - **Protocol version follows the SDK** instead of pinning `2024-11-05`, so
   clients get the newest version both ends know. Older clients are unaffected:
   the server echoes back whatever version they ask for.

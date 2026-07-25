@@ -125,9 +125,15 @@ written with a `TZID`, so it moves correctly across DST.
 
 ## MCP server
 
-One tool, `calendar`: execute a GraphQL query or mutation. The SDL ships inside
-the tool description rather than behind a separate introspection tool — ~2k
-tokens up front against a discovery round trip on every session.
+Two tools, following `fastmail-cli`'s design:
+
+- `calendar_schema` — the GraphQL SDL and the rules for using it
+- `calendar` — execute a query or mutation
+
+The schema is ~2k tokens, so it stays behind a tool call rather than in the
+tool descriptions, which every session loads whether or not it goes near a
+calendar. Connecting this server costs ~230 tokens until something actually
+asks about the calendar.
 
 ```bash
 claude mcp add --scope user caldav -- caldav-cli mcp
