@@ -64,41 +64,49 @@ fn header<'a>(parts: Option<&'a http::request::Parts>, name: &str) -> Option<&'a
         .filter(|s| !s.is_empty())
 }
 
-/// The user's chosen calendar for new events: the per-request header (HTTP),
-/// else the configured value (stdio). `None` leaves the choice to the server's
-/// own default calendar.
-fn resolve_default_calendar(
-    parts: Option<&http::request::Parts>,
-    default: Option<&str>,
-) -> Option<String> {
-    header(parts, CALENDAR_HEADER)
-        .or(default)
-        .map(str::to_string)
+/// What one account's requests are answered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Resolved {
+    credentials: Credentials,
+    /// Calendar for new events. `None` defers to the account's own default.
+    calendar: Option<String>,
 }
 
-/// Prefer the per-request headers (HTTP), else fall back to the configured
-/// default (stdio). Pure so it can be unit-tested without a live
+/// Everything a request resolves to: the per-request headers (HTTP), else the
+/// configured values (stdio). Pure so it can be unit-tested without a live
 /// [`RequestContext`].
 ///
 /// Username and password must *both* arrive as headers to be used — a partial
 /// header set never mixes with the configured credentials, which would
-/// otherwise silently authenticate as the wrong account.
-fn resolve_credentials(
+/// otherwise silently authenticate as the wrong account. The calendar is
+/// resolved in the same breath rather than separately, so it can never be
+/// paired with credentials from the other source: one account's request would
+/// otherwise inherit another's configured calendar.
+fn resolve(
     parts: Option<&http::request::Parts>,
     default: Option<&Credentials>,
-) -> Option<Credentials> {
+    default_calendar: Option<&str>,
+) -> Option<Resolved> {
     let header = |name: &str| header(parts, name);
 
     match (header(USERNAME_HEADER), header(PASSWORD_HEADER)) {
-        (Some(username), Some(password)) => Some(Credentials {
-            server_url: header(SERVER_URL_HEADER)
-                .map(str::to_string)
-                .or_else(|| default.map(|d| d.server_url.clone()))
-                .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string()),
-            username: username.to_string(),
-            password: password.to_string(),
+        (Some(username), Some(password)) => Some(Resolved {
+            credentials: Credentials {
+                server_url: header(SERVER_URL_HEADER)
+                    .map(str::to_string)
+                    .or_else(|| default.map(|d| d.server_url.clone()))
+                    .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string()),
+                username: username.to_string(),
+                password: password.to_string(),
+            },
+            calendar: header(CALENDAR_HEADER).map(str::to_string),
         }),
-        _ => default.cloned(),
+        _ => default.cloned().map(|credentials| Resolved {
+            credentials,
+            calendar: header(CALENDAR_HEADER)
+                .or(default_calendar)
+                .map(str::to_string),
+        }),
     }
 }
 
@@ -164,12 +172,12 @@ impl CalDavMcp {
         ctx.extensions.get::<http::request::Parts>()
     }
 
-    fn resolve_credentials(&self, ctx: &RequestContext<RoleServer>) -> Option<Credentials> {
-        resolve_credentials(self.parts(ctx), self.default_credentials.as_ref())
-    }
-
-    fn resolve_default_calendar(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
-        resolve_default_calendar(self.parts(ctx), self.default_calendar.as_deref())
+    fn resolve(&self, ctx: &RequestContext<RoleServer>) -> Option<Resolved> {
+        resolve(
+            self.parts(ctx),
+            self.default_credentials.as_ref(),
+            self.default_calendar.as_deref(),
+        )
     }
 
     /// Get or lazily create a client for `creds`, caching it for reuse.
@@ -210,7 +218,7 @@ impl CalDavMcp {
         // The chosen calendar is per-request, so it can't live in the static
         // server instructions. Prepending it here is the earliest the model
         // sees it — it is told to call this tool first.
-        match self.resolve_default_calendar(&ctx) {
+        match self.resolve(&ctx).and_then(|r| r.calendar) {
             Some(calendar) => Self::text_result(format!(
                 "# New events go to the user's chosen calendar, {calendar:?}, unless \
                  createEvent is given a `calendar` argument.\n\n{}",
@@ -228,20 +236,17 @@ impl CalDavMcp {
         ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<GraphqlRequest>,
     ) -> ToolResult {
-        let Some(creds) = self.resolve_credentials(&ctx) else {
+        let Some(resolved) = self.resolve(&ctx) else {
             return Self::error_result(
                 "No CalDAV credentials available. Configure them via `caldav-cli auth` \
                  (stdio) or send the X-CalDAV-Username and X-CalDAV-Password headers (HTTP).",
             );
         };
-        let client = self.client_for(&creds).await;
+        let client = self.client_for(&resolved.credentials).await;
 
-        let mut request =
-            async_graphql::Request::new(&req.query)
-                .data(client)
-                .data(graphql::DefaultCalendar(
-                    self.resolve_default_calendar(&ctx),
-                ));
+        let mut request = async_graphql::Request::new(&req.query)
+            .data(client)
+            .data(graphql::DefaultCalendar(resolved.calendar));
 
         if let Some(ref vars) = req.variables {
             match serde_json::from_str::<serde_json::Value>(vars) {
@@ -381,6 +386,14 @@ mod tests {
         }
     }
 
+    /// Most cases below only care about the credential half.
+    fn resolved_credentials(
+        parts: Option<&http::request::Parts>,
+        default: Option<&Credentials>,
+    ) -> Option<Credentials> {
+        resolve(parts, default, None).map(|r| r.credentials)
+    }
+
     fn parts_with(headers: &[(&str, &str)]) -> http::request::Parts {
         let mut builder = http::Request::builder();
         for (k, v) in headers {
@@ -396,7 +409,7 @@ mod tests {
             (PASSWORD_HEADER, "header-pw"),
             (SERVER_URL_HEADER, "https://caldav.fastmail.com"),
         ]);
-        let got = resolve_credentials(Some(&parts), Some(&creds("default@x.test"))).unwrap();
+        let got = resolved_credentials(Some(&parts), Some(&creds("default@x.test"))).unwrap();
         assert_eq!(got.username, "header@x.test");
         assert_eq!(got.password, "header-pw");
         assert_eq!(got.server_url, "https://caldav.fastmail.com");
@@ -405,28 +418,28 @@ mod tests {
     #[test]
     fn url_header_is_optional_and_falls_back_to_icloud() {
         let parts = parts_with(&[(USERNAME_HEADER, "me@icloud.com"), (PASSWORD_HEADER, "pw")]);
-        let got = resolve_credentials(Some(&parts), None).unwrap();
+        let got = resolved_credentials(Some(&parts), None).unwrap();
         assert_eq!(got.server_url, DEFAULT_SERVER_URL);
     }
 
     #[test]
     fn url_header_absent_inherits_the_default_server() {
         let parts = parts_with(&[(USERNAME_HEADER, "me@x.test"), (PASSWORD_HEADER, "pw")]);
-        let got = resolve_credentials(Some(&parts), Some(&creds("other@x.test"))).unwrap();
+        let got = resolved_credentials(Some(&parts), Some(&creds("other@x.test"))).unwrap();
         assert_eq!(got.server_url, "https://caldav.example.com");
         assert_eq!(got.username, "me@x.test");
     }
 
     #[test]
     fn falls_back_to_default_when_no_headers() {
-        let got = resolve_credentials(Some(&parts_with(&[])), Some(&creds("default@x.test")));
+        let got = resolved_credentials(Some(&parts_with(&[])), Some(&creds("default@x.test")));
         assert_eq!(got.unwrap().username, "default@x.test");
     }
 
     #[test]
     fn falls_back_to_default_when_no_parts() {
         // stdio: no HTTP parts in the request context at all.
-        let got = resolve_credentials(None, Some(&creds("default@x.test")));
+        let got = resolved_credentials(None, Some(&creds("default@x.test")));
         assert_eq!(got.unwrap().username, "default@x.test");
     }
 
@@ -435,42 +448,49 @@ mod tests {
         // A username header with no password must not authenticate as the
         // configured account under someone else's name.
         let parts = parts_with(&[(USERNAME_HEADER, "attacker@x.test")]);
-        let got = resolve_credentials(Some(&parts), Some(&creds("owner@x.test"))).unwrap();
+        let got = resolved_credentials(Some(&parts), Some(&creds("owner@x.test"))).unwrap();
         assert_eq!(got.username, "owner@x.test");
     }
 
     #[test]
     fn blank_headers_are_treated_as_absent() {
         let parts = parts_with(&[(USERNAME_HEADER, "  "), (PASSWORD_HEADER, "pw")]);
-        let got = resolve_credentials(Some(&parts), Some(&creds("owner@x.test"))).unwrap();
+        let got = resolved_credentials(Some(&parts), Some(&creds("owner@x.test"))).unwrap();
         assert_eq!(got.username, "owner@x.test");
     }
 
     #[test]
     fn calendar_header_overrides_the_configured_one() {
         let parts = parts_with(&[(CALENDAR_HEADER, "Work")]);
-        assert_eq!(
-            resolve_default_calendar(Some(&parts), Some("Personal")).as_deref(),
-            Some("Work")
-        );
+        let got = resolve(Some(&parts), Some(&creds("me@x.test")), Some("Personal")).unwrap();
+        assert_eq!(got.calendar.as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn header_credentials_never_inherit_the_configured_calendar() {
+        // Another account's request must not land events in this one's calendar.
+        let parts = parts_with(&[(USERNAME_HEADER, "other@x.test"), (PASSWORD_HEADER, "pw")]);
+        let got = resolve(Some(&parts), Some(&creds("owner@x.test")), Some("Owner")).unwrap();
+        assert_eq!(got.credentials.username, "other@x.test");
+        assert_eq!(got.calendar, None);
     }
 
     #[test]
     fn no_calendar_anywhere_defers_to_the_server() {
-        assert_eq!(resolve_default_calendar(Some(&parts_with(&[])), None), None);
-        assert_eq!(resolve_default_calendar(None, None), None);
+        let default = creds("me@x.test");
+        let plain = resolve(Some(&parts_with(&[])), Some(&default), None).unwrap();
+        assert_eq!(plain.calendar, None);
+        assert_eq!(resolve(None, Some(&default), None).unwrap().calendar, None);
         // A blank header is not a choice — it must not shadow the config.
         let parts = parts_with(&[(CALENDAR_HEADER, "   ")]);
-        assert_eq!(
-            resolve_default_calendar(Some(&parts), Some("Personal")).as_deref(),
-            Some("Personal")
-        );
+        let got = resolve(Some(&parts), Some(&default), Some("Personal")).unwrap();
+        assert_eq!(got.calendar.as_deref(), Some("Personal"));
     }
 
     #[test]
     fn none_when_neither_headers_nor_default() {
         // hosted mode with no upstream-injected credentials — must refuse.
-        assert_eq!(resolve_credentials(Some(&parts_with(&[])), None), None);
-        assert_eq!(resolve_credentials(None, None), None);
+        assert_eq!(resolved_credentials(Some(&parts_with(&[])), None), None);
+        assert_eq!(resolved_credentials(None, None), None);
     }
 }

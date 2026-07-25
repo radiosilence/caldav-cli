@@ -128,6 +128,7 @@ impl Config {
     pub fn get_calendar(&self) -> Option<String> {
         std::env::var("CALDAV_CALENDAR")
             .ok()
+            .filter(|s| !s.trim().is_empty())
             .or_else(|| self.core.calendar.clone())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())

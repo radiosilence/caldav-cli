@@ -883,13 +883,16 @@ fn first_href_under(xml: &str, ns: &str, prop: &str) -> Option<String> {
 }
 
 /// Where an unaddressed event goes: the account's own default calendar, else
-/// the first writable one. A read-only default is skipped — some servers keep
-/// pointing at a calendar the user has since lost write access to.
+/// the first calendar it can actually be written to. A read-only default is
+/// skipped — some servers keep pointing at a calendar the user has since lost
+/// write access to — as is a task-only collection, which would swallow the
+/// event somewhere no calendar app shows it.
 fn pick_default(calendars: &[Calendar]) -> Option<&Calendar> {
+    let usable = |c: &&Calendar| !c.read_only && c.supports_events;
     calendars
         .iter()
-        .find(|c| c.is_default && !c.read_only)
-        .or_else(|| calendars.iter().find(|c| !c.read_only))
+        .find(|c| c.is_default && usable(c))
+        .or_else(|| calendars.iter().find(usable))
         .or_else(|| calendars.first())
 }
 
@@ -904,11 +907,21 @@ fn parse_calendars(xml: &str, home: &str) -> Vec<Calendar> {
     // child of the calendar-home — so a Depth:1 listing carries it without an
     // extra round trip. The inbox is skipped as a calendar below (its
     // resourcetype is schedule-inbox), so scan the whole document for it.
+    // Two hazards here. iCloud echoes every requested property back, empty, in
+    // each collection's 404 propstat, so the first element carrying the name is
+    // not the one carrying the value. And where RFC 6638 wraps the URL in a
+    // DAV:href, iCloud puts it straight in the element as text.
     let default_href = doc
         .descendants()
-        .find(|n| n.has_tag_name((CALDAV_NS, "schedule-default-calendar-URL")))
-        .and_then(|n| n.descendants().find(|c| c.has_tag_name((DAV_NS, "href"))))
-        .and_then(|n| n.text())
+        .filter(|n| n.has_tag_name((CALDAV_NS, "schedule-default-calendar-URL")))
+        .find_map(|n| {
+            n.descendants()
+                .find(|c| c.has_tag_name((DAV_NS, "href")))
+                .and_then(|h| h.text())
+                .or_else(|| n.text())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
         .map(util::href_path);
 
     for response in doc
@@ -1043,6 +1056,9 @@ mod tests {
   </response>
   <response>
     <href>/1234/calendars/home/</href>
+    <propstat><status>HTTP/1.1 404 Not Found</status><prop>
+      <cal:schedule-default-calendar-URL/>
+    </prop></propstat>
     <propstat><prop>
       <displayname>Home</displayname>
       <resourcetype><collection/><cal:calendar/></resourcetype>
@@ -1083,6 +1099,25 @@ mod tests {
         let mut c = parse_calendars(CALENDARS_XML, "/1234/calendars/");
         c.sort_by_key(|c| c.name.to_lowercase());
         c
+    }
+
+    /// iCloud omits the RFC 6638 `DAV:href` wrapper and puts the path straight
+    /// in the element — and echoes the empty property into every other
+    /// collection's 404 propstat first.
+    #[test]
+    fn reads_icloud_shaped_default_calendar_properties() {
+        let xml = CALENDARS_XML
+            .replace(
+                "<cal:schedule-default-calendar-URL><href>/1234/calendars/home/</href></cal:schedule-default-calendar-URL>",
+                "<cal:schedule-default-calendar-URL>/1234/calendars/home/</cal:schedule-default-calendar-URL>",
+            );
+        let cals = parse_calendars(&xml, "/1234/calendars/");
+        let default: Vec<&str> = cals
+            .iter()
+            .filter(|c| c.is_default)
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(default, ["home"]);
     }
 
     #[test]
