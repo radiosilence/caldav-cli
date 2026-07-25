@@ -5,8 +5,29 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing is tagged yet, so this is the initial feature set rather than a set of
-changes against a released version.
+### Added
+
+- **A default calendar for new events.** `createEvent` / `caldav-cli create`
+  with no calendar named now lands where the user's calendar app would put it,
+  rather than in whichever writable collection sorted first alphabetically.
+  Calendars carry `isDefault`, and it is honoured on writes only — reads still
+  span the account, since scoping an agenda to one calendar hides the rest
+  without saying so.
+- **An override**, for accounts whose own default isn't where automation should
+  write: `X-CalDAV-Calendar` per request in hosted mode, or `calendar` in
+  `config.toml` / `CALDAV_CALENDAR`. The MCP server announces the choice in its
+  `schema_sdl` output, so a model knows where it is writing before it writes.
+- **Discovery that doesn't assume a server's shape**, which iCloud rewards:
+  it answers `schedule-default-calendar-URL` as bare element text rather than
+  the `DAV:href` RFC 6638 specifies, and echoes the property name back empty in
+  the `404` propstat of every collection that hasn't got it. The value is read
+  in whichever shape arrives, from the calendar-home listing or — only when
+  that says nothing — the scheduling inbox, the one location the RFC requires.
+
+## [0.1.0] - 2026-07-24
+
+The initial feature set rather than a set of changes against a released
+version.
 
 ### Added
 
