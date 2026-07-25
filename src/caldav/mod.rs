@@ -208,6 +208,7 @@ impl CalDavClient {
     <d:current-user-privilege-set/>
     <c:supported-calendar-component-set/>
     <c:calendar-description/>
+    <c:schedule-default-calendar-URL/>
     <ic:calendar-color/>
   </d:prop>
 </d:propfind>"#;
@@ -225,15 +226,12 @@ impl CalDavClient {
     }
 
     /// Resolve a calendar by id, display name, or href. With no name, the
-    /// first writable calendar wins — the common "just put it somewhere
-    /// sensible" case.
+    /// account's own default wins, then the first writable one — "just put it
+    /// where my calendar app would".
     pub async fn find_calendar(&self, name: Option<&str>) -> Result<Calendar> {
         let calendars = self.list_calendars().await?;
         match name.map(str::trim).filter(|s| !s.is_empty()) {
-            None => calendars
-                .iter()
-                .find(|c| !c.read_only)
-                .or_else(|| calendars.first())
+            None => pick_default(calendars)
                 .cloned()
                 .ok_or_else(|| Error::CalendarNotFound("no calendars on this account".into())),
             Some(name) => calendars
@@ -884,12 +882,34 @@ fn first_href_under(xml: &str, ns: &str, prop: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Where an unaddressed event goes: the account's own default calendar, else
+/// the first writable one. A read-only default is skipped — some servers keep
+/// pointing at a calendar the user has since lost write access to.
+fn pick_default(calendars: &[Calendar]) -> Option<&Calendar> {
+    calendars
+        .iter()
+        .find(|c| c.is_default && !c.read_only)
+        .or_else(|| calendars.iter().find(|c| !c.read_only))
+        .or_else(|| calendars.first())
+}
+
 fn parse_calendars(xml: &str, home: &str) -> Vec<Calendar> {
     let Ok(doc) = roxmltree::Document::parse(xml) else {
         return Vec::new();
     };
     let home_path = util::href_path(home);
     let mut out = Vec::new();
+
+    // `schedule-default-calendar-URL` hangs off the scheduling inbox, itself a
+    // child of the calendar-home — so a Depth:1 listing carries it without an
+    // extra round trip. The inbox is skipped as a calendar below (its
+    // resourcetype is schedule-inbox), so scan the whole document for it.
+    let default_href = doc
+        .descendants()
+        .find(|n| n.has_tag_name((CALDAV_NS, "schedule-default-calendar-URL")))
+        .and_then(|n| n.descendants().find(|c| c.has_tag_name((DAV_NS, "href"))))
+        .and_then(|n| n.text())
+        .map(util::href_path);
 
     for response in doc
         .descendants()
@@ -952,6 +972,9 @@ fn parse_calendars(xml: &str, home: &str) -> Vec<Calendar> {
 
         out.push(Calendar {
             id: util::last_segment(&href),
+            is_default: default_href
+                .as_deref()
+                .is_some_and(|d| d.trim_end_matches('/') == href.trim_end_matches('/')),
             // Resolve against the home URL, which carries the partition host
             // iCloud redirected us to — not the URL the user configured.
             url: util::resolve_url(home, &href),
@@ -1040,6 +1063,13 @@ mod tests {
     </prop></propstat>
   </response>
   <response>
+    <href>/1234/calendars/inbox/</href>
+    <propstat><prop>
+      <resourcetype><collection/><cal:schedule-inbox/></resourcetype>
+      <cal:schedule-default-calendar-URL><href>/1234/calendars/home/</href></cal:schedule-default-calendar-URL>
+    </prop></propstat>
+  </response>
+  <response>
     <href>/1234/calendars/tasks/</href>
     <propstat><prop>
       <displayname>Reminders</displayname>
@@ -1053,6 +1083,62 @@ mod tests {
         let mut c = parse_calendars(CALENDARS_XML, "/1234/calendars/");
         c.sort_by_key(|c| c.name.to_lowercase());
         c
+    }
+
+    #[test]
+    fn marks_the_calendar_the_server_calls_default() {
+        let cals = calendars();
+        let default: Vec<&str> = cals
+            .iter()
+            .filter(|c| c.is_default)
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(default, ["home"]);
+        // The scheduling inbox carrying the property is not itself a calendar.
+        assert!(!cals.iter().any(|c| c.id == "inbox"));
+    }
+
+    #[test]
+    fn the_advertised_default_beats_the_first_writable_calendar() {
+        let mut cals = calendars();
+        cals.sort_by_key(|c| c.name.to_lowercase());
+        // "Home" is not first alphabetically once a writable calendar precedes it.
+        cals.insert(
+            0,
+            Calendar {
+                id: "admin".into(),
+                href: "/1234/calendars/admin/".into(),
+                url: "/1234/calendars/admin/".into(),
+                name: "Admin".into(),
+                description: None,
+                color: None,
+                read_only: false,
+                supports_events: true,
+                is_default: false,
+            },
+        );
+        assert_eq!(pick_default(&cals).unwrap().id, "home");
+    }
+
+    #[test]
+    fn a_read_only_default_falls_through_to_a_writable_calendar() {
+        let mut cals = calendars();
+        for c in &mut cals {
+            c.read_only = c.is_default;
+        }
+        let picked = pick_default(&cals).unwrap();
+        assert!(!picked.read_only);
+        assert_ne!(picked.id, "home");
+    }
+
+    #[test]
+    fn no_default_property_leaves_every_calendar_unmarked() {
+        let xml = CALENDARS_XML.replace("schedule-default-calendar-URL", "unrelated-prop");
+        assert!(
+            !parse_calendars(&xml, "/1234/calendars/")
+                .iter()
+                .any(|c| c.is_default)
+        );
     }
 
     #[test]

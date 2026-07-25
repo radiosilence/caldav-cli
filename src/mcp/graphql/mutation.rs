@@ -11,8 +11,8 @@ use crate::commands::parse_attendee_spec;
 use crate::models::{Attendee, Event, EventFields};
 use crate::util;
 
-use super::SharedClient;
 use super::types::*;
+use super::{DefaultCalendar, SharedClient};
 
 pub struct MutationRoot;
 
@@ -120,7 +120,10 @@ fn push_field(out: &mut Vec<String>, label: &str, value: Option<&str>) {
 fn preview_create(input: &EventInput) -> String {
     let mut lines = vec![format!(
         "Create event in calendar: {}",
-        input.calendar.as_deref().unwrap_or("(first writable)")
+        input
+            .calendar
+            .as_deref()
+            .unwrap_or("(your default calendar)")
     )];
     push_field(&mut lines, "Title", input.summary.as_deref());
     if let Some(start) = input.start.as_deref() {
@@ -269,7 +272,7 @@ impl MutationRoot {
         #[graphql(desc = "Event title")] summary: String,
         #[graphql(desc = "Start: ISO 8601, 'YYYY-MM-DD [HH:MM]', 'tomorrow', or '+2h'")]
         start: String,
-        #[graphql(desc = "Calendar name or id. Omit for the first writable calendar.")]
+        #[graphql(desc = "Calendar name or id. Omit for the user's default calendar.")]
         calendar: Option<String>,
         #[graphql(desc = "End time. Takes precedence over durationMinutes.")] end: Option<String>,
         #[graphql(desc = "Length in minutes. Default 1 hour (1 day if all-day).")]
@@ -289,6 +292,10 @@ impl MutationRoot {
         #[graphql(desc = "Token from the PREVIEW response — required for CONFIRM")]
         confirmation_token: Option<String>,
     ) -> Result<GqlEventResult> {
+        // Resolved before the preview and the fingerprint, so the user sees the
+        // calendar the event will actually land in and CONFIRM writes there.
+        let calendar =
+            calendar.or_else(|| ctx.data_opt::<DefaultCalendar>().and_then(|d| d.0.clone()));
         let input = EventInput {
             calendar,
             summary: Some(summary),

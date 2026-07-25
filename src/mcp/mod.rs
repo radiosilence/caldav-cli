@@ -37,6 +37,10 @@ use graphql::{CalDavSchema, SharedClient};
 pub const USERNAME_HEADER: &str = "x-caldav-username";
 pub const PASSWORD_HEADER: &str = "x-caldav-password";
 pub const SERVER_URL_HEADER: &str = "x-caldav-url";
+/// The calendar new events land in when the model doesn't name one. Not a
+/// credential: it doesn't authenticate anything and must not re-key the client
+/// cache, so it is resolved separately from [`Credentials`].
+pub const CALENDAR_HEADER: &str = "x-caldav-calendar";
 
 /// One account's CalDAV credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -51,6 +55,27 @@ pub struct Credentials {
 /// than on every tool call. Shared across sessions.
 type ClientCache = Arc<Mutex<HashMap<Credentials, SharedClient>>>;
 
+/// A non-empty, trimmed header value, if present.
+fn header<'a>(parts: Option<&'a http::request::Parts>, name: &str) -> Option<&'a str> {
+    parts
+        .and_then(|p| p.headers.get(name))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// The user's chosen calendar for new events: the per-request header (HTTP),
+/// else the configured value (stdio). `None` leaves the choice to the server's
+/// own default calendar.
+fn resolve_default_calendar(
+    parts: Option<&http::request::Parts>,
+    default: Option<&str>,
+) -> Option<String> {
+    header(parts, CALENDAR_HEADER)
+        .or(default)
+        .map(str::to_string)
+}
+
 /// Prefer the per-request headers (HTTP), else fall back to the configured
 /// default (stdio). Pure so it can be unit-tested without a live
 /// [`RequestContext`].
@@ -62,13 +87,7 @@ fn resolve_credentials(
     parts: Option<&http::request::Parts>,
     default: Option<&Credentials>,
 ) -> Option<Credentials> {
-    let header = |name: &str| {
-        parts
-            .and_then(|p| p.headers.get(name))
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    };
+    let header = |name: &str| header(parts, name);
 
     match (header(USERNAME_HEADER), header(PASSWORD_HEADER)) {
         (Some(username), Some(password)) => Some(Credentials {
@@ -103,16 +122,20 @@ pub struct CalDavMcp {
     /// Fallback credentials for stdio mode (loaded from config). `None` in
     /// hosted HTTP mode, where they must arrive per request via the headers.
     default_credentials: Option<Credentials>,
+    /// Configured calendar for new events (stdio). Hosted requests carry their
+    /// own in [`CALENDAR_HEADER`].
+    default_calendar: Option<String>,
     #[allow(dead_code)] // referenced by #[tool_handler] macro expansion
     tool_router: ToolRouter<Self>,
 }
 
 impl CalDavMcp {
-    fn build(default_credentials: Option<Credentials>) -> Self {
+    fn build(default_credentials: Option<Credentials>, default_calendar: Option<String>) -> Self {
         Self {
             schema: Arc::new(graphql::build_schema()),
             clients: Arc::new(Mutex::new(HashMap::new())),
             default_credentials,
+            default_calendar,
             tool_router: Self::tool_router(),
         }
     }
@@ -121,22 +144,32 @@ impl CalDavMcp {
     /// every request. Errors if none are configured.
     pub fn new() -> anyhow::Result<Self> {
         let config = Config::load()?;
-        Ok(Self::build(Some(Credentials {
-            server_url: config.get_server_url(),
-            username: config.get_username()?,
-            password: config.get_app_password()?,
-        })))
+        Ok(Self::build(
+            Some(Credentials {
+                server_url: config.get_server_url(),
+                username: config.get_username()?,
+                password: config.get_app_password()?,
+            }),
+            config.get_calendar(),
+        ))
     }
 
     /// Construct for hosted HTTP use: no default credentials. Each request must
     /// carry its own via the headers, injected by the trusted upstream service.
     pub fn hosted() -> Self {
-        Self::build(None)
+        Self::build(None, None)
+    }
+
+    fn parts<'a>(&self, ctx: &'a RequestContext<RoleServer>) -> Option<&'a http::request::Parts> {
+        ctx.extensions.get::<http::request::Parts>()
     }
 
     fn resolve_credentials(&self, ctx: &RequestContext<RoleServer>) -> Option<Credentials> {
-        let parts = ctx.extensions.get::<http::request::Parts>();
-        resolve_credentials(parts, self.default_credentials.as_ref())
+        resolve_credentials(self.parts(ctx), self.default_credentials.as_ref())
+    }
+
+    fn resolve_default_calendar(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
+        resolve_default_calendar(self.parts(ctx), self.default_calendar.as_deref())
     }
 
     /// Get or lazily create a client for `creds`, caching it for reuse.
@@ -173,8 +206,18 @@ impl CalDavMcp {
     #[tool(
         description = "Returns the full GraphQL SDL (Schema Definition Language) for the CalDAV API. Call this first to discover available queries, mutations, types, and their arguments. The schema covers calendars, events, agenda, search, free/busy, and event creation, updates, and deletion."
     )]
-    async fn schema_sdl(&self) -> ToolResult {
-        Self::text_result(self.schema.sdl())
+    async fn schema_sdl(&self, ctx: RequestContext<RoleServer>) -> ToolResult {
+        // The chosen calendar is per-request, so it can't live in the static
+        // server instructions. Prepending it here is the earliest the model
+        // sees it — it is told to call this tool first.
+        match self.resolve_default_calendar(&ctx) {
+            Some(calendar) => Self::text_result(format!(
+                "# New events go to the user's chosen calendar, {calendar:?}, unless \
+                 createEvent is given a `calendar` argument.\n\n{}",
+                self.schema.sdl()
+            )),
+            None => Self::text_result(self.schema.sdl()),
+        }
     }
 
     #[tool(
@@ -193,7 +236,12 @@ impl CalDavMcp {
         };
         let client = self.client_for(&creds).await;
 
-        let mut request = async_graphql::Request::new(&req.query).data(client);
+        let mut request =
+            async_graphql::Request::new(&req.query)
+                .data(client)
+                .data(graphql::DefaultCalendar(
+                    self.resolve_default_calendar(&ctx),
+                ));
 
         if let Some(ref vars) = req.variables {
             match serde_json::from_str::<serde_json::Value>(vars) {
@@ -396,6 +444,27 @@ mod tests {
         let parts = parts_with(&[(USERNAME_HEADER, "  "), (PASSWORD_HEADER, "pw")]);
         let got = resolve_credentials(Some(&parts), Some(&creds("owner@x.test"))).unwrap();
         assert_eq!(got.username, "owner@x.test");
+    }
+
+    #[test]
+    fn calendar_header_overrides_the_configured_one() {
+        let parts = parts_with(&[(CALENDAR_HEADER, "Work")]);
+        assert_eq!(
+            resolve_default_calendar(Some(&parts), Some("Personal")).as_deref(),
+            Some("Work")
+        );
+    }
+
+    #[test]
+    fn no_calendar_anywhere_defers_to_the_server() {
+        assert_eq!(resolve_default_calendar(Some(&parts_with(&[])), None), None);
+        assert_eq!(resolve_default_calendar(None, None), None);
+        // A blank header is not a choice — it must not shadow the config.
+        let parts = parts_with(&[(CALENDAR_HEADER, "   ")]);
+        assert_eq!(
+            resolve_default_calendar(Some(&parts), Some("Personal")).as_deref(),
+            Some("Personal")
+        );
     }
 
     #[test]
