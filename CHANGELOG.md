@@ -50,13 +50,12 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the `404` propstat of every collection that hasn't got it. The value is read
   in whichever shape arrives, from the calendar-home listing or — only when
   that says nothing — the scheduling inbox, the one location the RFC requires.
-
-### Changed
-
 - **Docker images tagged by version.** `ghcr.io/radiosilence/caldav-cli` now
   gets `vX.Y.Z`, `vX.Y`, `vX`, and `latest` tags alongside `main` and
   `sha-<short>`, cut only on the push that first introduces that version in
   `Cargo.toml` so the tags never drift onto a later, unrelated commit.
+
+### Changed
 
 - **Every read goes through a DataLoader.** No resolver touches the CalDAV
   client directly. `calendar-multiget` is the one genuine batch CalDAV offers —
