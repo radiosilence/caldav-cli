@@ -244,9 +244,7 @@ impl CalDavMcp {
         };
         let client = self.client_for(&resolved.credentials).await;
 
-        let mut request = async_graphql::Request::new(&req.query)
-            .data(client)
-            .data(graphql::DefaultCalendar(resolved.calendar));
+        let mut request = graphql::request(&req.query, client, resolved.calendar);
 
         if let Some(ref vars) = req.variables {
             match serde_json::from_str::<serde_json::Value>(vars) {

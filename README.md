@@ -135,15 +135,99 @@ claude mcp add --scope user caldav -- caldav-cli mcp
 ```
 
 ```graphql
-{ calendars { id name color readOnly } }
+{ calendars { nodes { id name color readOnly } } }
 
 { agenda(days: 1, tz: "Europe/London") {
-    id summary location start { dateTime date allDay } end { dateTime } } }
+    nodes { id summary location start { dateTime date allDay } end { dateTime } } } }
 
-{ searchEvents(query: "dentist", days: 90) { id summary start { dateTime date } } }
+{ events(filter: { text: "dentist" }, days: 90) {
+    nodes { id summary start { dateTime date } } } }
 
-{ freeBusy(start: "today", days: 3) { start end status } }
+{ freeBusy(start: "today", days: 3) { nodes { start end status } } }
 ```
+
+### It's a graph
+
+Every collection is a connection (`nodes`, `edges`, `pageInfo`, `totalCount`,
+`first`/`after`), and everything below one is lazy — a field that isn't
+selected issues no request.
+
+The motivation is call count. "What's on today, whose calendar is it, and does
+anything clash" used to be `agenda` → `calendars` → an `events` call per
+result, with the model composing each round trip. Now it's one query:
+
+```graphql
+{
+  agenda(days: 1, tz: "Europe/London") {
+    totalCount
+    calendarsQueried
+    nodes {
+      summary
+      durationMinutes
+      calendar { name color readOnly }
+      conflicts { totalCount nodes { summary calendarName } }
+    }
+  }
+}
+```
+
+Cost: one `PROPFIND` for the calendar listing, shared by every calendar lookup
+in the document → one `calendar-query` REPORT per event-holding calendar →
+**nothing** for the conflicts, because they resolve the window the agenda
+already fetched.
+
+Filters are a tree rather than flat arguments. Scalars on one object AND
+together; `and`/`or`/`not` nest arbitrarily:
+
+```graphql
+{
+  events(
+    days: 14
+    filter: {
+      status: CONFIRMED
+      or: [{ attendee: "alice@example.com" }, { organizer: "alice@example.com" }]
+      not: [{ allDay: true }]
+    }
+    sort: [{ property: START, ascending: true }]
+    first: 20
+  ) { totalCount nodes { summary start { dateTime } } }
+}
+```
+
+Pagination is by event id, so `after:` is an id you have already seen:
+
+```graphql
+{ events(days: 30, first: 25, after: "evt-abc") {
+    totalCount pageInfo { hasNextPage endCursor } edges { cursor node { summary } } } }
+```
+
+### What each field costs
+
+CalDAV is stingier than JMAP about batching, so the schema says what it can and
+can't collapse rather than implying it away:
+
+| Read | Request | Batching |
+| --- | --- | --- |
+| Calendar listing | one `PROPFIND` | whole list — one call however many fields ask |
+| `events` / `agenda` / `Calendar.events` | `calendar-query` REPORT, one per collection | no plural form exists; identical windows deduplicate, distinct ones go out concurrently |
+| `Event.series` | `calendar-multiget` REPORT | a true batch — every href in one collection, one request |
+| `event(id:)` | `calendar-query` REPORT | CalDAV ANDs all sibling filters (RFC 4791 §9.7), so there is no OR over UIDs: one request per calendar until it hits. Pass `calendar:` to make it exactly one |
+| `Event.occurrences` | none | evaluated from the `RRULE` already in hand |
+
+Two consequences worth knowing, both stated in the schema:
+
+- **`totalCount` is free and exact.** CalDAV has no windowed query — the range
+  arrives whole — so the count is a length, not extra work for the server.
+- **Paging is slicing, and a cursor lasts as long as its event.** If the event
+  is gone you get a "restart pagination" error, not a quietly different page.
+
+`calendarsQueried` on every event connection reports how many collections were
+hit, so the cost isn't hidden. Naming `calendar:` brings it to one.
+
+Query cost is declared per field but **not** capped — refusing an
+expensive-but-legitimate query leaves the caller guessing at a threshold it
+can't see. Depth is capped at 15, because the graph has cycles by design
+(`event → calendar → events`) and nothing else bounds them.
 
 ### Writes are two-phase
 
@@ -185,7 +269,19 @@ Server-side overrides are respected: an edited occurrence replaces its
 generated slot, and one marked `CANCELLED` removes it.
 
 To **edit** a series, fetch it unexpanded (`events(expand: false)` or
-`caldav-cli list --no-expand`) and update the master event.
+`caldav-cli list --no-expand`) and update the master event. From an expanded
+occurrence, `series { ... }` walks to that master directly — a whole page of
+occurrences resolves through one `calendar-multiget`.
+
+`Event.occurrences` goes the other way: it evaluates the rule already in hand,
+so "where does this series actually fall over the next quarter" costs no
+request at all.
+
+```graphql
+{ events(expand: false, days: 1, filter: { recurring: true }) {
+    nodes { summary recurrence
+      occurrences(days: 90) { totalCount nodes { start { dateTime } } } } } }
+```
 
 ### Hosted mode
 
