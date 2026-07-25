@@ -678,7 +678,7 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
     let mut lines = vec![
         "BEGIN:VCALENDAR".to_string(),
         "VERSION:2.0".to_string(),
-        "PRODID:-//radiosilence//caldav-cli//EN".to_string(),
+        "PRODID:-//radiosilence//caldav//EN".to_string(),
         "CALSCALE:GREGORIAN".to_string(),
         "BEGIN:VEVENT".to_string(),
         format!("UID:{}", spec.uid),

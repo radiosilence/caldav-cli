@@ -274,7 +274,7 @@ impl CalDavMcp {
     ) -> ToolResult {
         let Some(resolved) = self.resolve(&ctx) else {
             return Self::error_result(
-                "No CalDAV credentials available. Configure them via `caldav-cli auth` \
+                "No CalDAV credentials available. Configure them via `caldav auth` \
                  (stdio) or send the X-CalDAV-Username and X-CalDAV-Password headers (HTTP).",
             );
         };
@@ -309,7 +309,7 @@ impl CalDavMcp {
 #[tool_handler]
 impl ServerHandler for CalDavMcp {
     fn get_info(&self) -> ServerInfo {
-        let server_info = Implementation::new("caldav-cli", env!("CARGO_PKG_VERSION"))
+        let server_info = Implementation::new("caldav", env!("CARGO_PKG_VERSION"))
             .with_title("CalDAV MCP Server")
             .with_website_url("https://github.com/radiosilence/caldav-cli");
 
@@ -418,7 +418,7 @@ async fn graphql_endpoint(
             return axum::Json(async_graphql::Response::from_errors(vec![
                 async_graphql::ServerError::new(
                     format!(
-                        "No CalDAV credentials available. Configure them via `caldav-cli auth` \
+                        "No CalDAV credentials available. Configure them via `caldav auth` \
                          or send the {USERNAME_HEADER} and {PASSWORD_HEADER} headers."
                     ),
                     None,
