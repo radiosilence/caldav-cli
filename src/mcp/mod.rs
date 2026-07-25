@@ -127,53 +127,6 @@ pub struct GraphqlRequest {
     pub variables: Option<String>,
 }
 
-/// Prelude to the schema. It lives here rather than in the server instructions
-/// because instructions are loaded into every session, and most of them never
-/// touch a calendar — this is only paid by the ones that do.
-const USAGE: &str = "\
-# Calendar API
-
-Times accept ISO 8601, 'YYYY-MM-DD HH:MM', 'today'/'tomorrow', and offsets like \
-'+2h'. Pass `tz` (e.g. Europe/London) whenever the user means a local wall-clock \
-time. `events` and `agenda` expand recurring series by default; to edit a \
-series, fetch it with `expand: false` and update the master event.
-
-## Creating vs changing
-
-`createEvent` writes straight away. Don't ask first — create the event, then \
-tell the user what you made and where it landed, so they can correct you.
-
-`updateEvent` and `deleteEvent` are two-phase, because they destroy something \
-that is already there and a delete cannot be undone. `action: PREVIEW` renders \
-what would change and returns a one-shot `confirmationToken`; `action: CONFIRM` \
-with that token applies it. NEVER confirm without reading the preview back to \
-the user and getting approval.
-
-## Examples
-
-```graphql
-{ calendars { id name color readOnly } }
-
-{ agenda(days: 1, tz: \"Europe/London\") {
-    id summary location start { dateTime date allDay } end { dateTime } } }
-
-{ events(start: \"2026-07-24\", days: 7) {
-    id summary start { dateTime date } calendar } }
-
-{ searchEvents(query: \"dentist\", days: 90) { id summary start { dateTime date } } }
-
-{ freeBusy(start: \"today\", days: 3) { start end status } }
-
-mutation { createEvent(summary: \"Coffee\", start: \"tomorrow 15:00\",
-    durationMinutes: 30, tz: \"Europe/London\") { event { id summary } } }
-
-mutation { deleteEvent(action: PREVIEW, id: \"...\") { preview confirmationToken } }
-```
-
-## Schema
-
-```graphql";
-
 // ============ Server Implementation ============
 
 #[derive(Clone)]
@@ -267,7 +220,7 @@ impl CalDavMcp {
     #[tool(
         name = "calendar_schema",
         title = "Calendar Schema",
-        description = "The calendar API's GraphQL schema and the rules for using it. Call once before the first `calendar` query."
+        description = "The calendar API's GraphQL schema. Call once before the first `calendar` query."
     )]
     async fn calendar_schema(&self, ctx: RequestContext<RoleServer>) -> ToolResult {
         // The chosen calendar is per-request, so it can't live in the static
@@ -280,7 +233,7 @@ impl CalDavMcp {
             ),
             None => String::new(),
         };
-        Self::text_result(format!("{calendar}{USAGE}\n\n{}\n```\n", self.schema.sdl()))
+        Self::text_result(format!("{calendar}{}", self.schema.sdl()))
     }
 
     #[tool(
@@ -346,10 +299,10 @@ impl ServerHandler for CalDavMcp {
             // schema and the rules for using it are a tool call away, paid only
             // when a calendar is actually in play.
             .with_instructions(
-                "The user's calendars, as a small GraphQL API. Read the schema and its usage \
-                 rules once with `calendar_schema`, then run queries and mutations with \
-                 `calendar`. Creating an event needs no confirmation; updates and deletes \
-                 are preview-then-confirm, and never confirm one the user hasn't seen.",
+                "The user's calendars, as a small GraphQL API. Read the schema once with \
+                 `calendar_schema`, then run queries and mutations with `calendar`. \
+                 Creating an event needs no confirmation; updates and deletes are \
+                 preview-then-confirm, and never confirm one the user hasn't seen.",
             )
     }
 }
