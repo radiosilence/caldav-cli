@@ -280,8 +280,9 @@ enum Commands {
         #[arg(long)]
         graphiql: bool,
 
-        /// Open the GraphiQL IDE in your browser once listening
-        #[arg(long, requires = "graphiql")]
+        /// Open the GraphiQL IDE in your browser once listening (implies
+        /// --graphiql)
+        #[arg(long)]
         browser: bool,
     },
 }
@@ -380,6 +381,12 @@ async fn main() {
             graphiql,
             browser,
         } => {
+            // Asking for a surface is asking for what it needs: opening a
+            // browser at the IDE means serving the IDE, which means serving the
+            // /graphql it talks to. Refusing to infer that leaves the user
+            // spelling out three flags to mean one thing.
+            let graphiql = graphiql || browser;
+
             // `--http` is MCP's own transport; `--graphql`/`--graphiql` are
             // separate surfaces that happen to need a listener too. Asking for
             // any of them binds one — there is nowhere to mount an HTTP route
