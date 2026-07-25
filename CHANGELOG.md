@@ -27,6 +27,13 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`createEvent` writes without a confirmation round trip**, dropping its
+  `action` and `confirmationToken` arguments. The two-phase guard exists for
+  changes that destroy state; a new event destroys nothing, is visible the
+  moment it lands, and is deletable — so the model creates it and says what it
+  created, and a wrong guess is corrected rather than pre-empted. `updateEvent`
+  and `deleteEvent` are unchanged: they overwrite or remove something already
+  there, and a delete can't be undone.
 - **MCP tools renamed** to `calendar_schema` and `calendar`, from `schema_sdl`
   and `graphql` — clients render the tool name, and "Schema sdl" / "Graphql"
   described the transport rather than what the tool reaches. Breaking for

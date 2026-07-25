@@ -150,26 +150,30 @@ claude mcp add --scope user caldav -- caldav-cli mcp
 { freeBusy(start: "today", days: 3) { start end status } }
 ```
 
-### Writes are two-phase
+### Creating is one step; changing is two
 
-Every mutation takes an `action`. `PREVIEW` renders what would change and
-returns a one-shot `confirmationToken`; `CONFIRM` applies it. The token is
+`createEvent` writes immediately. A wrong new event is visible and deletable,
+so a confirmation round trip buys nothing that the user's own eyes don't — the
+model reports what it made and gets corrected if it guessed badly.
+
+```graphql
+mutation { createEvent(summary: "Coffee", start: "tomorrow 15:00",
+    durationMinutes: 30, tz: "Europe/London") { event { id summary } } }
+```
+
+`updateEvent` and `deleteEvent` take an `action`, because they overwrite or
+remove something that already exists and a delete can't be undone. `PREVIEW`
+renders what would change — a before → after diff, or the event about to go —
+and returns a one-shot `confirmationToken`; `CONFIRM` applies it. The token is
 bound to a fingerprint of the arguments, so a confirm whose arguments drifted
 from its preview is rejected rather than silently doing something else.
 
 ```graphql
-mutation { createEvent(action: PREVIEW, summary: "Coffee",
-    start: "tomorrow 15:00", durationMinutes: 30, tz: "Europe/London") {
-  preview confirmationToken } }
+mutation { deleteEvent(action: PREVIEW, id: "...") { preview confirmationToken } }
 
-mutation { createEvent(action: CONFIRM, summary: "Coffee",
-    start: "tomorrow 15:00", durationMinutes: 30, tz: "Europe/London",
-    confirmationToken: "...") { event { id summary } } }
+mutation { deleteEvent(action: CONFIRM, id: "...",
+    confirmationToken: "...") { success } }
 ```
-
-`updateEvent` previews a before → after diff; `deleteEvent` previews the event
-it is about to remove. A calendar is shared, visible state — nothing should
-move without the user seeing it described first.
 
 ### Recurring events
 
