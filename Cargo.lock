@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "caldav-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "askama",

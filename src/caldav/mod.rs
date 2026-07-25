@@ -811,10 +811,34 @@ impl CalDavClient {
     /// Look one UID up in one calendar.
     ///
     /// CalDAV filters have no OR (RFC 4791 §9.7 ANDs every sibling), so a UID
-    /// lookup is one REPORT per calendar per UID — there is no plural form to
+    /// lookup is one request per calendar per UID — there is no plural form to
     /// batch into. Callers spanning an account fan these out instead.
+    ///
+    /// Three ways to ask, cheapest first, because no single one works
+    /// everywhere:
+    ///
+    /// 1. `calendar-multiget` on the href a UID-named resource would have. One
+    ///    request, and it hits for anything this tool or an Apple client wrote.
+    /// 2. A `calendar-query` filtered on UID — precise, and the only way to
+    ///    find an event whose filename doesn't match its UID. iCloud answers a
+    ///    `prop-filter` on UID with 412, so it can't be the only path.
+    /// 3. The whole collection, matched client-side. Expensive, so it is
+    ///    reached only when a server refuses (2) for an event that defeats (1).
     #[instrument(skip(self))]
     pub async fn event_in_calendar(&self, uid: &str, calendar: &Calendar) -> Result<Option<Event>> {
+        let file = format!("{}.ics", utf8_percent_encode(uid, PATH_SEGMENT));
+        let href = format!("{}{}", ensure_trailing_slash(&calendar.href), file);
+        // A guessed href, so a server that hard-errors on the miss instead of
+        // reporting 404 inside the multistatus hasn't told us anything final.
+        match self.multiget_events(calendar, &[href]).await {
+            Ok(events) => {
+                if let Some(event) = pick_uid(events, uid) {
+                    return Ok(Some(event));
+                }
+            }
+            Err(e) => debug!(error = %e, "href guess failed, falling back to a UID query"),
+        }
+
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
@@ -832,7 +856,7 @@ impl CalDavClient {
             xml_escape(uid)
         );
 
-        let xml = self
+        match self
             .dav(
                 "REPORT",
                 &calendar.url,
@@ -840,32 +864,74 @@ impl CalDavClient {
                 "application/xml",
                 Some(body),
             )
-            .await?;
+            .await
+        {
+            // A text-match is a substring match on some servers, so confirm the
+            // UID actually equals what was asked for.
+            Ok(xml) => Ok(pick_uid(parse_event_responses(&xml, calendar), uid)),
+            Err(Error::Dav { status, .. }) if refuses_uid_filter(status) => {
+                tracing::warn!(
+                    calendar = %calendar.name,
+                    status,
+                    "server rejected a UID filter — scanning the whole calendar instead"
+                );
+                self.scan_for_uid(uid, calendar).await
+            }
+            Err(e) => Err(e),
+        }
+    }
 
-        // A text-match is a substring match on some servers, so confirm the UID
-        // actually equals what was asked for. Prefer the master event (no
-        // RECURRENCE-ID) when a series has overrides.
-        let mut matches: Vec<Event> = parse_event_responses(&xml, calendar)
-            .into_iter()
-            .filter(|e| e.id == uid)
-            .collect();
-        matches.sort_by_key(|e| e.recurrence_id.is_some());
-        Ok(matches.into_iter().next())
+    /// Every event in a calendar, matched on UID here rather than server-side.
+    ///
+    /// Downloads the entire collection, which is why it is a last resort:
+    /// iCloud rejects a UID `prop-filter` outright, and asking for only the UID
+    /// back (RFC 4791 §9.6.1 partial retrieval) gets the full data anyway.
+    async fn scan_for_uid(&self, uid: &str, calendar: &Calendar) -> Result<Option<Event>> {
+        let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VEVENT"/>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>"#;
+        let xml = self
+            .dav(
+                "REPORT",
+                &calendar.url,
+                Some("1"),
+                "application/xml",
+                Some(body.to_string()),
+            )
+            .await?;
+        Ok(pick_uid(parse_event_responses(&xml, calendar), uid))
     }
 
     /// Find one event by UID. Searches every calendar unless one is named.
     ///
     /// Stops at the first calendar holding the UID, so the usual case costs one
-    /// REPORT. Only a miss pays for the whole sweep.
+    /// request. Only a miss pays for the whole sweep.
     #[instrument(skip(self))]
     pub async fn get_event(&self, uid: &str, calendar: Option<&str>) -> Result<Option<Event>> {
+        let mut failure = None;
         for cal in self.read_targets(calendar).await? {
-            // An unreadable calendar shouldn't mask a hit in the next one.
-            if let Ok(Some(event)) = self.event_in_calendar(uid, &cal).await {
-                return Ok(Some(event));
+            match self.event_in_calendar(uid, &cal).await {
+                Ok(Some(event)) => return Ok(Some(event)),
+                Ok(None) => {}
+                // An unreadable calendar shouldn't mask a hit in the next one —
+                // but it mustn't masquerade as "no such event" either, or every
+                // write reports a missing event when the read simply broke.
+                Err(e) => {
+                    tracing::warn!(calendar = %cal.name, error = %e, "UID lookup failed");
+                    failure = Some(e);
+                }
             }
         }
-        Ok(None)
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(None),
+        }
     }
 
     /// Substring search over summary, description, location, and attendees.
@@ -1795,6 +1861,22 @@ pub fn resolve_calendar(calendars: &[Calendar], name: Option<&str>) -> Result<Ca
             .cloned()
             .ok_or_else(|| Error::CalendarNotFound(name.to_string())),
     }
+}
+
+/// The event a UID lookup should return, out of whatever a request handed back.
+/// Prefers the master of a series over a server-side override of one occurrence,
+/// which shares its UID.
+fn pick_uid(events: Vec<Event>, uid: &str) -> Option<Event> {
+    let mut matches: Vec<Event> = events.into_iter().filter(|e| e.id == uid).collect();
+    matches.sort_by_key(|e| e.recurrence_id.is_some());
+    matches.into_iter().next()
+}
+
+/// Whether a status means "I won't filter on UID" rather than "that event isn't
+/// here". iCloud says 412; RFC 4791 §7.8 spends 403 on an invalid filter, but
+/// that's indistinguishable from a permissions problem, so it isn't listed.
+fn refuses_uid_filter(status: u16) -> bool {
+    matches!(status, 400 | 412 | 422 | 501)
 }
 
 fn pick_default(calendars: &[Calendar]) -> Option<&Calendar> {
