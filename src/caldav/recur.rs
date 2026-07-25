@@ -94,13 +94,58 @@ pub fn expand_all(events: Vec<Event>, start: DateTime<Utc>, end: DateTime<Utc>) 
     out
 }
 
+/// Pin date-valued recurrence anchors to UTC midnight.
+///
+/// An all-day series' `DTSTART` is a *date* — no timezone, the same day
+/// everywhere — but `RRuleSet` has to choose an instant and chooses midnight in
+/// the **machine's local zone**. Run east of Greenwich and every occurrence
+/// lands at 23:00 the day before, so a Monday bin collection is reported on
+/// Sunday, and an occurrence falling on the first day of the window is dropped
+/// for sorting before it.
+///
+/// Rewriting the anchor as an explicit UTC instant leaves rrule nothing to
+/// interpret, and matches how [`crate::caldav::ical::parse_time`] resolves the
+/// same date. A no-op for timed series, whose values carry a time and are
+/// therefore left alone.
+fn pin_dates_to_utc(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| {
+            let Some((head, values)) = line.split_once(':') else {
+                return line.to_string();
+            };
+            let is_bare_date = |v: &str| v.len() == 8 && v.bytes().all(|b| b.is_ascii_digit());
+            if !values.split(',').any(|v| is_bare_date(v.trim())) {
+                return line.to_string();
+            }
+            let pinned: Vec<String> = values
+                .split(',')
+                .map(|v| {
+                    let v = v.trim();
+                    if is_bare_date(v) {
+                        format!("{v}T000000Z")
+                    } else {
+                        v.to_string()
+                    }
+                })
+                .collect();
+            // `VALUE=DATE` and any `TZID` no longer describe the value.
+            let property = head.split(';').next().unwrap_or(head);
+            format!("{property}:{}", pinned.join(","))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Evaluate a recurrence set over `[start, end)`.
 fn occurrences(
     source: &str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<DateTime<Utc>>, String> {
-    let set: RRuleSet = source.parse().map_err(|e| format!("{e}"))?;
+    let set: RRuleSet = pin_dates_to_utc(source)
+        .parse()
+        .map_err(|e| format!("{e}"))?;
     // `after`/`before` are inclusive at both ends; the window is half-open, so
     // the upper bound is filtered below.
     let result = set
@@ -383,5 +428,109 @@ RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let a: Vec<_> = out.iter().map(|e| e.start.sort_key()).collect();
         let b: Vec<_> = sorted.iter().map(|e| e.start.sort_key()).collect();
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod all_day_tests {
+    use super::*;
+    use crate::caldav::ical;
+    use chrono::TimeZone;
+
+    fn at(y: i32, m: u32, d: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+    }
+
+    const BINS: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:bins\r\nSUMMARY:Bin day\r\n\
+DTSTART;VALUE=DATE:20260706\r\nDTEND;VALUE=DATE:20260707\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    fn parse(ics: &str) -> Vec<Event> {
+        ical::parse_events(ics, "Home", "/c/", "/c/e.ics", None)
+    }
+
+    /// The bug this guards: `RRuleSet` resolves a date-only `DTSTART` in the
+    /// machine's local zone, so anywhere east of Greenwich every occurrence
+    /// landed at 23:00 the day before — a Monday bin collection reported on
+    /// Sunday, and the first Monday dropped for sorting before the window.
+    #[test]
+    fn all_day_occurrences_keep_their_date_regardless_of_local_zone() {
+        let out = expand_all(parse(BINS), at(2026, 7, 6), at(2026, 7, 21));
+
+        let dates: Vec<&str> = out
+            .iter()
+            .map(|e| e.start.date.as_deref().unwrap_or("<none>"))
+            .collect();
+        assert_eq!(dates, ["2026-07-06", "2026-07-13", "2026-07-20"]);
+        assert!(out.iter().all(|e| e.all_day));
+        // Every occurrence anchors at UTC midnight, not local midnight.
+        assert!(
+            out.iter()
+                .all(|e| e.start.instant.unwrap().time() == chrono::NaiveTime::MIN)
+        );
+    }
+
+    /// A series starting exactly on the window's first day must not be filtered
+    /// out — the original symptom was three Mondays coming back as two.
+    #[test]
+    fn an_occurrence_on_the_first_day_of_the_window_is_kept() {
+        let out = expand_all(parse(BINS), at(2026, 7, 6), at(2026, 7, 13));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start.date.as_deref(), Some("2026-07-06"));
+    }
+
+    /// Date-valued EXDATEs suffer the same reinterpretation, so they are pinned
+    /// too — otherwise the exclusion misses the occurrence it names.
+    #[test]
+    fn a_date_valued_exdate_excludes_the_right_day() {
+        let ics = BINS.replace(
+            "RRULE:FREQ=WEEKLY;BYDAY=MO\r\n",
+            "RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEXDATE;VALUE=DATE:20260713\r\n",
+        );
+        let out = expand_all(parse(&ics), at(2026, 7, 6), at(2026, 7, 21));
+        let dates: Vec<&str> = out
+            .iter()
+            .map(|e| e.start.date.as_deref().unwrap_or("<none>"))
+            .collect();
+        assert_eq!(dates, ["2026-07-06", "2026-07-20"]);
+    }
+
+    /// A timed series carries a zone on purpose, and must keep it: 09:00 stays
+    /// 09:00 across the DST boundary rather than being pinned to UTC.
+    #[test]
+    fn a_timed_series_still_expands_in_its_own_zone() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:standup\r\nSUMMARY:Standup\r\n\
+DTSTART;TZID=Europe/London:20261019T090000\r\nDTEND;TZID=Europe/London:20261019T093000\r\n\
+RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        // The window straddles the end of BST (25 October 2026).
+        let out = expand_all(parse(ics), at(2026, 10, 19), at(2026, 11, 3));
+        let london: Vec<String> = out
+            .iter()
+            .map(|e| {
+                e.start
+                    .instant
+                    .unwrap()
+                    .with_timezone(&chrono_tz::Europe::London)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            london,
+            ["2026-10-19 09:00", "2026-10-26 09:00", "2026-11-02 09:00"],
+            "local wall-clock time must survive the DST change"
+        );
+    }
+
+    #[test]
+    fn pinning_leaves_timed_and_rule_lines_untouched() {
+        let source = "DTSTART;TZID=Europe/London:20260706T090000\nRRULE:FREQ=WEEKLY;BYDAY=MO,TU;UNTIL=20260721T000000Z";
+        assert_eq!(pin_dates_to_utc(source), source);
+    }
+
+    #[test]
+    fn pinning_rewrites_every_date_in_a_multi_value_line() {
+        let out = pin_dates_to_utc("EXDATE;VALUE=DATE:20260713,20260720");
+        assert_eq!(out, "EXDATE:20260713T000000Z,20260720T000000Z");
     }
 }

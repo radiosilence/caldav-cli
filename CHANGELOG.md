@@ -109,6 +109,17 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **All-day events landed a day early anywhere east of Greenwich.** An
+  iCalendar `DATE` has no timezone — it means the same day everywhere — but it
+  was being resolved through one anyway. `RRuleSet` anchors a date-only
+  `DTSTART` at midnight in the *machine's local zone*, so under BST a weekly
+  Monday bin collection came back as Sunday, and an occurrence on the window's
+  first day was dropped for sorting before it. The same applied to date-valued
+  `EXDATE`s, whose exclusions then missed the day they named, and to
+  non-recurring all-day events on any calendar publishing `X-WR-TIMEZONE`.
+  Dates are now anchored at UTC midnight everywhere, so the date survives the
+  round trip. Timed series still expand in their own zone, so 09:00 stays 09:00
+  across a DST boundary.
 - **The calendar listing was cached for the life of the process.** Clients are
   pooled per credential, so a long-running MCP server never saw a calendar
   created, renamed, or deleted after start-up — for writes as well as reads.
