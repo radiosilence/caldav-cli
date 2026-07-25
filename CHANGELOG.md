@@ -24,6 +24,13 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in whichever shape arrives, from the calendar-home listing or — only when
   that says nothing — the scheduling inbox, the one location the RFC requires.
 
+### Changed
+
+- **Docker images tagged by version.** `ghcr.io/radiosilence/caldav-cli` now
+  gets `vX.Y.Z`, `vX.Y`, `vX`, and `latest` tags alongside `main` and
+  `sha-<short>`, cut only on the push that first introduces that version in
+  `Cargo.toml` so the tags never drift onto a later, unrelated commit.
+
 ## [0.1.0] - 2026-07-24
 
 The initial feature set rather than a set of changes against a released
