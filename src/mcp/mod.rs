@@ -62,9 +62,9 @@ pub struct Credentials {
 type ClientCache = Arc<Mutex<HashMap<Credentials, SharedClient>>>;
 
 /// A non-empty, trimmed header value, if present.
-fn header<'a>(parts: Option<&'a http::request::Parts>, name: &str) -> Option<&'a str> {
-    parts
-        .and_then(|p| p.headers.get(name))
+fn header<'a>(headers: Option<&'a http::HeaderMap>, name: &str) -> Option<&'a str> {
+    headers
+        .and_then(|h| h.get(name))
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -89,11 +89,11 @@ struct Resolved {
 /// paired with credentials from the other source: one account's request would
 /// otherwise inherit another's configured calendar.
 fn resolve(
-    parts: Option<&http::request::Parts>,
+    headers: Option<&http::HeaderMap>,
     default: Option<&Credentials>,
     default_calendar: Option<&str>,
 ) -> Option<Resolved> {
-    let header = |name: &str| header(parts, name);
+    let header = |name: &str| header(headers, name);
 
     match (header(USERNAME_HEADER), header(PASSWORD_HEADER)) {
         (Some(username), Some(password)) => Some(Resolved {
@@ -116,6 +116,25 @@ fn resolve(
     }
 }
 
+/// The credentials to fall back on when a request carries no `X-CalDAV-*`
+/// headers, and the calendar that goes with them.
+///
+/// Best-effort by design. A hosted deployment ships no config and no
+/// environment, so this is `None` there and every request must bring its own
+/// headers — while running it yourself picks up your own account with no
+/// ceremony.
+fn local_credentials() -> Option<(Credentials, Option<String>)> {
+    let config = Config::load().ok()?;
+    Some((
+        Credentials {
+            server_url: config.get_server_url(),
+            username: config.get_username().ok()?,
+            password: config.get_app_password().ok()?,
+        },
+        config.get_calendar(),
+    ))
+}
+
 // ============ Request Types ============
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -133,11 +152,12 @@ pub struct GraphqlRequest {
 pub struct CalDavMcp {
     schema: Arc<CalDavSchema>,
     clients: ClientCache,
-    /// Fallback credentials for stdio mode (loaded from config). `None` in
-    /// hosted HTTP mode, where they must arrive per request via the headers.
+    /// Credentials used when a request carries no `X-CalDAV-*` headers. Always
+    /// set over stdio; over HTTP it is whatever [`local_credentials`] found, so
+    /// `None` in a hosted deployment and every request must bring its own.
     default_credentials: Option<Credentials>,
-    /// Configured calendar for new events (stdio). Hosted requests carry their
-    /// own in [`CALENDAR_HEADER`].
+    /// Configured calendar for new events. Requests carrying their own
+    /// credentials use [`CALENDAR_HEADER`] instead, never this.
     default_calendar: Option<String>,
     #[allow(dead_code)] // referenced by #[tool_handler] macro expansion
     tool_router: ToolRouter<Self>,
@@ -168,19 +188,25 @@ impl CalDavMcp {
         ))
     }
 
-    /// Construct for hosted HTTP use: no default credentials. Each request must
-    /// carry its own via the headers, injected by the trusted upstream service.
-    pub fn hosted() -> Self {
-        Self::build(None, None)
+    /// Construct for HTTP use. A request's own `X-CalDAV-*` headers always win;
+    /// [`local_credentials`] is the fallback, which exists when you run this
+    /// yourself and not in a hosted deployment.
+    pub fn http() -> Self {
+        match local_credentials() {
+            Some((credentials, calendar)) => Self::build(Some(credentials), calendar),
+            None => Self::build(None, None),
+        }
     }
 
-    fn parts<'a>(&self, ctx: &'a RequestContext<RoleServer>) -> Option<&'a http::request::Parts> {
-        ctx.extensions.get::<http::request::Parts>()
+    fn headers<'a>(&self, ctx: &'a RequestContext<RoleServer>) -> Option<&'a http::HeaderMap> {
+        ctx.extensions
+            .get::<http::request::Parts>()
+            .map(|p| &p.headers)
     }
 
     fn resolve(&self, ctx: &RequestContext<RoleServer>) -> Option<Resolved> {
         resolve(
-            self.parts(ctx),
+            self.headers(ctx),
             self.default_credentials.as_ref(),
             self.default_calendar.as_deref(),
         )
@@ -324,35 +350,183 @@ pub async fn run_server() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the MCP server over streamable HTTP on `addr`, mounted at `/mcp`.
+/// Body of a GraphQL-over-HTTP request, as GraphiQL sends it.
+#[derive(serde::Deserialize)]
+struct HttpGraphqlRequest {
+    query: String,
+    #[serde(default)]
+    variables: Option<serde_json::Value>,
+    #[serde(default, rename = "operationName")]
+    operation_name: Option<String>,
+}
+
+/// The GraphiQL IDE page. GraphiQL itself is loaded from a CDN with pinned
+/// versions and SRI hashes — see `templates/graphiql.html`.
+#[derive(askama::Template)]
+#[template(path = "graphiql.html")]
+struct GraphiqlPage<'a> {
+    title: &'a str,
+    endpoint: &'a str,
+}
+
+/// Whether every top-level selection is an introspection field, and so can be
+/// answered from the schema alone.
 ///
-/// No credentials are baked in: each request must carry them in the
-/// `X-CalDAV-*` headers, set by a trusted upstream after authenticating the
-/// user. This is the transport the hosted gateway puts behind OAuth.
-pub async fn run_http_server(addr: &str) -> anyhow::Result<()> {
+/// GraphiQL sends exactly this on load to build its docs, autocomplete and
+/// explorer. Requiring CalDAV credentials for it would mean bad ones leave you
+/// with an IDE that cannot describe the API you are trying to explore. Anything
+/// it cannot parse, or that mixes in real fields, is not introspection.
+fn is_introspection_only(query: &str) -> bool {
+    use async_graphql::parser::types::Selection;
+
+    let Ok(doc) = async_graphql::parser::parse_query(query) else {
+        return false;
+    };
+    doc.operations.iter().all(|(_, op)| {
+        op.node
+            .selection_set
+            .node
+            .items
+            .iter()
+            .all(|item| match &item.node {
+                Selection::Field(field) => field.node.name.node.starts_with("__"),
+                // Fragments could hide anything; make them take the auth path.
+                _ => false,
+            })
+    })
+}
+
+/// Plain GraphQL-over-HTTP, for browsers and anything else that speaks it
+/// directly rather than through MCP's JSON-RPC envelope. Shares the server's
+/// schema, client cache and credential resolution with the `calendar` tool.
+async fn graphql_endpoint(
+    axum::extract::State(mcp): axum::extract::State<CalDavMcp>,
+    headers: http::HeaderMap,
+    axum::Json(req): axum::Json<HttpGraphqlRequest>,
+) -> axum::Json<async_graphql::Response> {
+    // Introspection is answered from the schema, so it neither needs credentials
+    // nor touches the network — the IDE stays usable while they are wrong.
+    let mut request = if is_introspection_only(&req.query) {
+        async_graphql::Request::new(&req.query)
+    } else {
+        let Some(resolved) = resolve(
+            Some(&headers),
+            mcp.default_credentials.as_ref(),
+            mcp.default_calendar.as_deref(),
+        ) else {
+            return axum::Json(async_graphql::Response::from_errors(vec![
+                async_graphql::ServerError::new(
+                    format!(
+                        "No CalDAV credentials available. Configure them via `caldav-cli auth` \
+                         or send the {USERNAME_HEADER} and {PASSWORD_HEADER} headers."
+                    ),
+                    None,
+                ),
+            ]));
+        };
+        let client = mcp.client_for(&resolved.credentials).await;
+        graphql::request(&req.query, client, resolved.calendar)
+    };
+    if let Some(vars) = req.variables {
+        request = request.variables(async_graphql::Variables::from_json(vars));
+    }
+    if let Some(name) = req.operation_name {
+        request = request.operation_name(name);
+    }
+    axum::Json(mcp.schema.execute(request).await)
+}
+
+/// Where the HTTP server listens when no address is given.
+pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
+
+/// Which surfaces [`run_http_server`] mounts. Each is independent: MCP's
+/// streamable-HTTP transport and a browsable GraphQL endpoint are different
+/// things that happen to share a port.
+#[derive(Clone, Copy)]
+pub struct HttpSurfaces {
+    /// MCP streamable-HTTP at `/mcp`.
+    pub mcp: bool,
+    /// Plain GraphQL-over-HTTP at `/graphql`.
+    pub graphql: bool,
+    /// The GraphiQL IDE at `/`. Implies `graphql` — it is the IDE's endpoint.
+    pub graphiql: bool,
+    /// Open the IDE in the default browser once listening.
+    pub browser: bool,
+}
+
+/// Run the HTTP server on `addr`, mounting whichever of [`HttpSurfaces`] is
+/// enabled.
+///
+/// A request's own `X-CalDAV-*` headers always win; [`local_credentials`] is the
+/// fallback. Running this yourself, that means your own account with no
+/// ceremony. In a hosted deployment there is no local config, so every request
+/// must carry the headers — set by a trusted upstream after authenticating the
+/// caller. Do **not** expose this to the internet without such a layer in
+/// front: the headers are trusted unconditionally.
+pub async fn run_http_server(addr: &str, surfaces: HttpSurfaces) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
 
-    // One shared instance (shared schema + client cache) cloned into each session.
-    let template = CalDavMcp::hosted();
-    // Disable rmcp's DNS-rebinding Host allowlist: this transport is designed to
-    // run behind a trusted reverse proxy, which forwards an internal Host (e.g.
-    // the service name) that the default allowlist (localhost/127.0.0.1/::1)
-    // would reject with 403. Rebinding protection guards browsers hitting a
-    // localhost MCP directly — irrelevant for a proxied, non-browser-facing
-    // backend; the proxy is the security boundary.
-    let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
-    let service = StreamableHttpService::new(
-        move || Ok(template.clone()),
-        Arc::new(LocalSessionManager::default()),
-        config,
-    );
+    // One shared instance (shared schema + client cache) cloned into each
+    // session and used as the axum state for the GraphQL routes.
+    let mcp = CalDavMcp::http();
+    let mut router = axum::Router::new();
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    if surfaces.mcp {
+        // Disable rmcp's DNS-rebinding Host allowlist: this transport is designed
+        // to run behind a trusted reverse proxy, which forwards an internal Host
+        // (e.g. the service name) that the default allowlist
+        // (localhost/127.0.0.1/::1) would reject with 403. Rebinding protection
+        // guards browsers hitting a localhost MCP directly — irrelevant for a
+        // proxied, non-browser-facing backend; the proxy is the security
+        // boundary.
+        let config = StreamableHttpServerConfig::default().disable_allowed_hosts();
+        let service = StreamableHttpService::new(
+            {
+                let template = mcp.clone();
+                move || Ok(template.clone())
+            },
+            Arc::new(LocalSessionManager::default()),
+            config,
+        );
+        router = router.nest_service("/mcp", service);
+        tracing::info!("MCP streamable-HTTP listening on http://{addr}/mcp");
+    }
+
+    if surfaces.graphql || surfaces.graphiql {
+        router = router.route("/graphql", axum::routing::post(graphql_endpoint));
+        tracing::info!("GraphQL endpoint on http://{addr}/graphql");
+    }
+
+    if surfaces.graphiql {
+        // Rendered once: nothing in the page varies per request, and a template
+        // error should stop the server rather than 500 on every hit.
+        let ide = askama::Template::render(&GraphiqlPage {
+            title: "CalDAV GraphQL",
+            endpoint: "/graphql",
+        })?;
+        router = router.route(
+            "/",
+            axum::routing::get(move || {
+                let ide = ide.clone();
+                async move { axum::response::Html(ide) }
+            }),
+        );
+        tracing::info!("GraphiQL IDE on http://{addr}/");
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("MCP streamable-HTTP server listening on http://{addr}/mcp");
-    axum::serve(listener, router)
+
+    // Only once the listener is bound, so the browser cannot beat us to it.
+    if surfaces.browser {
+        let url = format!("http://{addr}/");
+        if let Err(e) = open::that_detached(&url) {
+            tracing::warn!("Could not open a browser at {url}: {e}");
+        }
+    }
+
+    axum::serve(listener, router.with_state(mcp))
         .await
         .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {}", e))?;
 
@@ -373,28 +547,31 @@ mod tests {
 
     /// Most cases below only care about the credential half.
     fn resolved_credentials(
-        parts: Option<&http::request::Parts>,
+        headers: Option<&http::HeaderMap>,
         default: Option<&Credentials>,
     ) -> Option<Credentials> {
-        resolve(parts, default, None).map(|r| r.credentials)
+        resolve(headers, default, None).map(|r| r.credentials)
     }
 
-    fn parts_with(headers: &[(&str, &str)]) -> http::request::Parts {
-        let mut builder = http::Request::builder();
+    fn headers_with(headers: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
         for (k, v) in headers {
-            builder = builder.header(*k, *v);
+            map.insert(
+                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
         }
-        builder.body(()).unwrap().into_parts().0
+        map
     }
 
     #[test]
     fn headers_win_over_default() {
-        let parts = parts_with(&[
+        let headers = headers_with(&[
             (USERNAME_HEADER, "header@x.test"),
             (PASSWORD_HEADER, "header-pw"),
             (SERVER_URL_HEADER, "https://caldav.fastmail.com"),
         ]);
-        let got = resolved_credentials(Some(&parts), Some(&creds("default@x.test"))).unwrap();
+        let got = resolved_credentials(Some(&headers), Some(&creds("default@x.test"))).unwrap();
         assert_eq!(got.username, "header@x.test");
         assert_eq!(got.password, "header-pw");
         assert_eq!(got.server_url, "https://caldav.fastmail.com");
@@ -402,28 +579,28 @@ mod tests {
 
     #[test]
     fn url_header_is_optional_and_falls_back_to_icloud() {
-        let parts = parts_with(&[(USERNAME_HEADER, "me@icloud.com"), (PASSWORD_HEADER, "pw")]);
-        let got = resolved_credentials(Some(&parts), None).unwrap();
+        let headers = headers_with(&[(USERNAME_HEADER, "me@icloud.com"), (PASSWORD_HEADER, "pw")]);
+        let got = resolved_credentials(Some(&headers), None).unwrap();
         assert_eq!(got.server_url, DEFAULT_SERVER_URL);
     }
 
     #[test]
     fn url_header_absent_inherits_the_default_server() {
-        let parts = parts_with(&[(USERNAME_HEADER, "me@x.test"), (PASSWORD_HEADER, "pw")]);
-        let got = resolved_credentials(Some(&parts), Some(&creds("other@x.test"))).unwrap();
+        let headers = headers_with(&[(USERNAME_HEADER, "me@x.test"), (PASSWORD_HEADER, "pw")]);
+        let got = resolved_credentials(Some(&headers), Some(&creds("other@x.test"))).unwrap();
         assert_eq!(got.server_url, "https://caldav.example.com");
         assert_eq!(got.username, "me@x.test");
     }
 
     #[test]
     fn falls_back_to_default_when_no_headers() {
-        let got = resolved_credentials(Some(&parts_with(&[])), Some(&creds("default@x.test")));
+        let got = resolved_credentials(Some(&headers_with(&[])), Some(&creds("default@x.test")));
         assert_eq!(got.unwrap().username, "default@x.test");
     }
 
     #[test]
-    fn falls_back_to_default_when_no_parts() {
-        // stdio: no HTTP parts in the request context at all.
+    fn falls_back_to_default_when_no_request_context() {
+        // stdio: no HTTP headers in the request context at all.
         let got = resolved_credentials(None, Some(&creds("default@x.test")));
         assert_eq!(got.unwrap().username, "default@x.test");
     }
@@ -432,30 +609,30 @@ mod tests {
     fn partial_headers_never_mix_with_the_default() {
         // A username header with no password must not authenticate as the
         // configured account under someone else's name.
-        let parts = parts_with(&[(USERNAME_HEADER, "attacker@x.test")]);
-        let got = resolved_credentials(Some(&parts), Some(&creds("owner@x.test"))).unwrap();
+        let headers = headers_with(&[(USERNAME_HEADER, "attacker@x.test")]);
+        let got = resolved_credentials(Some(&headers), Some(&creds("owner@x.test"))).unwrap();
         assert_eq!(got.username, "owner@x.test");
     }
 
     #[test]
     fn blank_headers_are_treated_as_absent() {
-        let parts = parts_with(&[(USERNAME_HEADER, "  "), (PASSWORD_HEADER, "pw")]);
-        let got = resolved_credentials(Some(&parts), Some(&creds("owner@x.test"))).unwrap();
+        let headers = headers_with(&[(USERNAME_HEADER, "  "), (PASSWORD_HEADER, "pw")]);
+        let got = resolved_credentials(Some(&headers), Some(&creds("owner@x.test"))).unwrap();
         assert_eq!(got.username, "owner@x.test");
     }
 
     #[test]
     fn calendar_header_overrides_the_configured_one() {
-        let parts = parts_with(&[(CALENDAR_HEADER, "Work")]);
-        let got = resolve(Some(&parts), Some(&creds("me@x.test")), Some("Personal")).unwrap();
+        let headers = headers_with(&[(CALENDAR_HEADER, "Work")]);
+        let got = resolve(Some(&headers), Some(&creds("me@x.test")), Some("Personal")).unwrap();
         assert_eq!(got.calendar.as_deref(), Some("Work"));
     }
 
     #[test]
     fn header_credentials_never_inherit_the_configured_calendar() {
         // Another account's request must not land events in this one's calendar.
-        let parts = parts_with(&[(USERNAME_HEADER, "other@x.test"), (PASSWORD_HEADER, "pw")]);
-        let got = resolve(Some(&parts), Some(&creds("owner@x.test")), Some("Owner")).unwrap();
+        let headers = headers_with(&[(USERNAME_HEADER, "other@x.test"), (PASSWORD_HEADER, "pw")]);
+        let got = resolve(Some(&headers), Some(&creds("owner@x.test")), Some("Owner")).unwrap();
         assert_eq!(got.credentials.username, "other@x.test");
         assert_eq!(got.calendar, None);
     }
@@ -463,19 +640,49 @@ mod tests {
     #[test]
     fn no_calendar_anywhere_defers_to_the_server() {
         let default = creds("me@x.test");
-        let plain = resolve(Some(&parts_with(&[])), Some(&default), None).unwrap();
+        let plain = resolve(Some(&headers_with(&[])), Some(&default), None).unwrap();
         assert_eq!(plain.calendar, None);
         assert_eq!(resolve(None, Some(&default), None).unwrap().calendar, None);
         // A blank header is not a choice — it must not shadow the config.
-        let parts = parts_with(&[(CALENDAR_HEADER, "   ")]);
-        let got = resolve(Some(&parts), Some(&default), Some("Personal")).unwrap();
+        let headers = headers_with(&[(CALENDAR_HEADER, "   ")]);
+        let got = resolve(Some(&headers), Some(&default), Some("Personal")).unwrap();
         assert_eq!(got.calendar.as_deref(), Some("Personal"));
+    }
+
+    #[test]
+    fn introspection_needs_no_credentials() {
+        // What GraphiQL sends on load, plus the shapes around it.
+        assert!(is_introspection_only("{ __schema { queryType { name } } }"));
+        assert!(is_introspection_only(
+            "query IntrospectionQuery { __schema { types { name } } }"
+        ));
+        assert!(is_introspection_only(
+            "{ __type(name: \"Event\") { name } }"
+        ));
+        assert!(is_introspection_only("{ __typename }"));
+    }
+
+    #[test]
+    fn real_fields_still_need_credentials() {
+        assert!(!is_introspection_only("{ calendars { nodes { name } } }"));
+        // Mixed with introspection, and nested below it, still count as real.
+        assert!(!is_introspection_only(
+            "{ __typename calendars { nodes { name } } }"
+        ));
+        assert!(!is_introspection_only(
+            "mutation { deleteEvent(action: PREVIEW, uid: \"x\") { preview } }"
+        ));
+        // Fragments could hide anything, and unparseable input proves nothing.
+        assert!(!is_introspection_only(
+            "{ ...F } fragment F on Query { __typename }"
+        ));
+        assert!(!is_introspection_only("{ this is not graphql"));
     }
 
     #[test]
     fn none_when_neither_headers_nor_default() {
         // hosted mode with no upstream-injected credentials — must refuse.
-        assert_eq!(resolved_credentials(Some(&parts_with(&[])), None), None);
+        assert_eq!(resolved_credentials(Some(&headers_with(&[])), None), None);
         assert_eq!(resolved_credentials(None, None), None);
     }
 }

@@ -11,8 +11,9 @@ composable GraphQL interface instead of a tool per operation.
 ```bash
 caldav-cli agenda --days 1 --tz Europe/London
 caldav-cli create --summary "Coffee" --start "tomorrow 15:00" --duration 30 --tz Europe/London
-caldav-cli mcp                       # stdio MCP server for Claude
-caldav-cli mcp --http 0.0.0.0:8080   # hosted mode, credentials per request
+caldav-cli mcp                             # stdio MCP server for Claude
+caldav-cli mcp --http --graphiql --browser # GraphiQL in your browser
+caldav-cli mcp --http 0.0.0.0:8080         # hosted mode, credentials per request
 ```
 
 ## Why this exists
@@ -92,7 +93,7 @@ caldav-cli update EVENT_UID [OPTIONS]
 caldav-cli delete EVENT_UID -y
 
 caldav-cli completions bash|zsh|fish
-caldav-cli mcp [--http ADDR]
+caldav-cli mcp [--http [ADDR]] [--graphql] [--graphiql] [--browser]
 ```
 
 Event options shared by `create` and `update`:
@@ -292,26 +293,68 @@ request at all.
       occurrences(days: 90) { totalCount nodes { start { dateTime } } } } } }
 ```
 
-### Hosted mode
+### HTTP surfaces
 
-`caldav-cli mcp --http ADDR` serves streamable HTTP at `/mcp` with **no**
-credentials baked in. Each request must carry them, injected by a trusted
-upstream after authenticating the user:
+Three independent surfaces, each opt-in, sharing one port (default
+`127.0.0.1:8080`, or pass an address to `--http`):
 
-| Header               | Required | Meaning                              |
-| -------------------- | -------- | ------------------------------------ |
-| `X-CalDAV-Username`  | yes      | Account username                     |
-| `X-CalDAV-Password`  | yes      | App-specific password                |
-| `X-CalDAV-Url`       | no       | Server base URL; defaults to iCloud  |
-| `X-CalDAV-Calendar`  | no       | Calendar for new events; defaults to the account's own |
+| Flag         | Serves                                       |
+| ------------ | -------------------------------------------- |
+| `--http`     | MCP streamable-HTTP at `/mcp`                |
+| `--graphql`  | plain GraphQL-over-HTTP at `/graphql`        |
+| `--graphiql` | the GraphiQL IDE at `/`, and its `/graphql`  |
+| `--browser`  | opens the IDE once the port is bound         |
 
-Username and password must both arrive as headers to be used — a partial
-header set never mixes with configured credentials, which would otherwise
-authenticate as the wrong account.
+```bash
+caldav-cli mcp                                   # stdio MCP, no listener
+caldav-cli mcp --graphiql --browser              # just the IDE, opened for you
+caldav-cli mcp --http                            # just /mcp
+caldav-cli mcp --http 0.0.0.0:8080 --graphql     # both, explicit address
+```
 
-This is the transport `jaritanet-mcp-gateway` puts behind OAuth. Because
-CalDAV needs three values rather than one bearer token, the gateway stores a
-credential *set* for this MCP.
+Asking for any surface binds the listener; there is nowhere to mount an HTTP
+route over stdio. Only `--http` puts MCP on it — the transport a model connects
+through and a browsable endpoint for you are separate things. `--browser`
+requires `--graphiql`, since it opens the IDE.
+
+`/graphql` is plain GraphQL-over-HTTP, which is what a browser speaks; `/mcp` is
+MCP JSON-RPC, which it doesn't. That is why GraphiQL needs its own route rather
+than pointing at the MCP one. Both share the schema, the client cache and the
+credential resolution below, so the IDE sees exactly what a model sees.
+
+**Introspection needs no credentials**: it is answered from the schema without
+touching CalDAV, so GraphiQL's docs, autocomplete and explorer work before you
+have a working app password. Queries selecting any real field authenticate as
+normal, on first use rather than at startup — a wrong password shows up in the
+response pane instead of stopping the server booting.
+
+#### Credentials
+
+A request's own headers win; the configured credentials are the fallback:
+
+| Header              | Required | Meaning                                                |
+| ------------------- | -------- | ------------------------------------------------------ |
+| `X-CalDAV-Username` | yes      | Account username                                       |
+| `X-CalDAV-Password` | yes      | App-specific password                                  |
+| `X-CalDAV-Url`      | no       | Server base URL; defaults to iCloud                    |
+| `X-CalDAV-Calendar` | no       | Calendar for new events; defaults to the account's own  |
+
+Username and password must both arrive as headers to be used — a partial header
+set never mixes with configured credentials, which would otherwise authenticate
+as the wrong account. Header credentials never inherit the configured calendar
+either, so one account's request can't land an event in another's.
+
+Running it yourself, the fallback means your own account with no ceremony. In a
+hosted deployment there is no local config, so the fallback is absent and every
+request must carry the headers, injected by a trusted upstream after it has
+authenticated the caller. That is the transport `jaritanet-mcp-gateway` puts
+behind OAuth; because CalDAV needs three values rather than one bearer token,
+the gateway stores a credential *set* for this MCP.
+
+Do **not** expose this to the internet without such an auth layer in front —
+the headers are trusted unconditionally. Equally, do not run it with local
+credentials present on a non-loopback address: anything that can reach the port
+gets your calendar without needing a header at all.
 
 ## Coverage
 

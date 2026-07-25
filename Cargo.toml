@@ -1,6 +1,6 @@
 [package]
 name = "caldav-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "CLI and MCP server for CalDAV calendars (iCloud by default)"
 repository = "https://github.com/radiosilence/caldav-cli"
@@ -27,7 +27,9 @@ rmcp = { version = "1", features = [
   "transport-streamable-http-server"
 ] }
 axum = "0.8"
+askama = "0.16"
 http = "1"
+open = "5"
 schemars = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

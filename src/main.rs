@@ -260,11 +260,29 @@ enum Commands {
 
     /// Run as MCP (Model Context Protocol) server for Claude integration
     Mcp {
-        /// Serve over streamable HTTP on this address (e.g. 127.0.0.1:8080)
-        /// instead of stdio. In HTTP mode the credentials are read from the
-        /// `X-CalDAV-*` headers per request; over stdio they come from config.
-        #[arg(long, value_name = "ADDR")]
+        /// Serve MCP over streamable HTTP at /mcp instead of stdio, on this
+        /// address (default 127.0.0.1:8080). The `X-CalDAV-*` headers override
+        /// the configured credentials per request, which is how a hosted
+        /// deployment serves many users.
+        #[arg(
+            long,
+            value_name = "ADDR",
+            num_args = 0..=1,
+            default_missing_value = mcp::DEFAULT_HTTP_ADDR,
+        )]
         http: Option<String>,
+
+        /// Serve plain GraphQL-over-HTTP at /graphql
+        #[arg(long)]
+        graphql: bool,
+
+        /// Serve the GraphiQL IDE at /, and the /graphql it talks to
+        #[arg(long)]
+        graphiql: bool,
+
+        /// Open the GraphiQL IDE in your browser once listening
+        #[arg(long, requires = "graphiql")]
+        browser: bool,
     },
 }
 
@@ -356,10 +374,32 @@ async fn main() {
             return;
         }
 
-        Commands::Mcp { http } => match http {
-            Some(addr) => mcp::run_http_server(&addr).await,
-            None => mcp::run_server().await,
-        },
+        Commands::Mcp {
+            http,
+            graphql,
+            graphiql,
+            browser,
+        } => {
+            // `--http` is MCP's own transport; `--graphql`/`--graphiql` are
+            // separate surfaces that happen to need a listener too. Asking for
+            // any of them binds one — there is nowhere to mount an HTTP route
+            // over stdio — and only `--http` puts MCP on it.
+            let addr = http
+                .clone()
+                .or_else(|| (graphql || graphiql).then(|| mcp::DEFAULT_HTTP_ADDR.to_string()));
+            match addr {
+                Some(addr) => {
+                    let surfaces = mcp::HttpSurfaces {
+                        mcp: http.is_some(),
+                        graphql,
+                        graphiql,
+                        browser,
+                    };
+                    mcp::run_http_server(&addr, surfaces).await
+                }
+                None => mcp::run_server().await,
+            }
+        }
     };
 
     if let Err(e) = result {
