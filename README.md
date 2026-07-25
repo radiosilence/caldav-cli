@@ -27,11 +27,17 @@ per request and never sees the secret.
 ## Install
 
 ```bash
-cargo install --git https://github.com/radiosilence/caldav-cli
+mise use -g "github:radiosilence/caldav-cli"
 ```
 
-The installed binary is `caldav`. Or grab one from
-[releases](https://github.com/radiosilence/caldav-cli/releases).
+Tracks the [release](https://github.com/radiosilence/caldav-cli/releases)
+tarballs, which hold a single binary named `caldav` — no `[exe=…]` needed.
+
+From source instead:
+
+```bash
+cargo install --git https://github.com/radiosilence/caldav-cli
+```
 
 ## Setup
 
