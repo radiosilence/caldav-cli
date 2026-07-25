@@ -127,7 +127,7 @@ written with a `TZID`, so it moves correctly across DST.
 
 Two tools, following `fastmail-cli`'s design:
 
-- `calendar_schema` — the GraphQL SDL and the rules for using it
+- `calendar_schema` — the GraphQL SDL
 - `calendar` — execute a query or mutation
 
 The schema is ~5k tokens, so it stays behind a tool call rather than in the

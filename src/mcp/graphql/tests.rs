@@ -749,63 +749,32 @@ async fn an_expensive_query_is_allowed_to_run() {
     .await;
 }
 
-/// The examples in the MCP `calendar_schema` response must actually run.
-///
-/// They are the first thing a model copies, and a stale one costs it a failed
-/// round trip — so they are validated against the real schema rather than
-/// maintained by hand and hoped over.
+/// `calendar_schema` returns the SDL and nothing else — the hand-written
+/// prelude was deleted because the schema already said it. That only holds if
+/// the schema really does, so the load-bearing guidance is asserted here rather
+/// than assumed: a model reading the SDL must be able to work out how to page,
+/// what a cursor is, and that filters nest.
 #[tokio::test]
-async fn the_documented_examples_all_execute() {
-    let h = Harness::start().await;
-    let usage = crate::mcp::USAGE;
-    let examples = usage
-        .split("```graphql")
-        .nth(1)
-        .expect("USAGE has a graphql example block");
-    let examples = examples.split("```").next().unwrap();
-
-    // Split on blank lines between top-level documents.
-    let mut current = String::new();
-    let mut docs: Vec<String> = Vec::new();
-    for line in examples.lines() {
-        if line.trim().is_empty() {
-            if !current.trim().is_empty() {
-                docs.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        if line.trim_start().starts_with('#') && current.trim().is_empty() {
-            continue;
-        }
-        current.push_str(line);
-        current.push('\n');
-    }
-    if !current.trim().is_empty() {
-        docs.push(current);
-    }
-
-    assert!(
-        docs.len() >= 8,
-        "expected the full example set, got {docs:?}"
-    );
-    for doc in docs {
-        // Mutations would write; validating them is enough to catch a rename.
-        let response = h.schema.execute(request(&doc, h.client(), None)).await;
-        let bad: Vec<_> = response
-            .errors
-            .iter()
-            .filter(|e| {
-                let m = e.message.to_lowercase();
-                m.contains("unknown")
-                    || m.contains("not found on type")
-                    || m.contains("expected")
-                    || m.contains("parse")
-                    || m.contains("invalid")
-            })
-            .collect();
+async fn the_sdl_carries_the_guidance_that_replaced_the_prelude() {
+    let sdl = build_schema().sdl();
+    for needle in [
+        // Time grammar, which the prelude used to spell out.
+        "'today', 'tomorrow'",
+        // How to reach a series' master in order to edit it.
+        "master event",
+        // Paging: what a cursor is and that totalCount is cheap.
+        "Cursors are event ids",
+        "free and exact",
+        // Filter composition.
+        "AND-ed",
+        "nest arbitrarily",
+        // PREVIEW-first on the destructive mutations.
+        "PREVIEW",
+    ] {
         assert!(
-            bad.is_empty(),
-            "example failed to validate:\n{doc}\n{bad:?}"
+            sdl.contains(needle),
+            "the SDL no longer states {needle:?} — it was the prelude's job and \
+             the prelude is gone"
         );
     }
 }
