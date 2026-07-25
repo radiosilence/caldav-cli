@@ -520,6 +520,94 @@ async fn deleting_an_unknown_uid_is_an_error_not_a_silent_success() {
 }
 
 #[tokio::test]
+async fn a_uid_lookup_asks_for_the_uid_named_resource_first() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("REPORT"))
+        .and(body_string_contains("calendar-multiget"))
+        .and(body_string_contains("/1234/calendars/home/evt-1.ics"))
+        .respond_with(ok(&events_xml(STANDUP_ICS)))
+        .mount(&server)
+        .await;
+    // Anything beyond the one request is a regression: the guess was right.
+    Mock::given(method("REPORT"))
+        .and(body_string_contains("calendar-query"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let event = client(&server)
+        .get_event("evt-1", Some("Home"))
+        .await
+        .unwrap()
+        .expect("found");
+    assert_eq!(event.summary.as_deref(), Some("Standup"));
+}
+
+/// iCloud answers a `prop-filter` on UID with 412, so an event whose filename
+/// doesn't match its UID is only reachable by reading the collection.
+#[tokio::test]
+async fn a_rejected_uid_filter_falls_back_to_scanning_the_calendar() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    let stored = r#"<?xml version="1.0" encoding="UTF-8"?>
+<multistatus xmlns="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <response><href>/1234/calendars/home/1A2B3C.ics</href><propstat><prop>
+    <getetag>"etag-1"</getetag>
+    <c:calendar-data>BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:not-the-filename
+SUMMARY:Renamed resource
+DTSTART:20260724T090000Z
+END:VEVENT
+END:VCALENDAR</c:calendar-data>
+  </prop><status>HTTP/1.1 200 OK</status></propstat></response>
+</multistatus>"#;
+    Mock::given(method("REPORT"))
+        .and(body_string_contains("calendar-multiget"))
+        .respond_with(ok(EMPTY_MULTISTATUS))
+        .mount(&server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(body_string_contains("prop-filter"))
+        .respond_with(ResponseTemplate::new(412))
+        .mount(&server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(body_string_contains(r#"<c:comp-filter name="VEVENT"/>"#))
+        .respond_with(ok(stored))
+        .mount(&server)
+        .await;
+
+    let event = client(&server)
+        .get_event("not-the-filename", Some("Home"))
+        .await
+        .unwrap()
+        .expect("found by scan");
+    assert_eq!(event.summary.as_deref(), Some("Renamed resource"));
+    assert_eq!(event.href, "/1234/calendars/home/1A2B3C.ics");
+}
+
+/// A lookup that broke used to surface as "event not found", so every write
+/// blamed a missing event for what was really a failed read.
+#[tokio::test]
+async fn a_failed_lookup_is_an_error_not_a_missing_event() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .get_event("evt-1", Some("Home"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("503"), "got: {err}");
+}
+
+#[tokio::test]
 async fn get_event_matches_the_uid_exactly() {
     let server = MockServer::start().await;
     mount_discovery(&server).await;
