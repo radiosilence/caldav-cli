@@ -1,8 +1,10 @@
 //! MCP (Model Context Protocol) server for CalDAV.
 //!
-//! Exposes calendar functionality via two GraphQL tools:
-//! - `schema_sdl` — returns the full GraphQL SDL for introspection
-//! - `graphql` — executes a GraphQL query/mutation
+//! Exposes calendar functionality via a single tool, `calendar`, which executes
+//! a GraphQL query or mutation. The SDL rides along in the tool description
+//! rather than behind a separate introspection tool: ~2k tokens up front, but
+//! the model can act on the first turn instead of spending a round trip
+//! discovering the schema.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,7 +12,10 @@ use std::sync::Arc;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolResult, Content, Implementation, ListToolsResult, PaginatedRequestParams,
+        ProtocolVersion, ServerCapabilities, ServerInfo,
+    },
     schemars,
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -133,7 +138,6 @@ pub struct CalDavMcp {
     /// Configured calendar for new events (stdio). Hosted requests carry their
     /// own in [`CALENDAR_HEADER`].
     default_calendar: Option<String>,
-    #[allow(dead_code)] // referenced by #[tool_handler] macro expansion
     tool_router: ToolRouter<Self>,
 }
 
@@ -212,26 +216,11 @@ impl CalDavMcp {
 #[tool_router]
 impl CalDavMcp {
     #[tool(
-        description = "Returns the full GraphQL SDL (Schema Definition Language) for the CalDAV API. Call this first to discover available queries, mutations, types, and their arguments. The schema covers calendars, events, agenda, search, free/busy, and event creation, updates, and deletion."
+        name = "calendar",
+        title = "Calendar",
+        description = "Read and write the user's calendars by executing a GraphQL query or mutation against the schema below. Covers listing calendars, reading the agenda, searching events, checking free/busy, and creating, updating, or deleting events (with the preview/confirm pattern). Pass variables as a JSON string."
     )]
-    async fn schema_sdl(&self, ctx: RequestContext<RoleServer>) -> ToolResult {
-        // The chosen calendar is per-request, so it can't live in the static
-        // server instructions. Prepending it here is the earliest the model
-        // sees it — it is told to call this tool first.
-        match self.resolve(&ctx).and_then(|r| r.calendar) {
-            Some(calendar) => Self::text_result(format!(
-                "# New events go to the user's chosen calendar, {calendar:?}, unless \
-                 createEvent is given a `calendar` argument.\n\n{}",
-                self.schema.sdl()
-            )),
-            None => Self::text_result(self.schema.sdl()),
-        }
-    }
-
-    #[tool(
-        description = "Execute a GraphQL query or mutation against the CalDAV API. Use `schema_sdl` first to discover the schema. Supports listing calendars, reading the agenda, searching events, checking free/busy, and creating, updating, or deleting events (with the preview/confirm pattern). Pass variables as a JSON string."
-    )]
-    async fn graphql(
+    async fn calendar(
         &self,
         ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<GraphqlRequest>,
@@ -274,19 +263,55 @@ impl CalDavMcp {
 
 #[tool_handler]
 impl ServerHandler for CalDavMcp {
+    /// Finishes the tool description at list time with the two things that
+    /// can't be a static string: the SDL, which is built from the schema, and
+    /// the caller's chosen calendar, which is per-request.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let calendar = match self.resolve(&context).and_then(|r| r.calendar) {
+            Some(name) => format!(
+                "New events go to the user's chosen calendar, {name:?}, unless `createEvent` \
+                 is given a `calendar` argument.\n\n"
+            ),
+            None => String::new(),
+        };
+
+        let mut tools = self.tool_router.list_all();
+        for tool in &mut tools {
+            let base = tool.description.take().unwrap_or_default();
+            tool.description = Some(
+                format!(
+                    "{base}\n\n{calendar}# Schema\n\n```graphql\n{}\n```",
+                    self.schema.sdl()
+                )
+                .into(),
+            );
+        }
+
+        Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
     fn get_info(&self) -> ServerInfo {
         let server_info = Implementation::new("caldav-cli", env!("CARGO_PKG_VERSION"))
             .with_title("CalDAV MCP Server")
             .with_website_url("https://github.com/radiosilence/caldav-cli");
 
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(rmcp::model::ProtocolVersion::V_2024_11_05)
+            // Only the fallback for a client asking for a version the SDK
+            // doesn't know; anything known is echoed back during negotiation.
+            .with_protocol_version(ProtocolVersion::LATEST)
             .with_server_info(server_info)
             .with_instructions(
                 "CalDAV MCP Server — GraphQL interface for calendar operations.\n\n\
-                ## Getting Started\n\
-                1. Call `schema_sdl` to get the full GraphQL schema\n\
-                2. Use `graphql` to execute queries and mutations\n\n\
+                The `calendar` tool executes queries and mutations; its description carries \
+                the full schema.\n\n\
                 ## Common Queries\n\
                 ```graphql\n\
                 # List calendars\n\

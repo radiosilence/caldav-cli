@@ -156,7 +156,8 @@ caldav-cli mcp                        # stdio, credentials from config
 caldav-cli mcp --http 0.0.0.0:8080    # hosted, credentials per request
 ```
 
-Two tools: `schema_sdl` (get the GraphQL schema) and `graphql` (run a query).
+One tool: `calendar` (run a query or mutation). Its description carries the
+full GraphQL SDL, so there is nothing to introspect first.
 
 In HTTP mode credentials come from `X-CalDAV-Username`, `X-CalDAV-Password`,
 and optionally `X-CalDAV-Url` — injected by a trusted upstream, never by the

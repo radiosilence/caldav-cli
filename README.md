@@ -125,10 +125,9 @@ written with a `TZID`, so it moves correctly across DST.
 
 ## MCP server
 
-Two tools, following `fastmail-cli`'s design:
-
-- `schema_sdl` — the full GraphQL SDL, for discovering what's available
-- `graphql` — execute a query or mutation
+One tool, `calendar`: execute a GraphQL query or mutation. The SDL ships inside
+the tool description rather than behind a separate introspection tool — ~2k
+tokens up front against a discovery round trip on every session.
 
 ```bash
 claude mcp add --scope user caldav -- caldav-cli mcp

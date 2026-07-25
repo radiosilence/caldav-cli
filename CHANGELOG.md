@@ -15,8 +15,9 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without saying so.
 - **An override**, for accounts whose own default isn't where automation should
   write: `X-CalDAV-Calendar` per request in hosted mode, or `calendar` in
-  `config.toml` / `CALDAV_CALENDAR`. The MCP server announces the choice in its
-  `schema_sdl` output, so a model knows where it is writing before it writes.
+  `config.toml` / `CALDAV_CALENDAR`. The MCP server announces the choice in the
+  `calendar` tool description, so a model knows where it is writing before it
+  writes.
 - **Discovery that doesn't assume a server's shape**, which iCloud rewards:
   it answers `schedule-default-calendar-URL` as bare element text rather than
   the `DAV:href` RFC 6638 specifies, and echoes the property name back empty in
@@ -25,6 +26,15 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that says nothing — the scheduling inbox, the one location the RFC requires.
 
 ### Changed
+
+- **One MCP tool, `calendar`, replacing `schema_sdl` and `graphql`.** The SDL
+  now rides in the tool description, which costs ~2k tokens per session but
+  removes the introspection round trip before every first query — and drops the
+  failure mode where a model skips it and guesses at the schema. Breaking for
+  anything naming the old tools; the queries themselves are unchanged.
+- **Protocol version follows the SDK** instead of pinning `2024-11-05`, so
+  clients get the newest version both ends know. Older clients are unaffected:
+  the server echoes back whatever version they ask for.
 
 - **Docker images tagged by version.** `ghcr.io/radiosilence/caldav-cli` now
   gets `vX.Y.Z`, `vX.Y`, `vX`, and `latest` tags alongside `main` and
