@@ -3,10 +3,37 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-07-25
 
 ### Added
 
+- **The GraphQL surface is a graph.** Every logical edge is traversable, every
+  collection is a Relay connection, and everything below a list is lazy and
+  batched. The motivation is call count: "what's on today, whose calendar is
+  it, and does anything clash" was `agenda` → `calendars` → an `events` call
+  per result, with the model composing each round trip. It is now one query
+  costing one `PROPFIND` and one REPORT per event-holding calendar.
+- **New edges.** `Event.calendar` resolves the collection itself rather than
+  just its name; `Event.series` walks from an expanded occurrence to the master
+  carrying the `RRULE`; `Event.occurrences` evaluates that rule with no request
+  at all; `Event.conflicts` finds what overlaps; `Calendar.events` reads one
+  collection; `Query.calendar(id:)` looks one up, or returns the default when
+  `id` is omitted.
+- **Filters compose.** `EventFilter` is a tree: scalars on one object AND
+  together, and `and`/`or`/`not` nest arbitrarily, so "confirmed, involving
+  Alice either way, but not all-day" is one filter rather than three queries.
+  Matching is client-side by necessity — CalDAV ANDs every sibling filter
+  (RFC 4791 §9.7), has no OR, and implements `text-match` inconsistently across
+  iCloud, Fastmail, Google and Nextcloud. The time range still goes on the
+  wire, since that is the one filter every server agrees on. `EventSort` orders
+  by start, end, summary, created or last-modified.
+- **`calendarsQueried`** on every event connection, reporting how many
+  collections a page cost. CalDAV has no cross-collection query, so an
+  account-wide read is one REPORT per calendar — said out loud rather than
+  hidden. Naming `calendar:` brings it to one.
+- **Field audit.** `Event` now exposes `href`, `etag`, `sequence`,
+  `durationMinutes`, `isRecurring` and `calendarName`; `Calendar` exposes
+  `url`. All were already on the wire and being discarded.
 - **A default calendar for new events.** `createEvent` / `caldav-cli create`
   with no calendar named now lands where the user's calendar app would put it,
   rather than in whichever writable collection sorted first alphabetically.
@@ -24,6 +51,10 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the `404` propstat of every collection that hasn't got it. The value is read
   in whichever shape arrives, from the calendar-home listing or — only when
   that says nothing — the scheduling inbox, the one location the RFC requires.
+- **Docker images tagged by version.** `ghcr.io/radiosilence/caldav-cli` now
+  gets `vX.Y.Z`, `vX.Y`, `vX`, and `latest` tags alongside `main` and
+  `sha-<short>`, cut only on the push that first introduces that version in
+  `Cargo.toml` so the tags never drift onto a later, unrelated commit.
 
 ### Changed
 
@@ -50,11 +81,75 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Protocol version follows the SDK** instead of pinning `2024-11-05`, so
   clients get the newest version both ends know. Older clients are unaffected:
   the server echoes back whatever version they ask for.
+- **Every read goes through a DataLoader.** No resolver touches the CalDAV
+  client directly. `calendar-multiget` is the one genuine batch CalDAV offers —
+  many hrefs, one REPORT — and `Event.series` uses it, so a page of occurrences
+  costs one request per calendar rather than one per occurrence. The rest have
+  no plural form, so those loaders do what is actually available: deduplicate
+  repeated keys and issue the batch's requests concurrently instead of one
+  after another. Loaders are per request, so their cache is request-scoped.
+- **Per-calendar reads run concurrently.** `events_in_range` walked its
+  calendars in a serial loop; an account-wide read now issues its REPORTs
+  together, at most six in flight. This is the CLI's win too, not just
+  GraphQL's.
+- **Collections are connections**, taking `first`/`last`/`after`/`before` and
+  carrying `totalCount`/`pageInfo`/`edges`/`nodes`. Cursors are event ids (an
+  occurrence adds its `RECURRENCE-ID`, since a series repeats its UID) rather
+  than offsets, so a cursor names a specific event and stays legible to a model
+  composing the next page. CalDAV has no windowed query, so paging is slicing:
+  `totalCount` is free and exact, and a cursor whose event has gone gives a
+  "restart pagination" error rather than a quietly different page.
+- **The new schema documents itself.** Everything a caller needs — how to page,
+  what a cursor is, that `totalCount` is free, that filters nest, what each
+  field costs — lives in the field descriptions, so `calendar_schema` stays the
+  single source of truth rather than growing a prelude beside it. A test asserts
+  the SDL really does carry that guidance, since nothing else now would.
+- **Query cost is guidance, not a cap.** Fields declare costs and the
+  descriptions surface them, but nothing is refused for being expensive — a
+  caller told "too complex" has to guess at a threshold it cannot see. Depth
+  stays capped at 15: the graph has cycles by design and nothing else bounds
+  them.
 
-- **Docker images tagged by version.** `ghcr.io/radiosilence/caldav-cli` now
-  gets `vX.Y.Z`, `vX.Y`, `vX`, and `latest` tags alongside `main` and
-  `sha-<short>`, cut only on the push that first introduces that version in
-  `Cargo.toml` so the tags never drift onto a later, unrelated commit.
+### Fixed
+
+- **All-day events landed a day early anywhere east of Greenwich.** An
+  iCalendar `DATE` has no timezone — it means the same day everywhere — but it
+  was being resolved through one anyway. `RRuleSet` anchors a date-only
+  `DTSTART` at midnight in the *machine's local zone*, so under BST a weekly
+  Monday bin collection came back as Sunday, and an occurrence on the window's
+  first day was dropped for sorting before it. The same applied to date-valued
+  `EXDATE`s, whose exclusions then missed the day they named, and to
+  non-recurring all-day events on any calendar publishing `X-WR-TIMEZONE`.
+  Dates are now anchored at UTC midnight everywhere, so the date survives the
+  round trip. Timed series still expand in their own zone, so 09:00 stays 09:00
+  across a DST boundary.
+- **The calendar listing was cached for the life of the process.** Clients are
+  pooled per credential, so a long-running MCP server never saw a calendar
+  created, renamed, or deleted after start-up — for writes as well as reads.
+  The client no longer memoises it; deduplication belongs to the caller's
+  scope, which for GraphQL is the per-request loader and for the CLI is a
+  process that lives one command. Principal and calendar-home discovery are
+  still cached, because those don't change.
+
+### Removed
+
+- `MAX_EVENTS` no longer truncates GraphQL reads. It existed to stop a
+  decade-wide range flooding a model's context; pagination does that now, and a
+  silent truncation would have made `totalCount` lie. The CLI's `--limit` is
+  unchanged.
+
+### Breaking
+
+- Collections need `nodes { ... }` around their selection and default to 25
+  items (max 100), where the old flat lists defaulted to 100.
+- `Event.calendar` was the calendar's display name; it is now the `Calendar`
+  itself. The old value is `calendarName`.
+- `searchEvents` is deprecated in favour of `events(filter: { text: ... })`,
+  which narrows per field and composes with `and`/`or`/`not`. It still works,
+  mapping `query` onto one filter leaf, and now returns a connection.
+- `events`/`agenda`/`searchEvents` no longer take `limit`; use `first`.
+- `CalDavClient::list_calendars` returns `Vec<Calendar>` rather than
+  `&[Calendar]`, following the cache removal.
 
 ## [0.1.0] - 2026-07-24
 

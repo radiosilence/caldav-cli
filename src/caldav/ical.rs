@@ -235,11 +235,15 @@ pub fn parse_time(line: &ContentLine, default_tz: Tz) -> EventTime {
         .unwrap_or(default_tz);
 
     let instant = if is_date {
+        // A DATE is not an instant. RFC 5545 gives it no timezone and it means
+        // the same day everywhere, so resolving it through one moves the day
+        // itself: east of Greenwich, local midnight is the previous day in UTC,
+        // and the event renders a day early. Anchor at UTC midnight so the date
+        // survives the round trip.
         NaiveDate::parse_from_str(&raw, "%Y%m%d")
             .ok()
             .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .and_then(|naive| tz.from_local_datetime(&naive).earliest())
-            .map(|dt| dt.with_timezone(&Utc))
+            .map(|naive| Utc.from_utc_datetime(&naive))
     } else if let Some(stripped) = raw.strip_suffix('Z') {
         NaiveDateTime::parse_from_str(stripped, "%Y%m%dT%H%M%S")
             .ok()

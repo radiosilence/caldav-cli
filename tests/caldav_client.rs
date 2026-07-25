@@ -641,8 +641,15 @@ async fn free_busy_prefers_the_servers_own_report() {
     assert_eq!(periods[0].start, "2026-07-24T11:00:00Z");
 }
 
+/// The principal walk is cached for the client's life; the calendar listing is
+/// deliberately not.
+///
+/// Caching the listing meant a pooled client — which is what the MCP server
+/// holds — never saw a calendar created, renamed, or deleted after start-up.
+/// Deduplicating it belongs to the caller's scope (a per-request loader in
+/// GraphQL, a one-command process in the CLI), not to the connection.
 #[tokio::test]
-async fn discovery_runs_once_per_client() {
+async fn discovery_is_cached_but_the_calendar_listing_is_refetched() {
     let server = MockServer::start().await;
     mount_discovery(&server).await;
     Mock::given(method("REPORT"))
@@ -656,16 +663,29 @@ async fn discovery_runs_once_per_client() {
         c.events_in_range(None, start, end, true, 10).await.unwrap();
     }
 
-    let propfinds = server
+    let propfinds: Vec<String> = server
         .received_requests()
         .await
         .unwrap()
         .into_iter()
         .filter(|r: &Request| r.method.as_str() == "PROPFIND")
+        .map(|r| r.url.path().to_string())
+        .collect();
+
+    // The well-known probe, the root, and the principal — once for the loop,
+    // not once per call.
+    let walk = propfinds
+        .iter()
+        .filter(|p| p.as_str() != "/1234/calendars/")
         .count();
-    // Four PROPFINDs total for the whole loop — the well-known probe, the
-    // root, the principal, and the calendar home — not four per call.
-    assert_eq!(propfinds, 4);
+    assert_eq!(walk, 3, "{propfinds:?}");
+
+    // The listing, once per call, so each one sees current calendars.
+    let listings = propfinds
+        .iter()
+        .filter(|p| p.as_str() == "/1234/calendars/")
+        .count();
+    assert_eq!(listings, 3, "{propfinds:?}");
 }
 
 /// iCloud shards accounts onto partition hosts: you authenticate against

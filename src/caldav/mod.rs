@@ -44,14 +44,33 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
 /// on a busy calendar can't blow up a model's context window.
 pub const MAX_EVENTS: usize = 500;
 
+/// How many CalDAV requests may be in flight at once.
+///
+/// Time-range queries are per-collection — CalDAV offers no plural form — so
+/// spanning an account costs one REPORT per calendar however you slice it.
+/// Issuing them concurrently turns N round trips into roughly one; the cap stops
+/// a 30-calendar account from opening 30 connections at a server that would
+/// rather it didn't.
+pub const MAX_CONCURRENT_REQUESTS: usize = 6;
+
+/// Run `tasks` concurrently, at most [`MAX_CONCURRENT_REQUESTS`] at a time,
+/// returning their outputs in the order the tasks were given.
+pub(crate) async fn fan_out<F: std::future::Future>(tasks: Vec<F>) -> Vec<F::Output> {
+    use futures_util::stream::{self, StreamExt};
+    stream::iter(tasks)
+        .buffered(MAX_CONCURRENT_REQUESTS)
+        .collect()
+        .await
+}
+
 pub struct CalDavClient {
     client: Client,
     base: String,
     username: String,
     password: String,
-    /// Discovery is three round trips; cache the result for the client's life.
+    /// Discovery is three round trips; the principal and home don't change, so
+    /// cache them for the client's life.
     home: OnceCell<String>,
-    calendars: OnceCell<Vec<Calendar>>,
 }
 
 impl CalDavClient {
@@ -70,7 +89,6 @@ impl CalDavClient {
             username,
             password,
             home: OnceCell::new(),
-            calendars: OnceCell::new(),
         }
     }
 
@@ -195,12 +213,20 @@ impl CalDavClient {
             .map(String::as_str)
     }
 
-    /// All calendar collections that can hold events, discovered once per client.
+    /// All calendar collections that can hold events.
+    ///
+    /// Deliberately **not** memoised on the client. It used to be, and that was
+    /// a bug: clients are pooled per credential for the life of the process, so
+    /// a long-running MCP server never saw a calendar created, renamed, or
+    /// deleted after start-up — for writes as well as reads. Deduplication
+    /// belongs to the caller's scope, not the connection's: the GraphQL layer
+    /// gets it from a per-request loader, and a CLI process is one command long.
+    ///
+    /// Discovery of the principal and calendar home *is* still cached — those
+    /// don't change.
     #[instrument(skip(self))]
-    pub async fn list_calendars(&self) -> Result<&[Calendar]> {
-        self.calendars
-            .get_or_try_init(|| async {
-                const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+    pub async fn list_calendars(&self) -> Result<Vec<Calendar>> {
+        const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:ic="http://apple.com/ns/ical/">
   <d:prop>
     <d:displayname/>
@@ -213,28 +239,31 @@ impl CalDavClient {
   </d:prop>
 </d:propfind>"#;
 
-                let home = self.calendar_home().await?;
-                let xml = self
-                    .dav("PROPFIND", home, Some("1"), "application/xml", Some(BODY.into()))
-                    .await?;
-                let mut calendars = parse_calendars(&xml, home);
-                calendars.sort_by_key(|c| c.name.to_lowercase());
+        let home = self.calendar_home().await?;
+        let xml = self
+            .dav(
+                "PROPFIND",
+                home,
+                Some("1"),
+                "application/xml",
+                Some(BODY.into()),
+            )
+            .await?;
+        let mut calendars = parse_calendars(&xml, home);
+        calendars.sort_by_key(|c| c.name.to_lowercase());
 
-                // Servers disagree on where they'll answer this. Most volunteer
-                // it in the listing above; RFC 6638 only requires it on the
-                // scheduling inbox. Ask there when the free answer is missing —
-                // one extra round trip, once per client, and only when needed.
-                let default = match parse_default_href(&xml) {
-                    Some(href) => Some(href),
-                    None => self.default_calendar_from_inbox(&xml, home).await,
-                };
-                if let Some(href) = default {
-                    mark_default(&mut calendars, &href);
-                }
-                Ok(calendars)
-            })
-            .await
-            .map(Vec::as_slice)
+        // Servers disagree on where they'll answer this. Most volunteer it in
+        // the listing above; RFC 6638 only requires it on the scheduling inbox.
+        // Ask there when the free answer is missing — one extra round trip, and
+        // only when needed.
+        let default = match parse_default_href(&xml) {
+            Some(href) => Some(href),
+            None => self.default_calendar_from_inbox(&xml, home).await,
+        };
+        if let Some(href) = default {
+            mark_default(&mut calendars, &href);
+        }
+        Ok(calendars)
     }
 
     /// Ask the scheduling inbox for the default calendar, the one place RFC
@@ -265,21 +294,7 @@ impl CalDavClient {
     /// account's own default wins, then the first writable one — "just put it
     /// where my calendar app would".
     pub async fn find_calendar(&self, name: Option<&str>) -> Result<Calendar> {
-        let calendars = self.list_calendars().await?;
-        match name.map(str::trim).filter(|s| !s.is_empty()) {
-            None => pick_default(calendars)
-                .cloned()
-                .ok_or_else(|| Error::CalendarNotFound("no calendars on this account".into())),
-            Some(name) => calendars
-                .iter()
-                .find(|c| {
-                    c.id.eq_ignore_ascii_case(name)
-                        || c.name.eq_ignore_ascii_case(name)
-                        || c.href == util::href_path(name)
-                })
-                .cloned()
-                .ok_or_else(|| Error::CalendarNotFound(name.to_string())),
-        }
+        resolve_calendar(&self.list_calendars().await?, name)
     }
 
     // ---- Reading events ----
@@ -371,6 +386,57 @@ impl CalDavClient {
         )
     }
 
+    /// Fetch specific `.ics` resources from one calendar in a single request.
+    ///
+    /// `calendar-multiget` (RFC 4791 §7.9) is the one place CalDAV lets us batch:
+    /// any number of hrefs, one REPORT. Everything else — the calendar listing, a
+    /// time-range query — is per-collection with no plural form.
+    #[instrument(skip(self, hrefs))]
+    pub async fn multiget_events(
+        &self,
+        calendar: &Calendar,
+        hrefs: &[String],
+    ) -> Result<Vec<Event>> {
+        if hrefs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let refs: String = hrefs
+            .iter()
+            .map(|h| format!("  <d:href>{}</d:href>\n", xml_escape(h)))
+            .collect();
+        let body = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+{refs}</c:calendar-multiget>"#
+        );
+        let xml = self
+            .dav(
+                "REPORT",
+                &calendar.url,
+                Some("1"),
+                "application/xml",
+                Some(body),
+            )
+            .await?;
+        Ok(parse_event_responses(&xml, calendar))
+    }
+
+    /// The calendars a read should span: the one named, or every collection that
+    /// holds events.
+    pub async fn read_targets(&self, calendar: Option<&str>) -> Result<Vec<Calendar>> {
+        Ok(match calendar {
+            Some(name) => vec![self.find_calendar(Some(name)).await?],
+            None => self
+                .list_calendars()
+                .await?
+                .iter()
+                .filter(|c| c.supports_events)
+                .cloned()
+                .collect(),
+        })
+    }
+
     /// Events across every calendar (or just `calendar`, when named).
     pub async fn events_in_range(
         &self,
@@ -380,34 +446,40 @@ impl CalDavClient {
         expand: bool,
         limit: usize,
     ) -> Result<Vec<Event>> {
-        let targets: Vec<Calendar> = match calendar {
-            Some(name) => vec![self.find_calendar(Some(name)).await?],
-            None => self
-                .list_calendars()
-                .await?
-                .iter()
-                .filter(|c| c.supports_events)
-                .cloned()
-                .collect(),
-        };
+        let targets = self.read_targets(calendar).await?;
+        let calls: Vec<_> = targets
+            .iter()
+            .map(|cal| self.list_events(cal, start, end, expand))
+            .collect();
+        let results = fan_out(calls).await;
 
-        let mut all = Vec::new();
-        for cal in &targets {
-            match self.list_events(cal, start, end, expand).await {
-                Ok(events) => all.extend(events),
-                // One unreadable calendar (shared, or a server hiccup) should
-                // not sink the whole agenda.
-                Err(e) => tracing::warn!(calendar = %cal.name, error = %e, "skipping calendar"),
-            }
-        }
+        let mut all: Vec<Event> = results
+            .into_iter()
+            .zip(&targets)
+            // One unreadable calendar (shared, or a server hiccup) should not
+            // sink the whole agenda.
+            .filter_map(|(events, cal)| {
+                events
+                    .inspect_err(
+                        |e| tracing::warn!(calendar = %cal.name, error = %e, "skipping calendar"),
+                    )
+                    .ok()
+            })
+            .flatten()
+            .collect();
+
         all.sort_by_key(|e| e.start.sort_key());
         all.truncate(limit.min(MAX_EVENTS));
         Ok(all)
     }
 
-    /// Find one event by UID. Searches every calendar unless one is named.
+    /// Look one UID up in one calendar.
+    ///
+    /// CalDAV filters have no OR (RFC 4791 §9.7 ANDs every sibling), so a UID
+    /// lookup is one REPORT per calendar per UID — there is no plural form to
+    /// batch into. Callers spanning an account fan these out instead.
     #[instrument(skip(self))]
-    pub async fn get_event(&self, uid: &str, calendar: Option<&str>) -> Result<Option<Event>> {
+    pub async fn event_in_calendar(&self, uid: &str, calendar: &Calendar) -> Result<Option<Event>> {
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
@@ -425,39 +497,36 @@ impl CalDavClient {
             xml_escape(uid)
         );
 
-        let targets: Vec<Calendar> = match calendar {
-            Some(name) => vec![self.find_calendar(Some(name)).await?],
-            None => self
-                .list_calendars()
-                .await?
-                .iter()
-                .filter(|c| c.supports_events)
-                .cloned()
-                .collect(),
-        };
+        let xml = self
+            .dav(
+                "REPORT",
+                &calendar.url,
+                Some("1"),
+                "application/xml",
+                Some(body),
+            )
+            .await?;
 
-        for cal in &targets {
-            let Ok(xml) = self
-                .dav(
-                    "REPORT",
-                    &cal.url,
-                    Some("1"),
-                    "application/xml",
-                    Some(body.clone()),
-                )
-                .await
-            else {
-                continue;
-            };
-            // A text-match is a substring match on some servers, so confirm the
-            // UID actually equals what was asked for. Prefer the master event
-            // (no RECURRENCE-ID) when a series has overrides.
-            let mut matches: Vec<Event> = parse_event_responses(&xml, cal)
-                .into_iter()
-                .filter(|e| e.id == uid)
-                .collect();
-            matches.sort_by_key(|e| e.recurrence_id.is_some());
-            if let Some(event) = matches.into_iter().next() {
+        // A text-match is a substring match on some servers, so confirm the UID
+        // actually equals what was asked for. Prefer the master event (no
+        // RECURRENCE-ID) when a series has overrides.
+        let mut matches: Vec<Event> = parse_event_responses(&xml, calendar)
+            .into_iter()
+            .filter(|e| e.id == uid)
+            .collect();
+        matches.sort_by_key(|e| e.recurrence_id.is_some());
+        Ok(matches.into_iter().next())
+    }
+
+    /// Find one event by UID. Searches every calendar unless one is named.
+    ///
+    /// Stops at the first calendar holding the UID, so the usual case costs one
+    /// REPORT. Only a miss pays for the whole sweep.
+    #[instrument(skip(self))]
+    pub async fn get_event(&self, uid: &str, calendar: Option<&str>) -> Result<Option<Event>> {
+        for cal in self.read_targets(calendar).await? {
+            // An unreadable calendar shouldn't mask a hit in the next one.
+            if let Ok(Some(event)) = self.event_in_calendar(uid, &cal).await {
                 return Ok(Some(event));
             }
         }
@@ -923,6 +992,27 @@ fn first_href_under(xml: &str, ns: &str, prop: &str) -> Option<String> {
 /// skipped — some servers keep pointing at a calendar the user has since lost
 /// write access to — as is a task-only collection, which would swallow the
 /// event somewhere no calendar app shows it.
+/// Match a calendar in an already-fetched listing, by id, display name, or
+/// href. Split out from [`CalDavClient::find_calendar`] so the GraphQL layer can
+/// resolve names against its own per-request listing rather than the client's
+/// process-lifetime cache.
+pub fn resolve_calendar(calendars: &[Calendar], name: Option<&str>) -> Result<Calendar> {
+    match name.map(str::trim).filter(|s| !s.is_empty()) {
+        None => pick_default(calendars)
+            .cloned()
+            .ok_or_else(|| Error::CalendarNotFound("no calendars on this account".into())),
+        Some(name) => calendars
+            .iter()
+            .find(|c| {
+                c.id.eq_ignore_ascii_case(name)
+                    || c.name.eq_ignore_ascii_case(name)
+                    || c.href == util::href_path(name)
+            })
+            .cloned()
+            .ok_or_else(|| Error::CalendarNotFound(name.to_string())),
+    }
+}
+
 fn pick_default(calendars: &[Calendar]) -> Option<&Calendar> {
     let usable = |c: &&Calendar| !c.read_only && c.supports_events;
     calendars
