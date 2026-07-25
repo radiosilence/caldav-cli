@@ -39,11 +39,14 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   described the transport rather than what the tool reaches. Breaking for
   anything naming the old tools; the queries themselves are unchanged.
 - **A near-free idle cost for the MCP server.** Instructions and tool
-  descriptions load into every session, most of which never mention a calendar,
-  so the usage rules and examples moved out of them and into the
-  `calendar_schema` response, alongside the SDL they annotate. Connecting the
-  server now costs ~230 tokens instead of ~750, and everything substantial is
-  paid only by sessions that touch a calendar.
+  descriptions load into every session, most of which never mention a calendar.
+  The prose that lived there — usage rules, worked examples — was restating
+  what the schema's own field descriptions already say, so it is gone rather
+  than relocated: `calendar_schema` returns the SDL and nothing else, and the
+  handful of rules the schema couldn't express (get approval before CONFIRM)
+  are now field descriptions themselves. Connecting the server costs ~230
+  tokens instead of ~750, and one generated document is the only source of
+  truth about the API.
 - **Protocol version follows the SDK** instead of pinning `2024-11-05`, so
   clients get the newest version both ends know. Older clients are unaffected:
   the server echoes back whatever version they ask for.

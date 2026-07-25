@@ -282,6 +282,7 @@ impl MutationRoot {
 
     /// Update an event. Only the arguments you pass are changed. ALWAYS call
     /// with action=PREVIEW first — the preview shows a before → after diff.
+    /// Read it back to the user and get their approval before CONFIRM.
     async fn update_event(
         &self,
         ctx: &Context<'_>,
@@ -360,6 +361,7 @@ impl MutationRoot {
 
     /// Delete an event. ALWAYS call with action=PREVIEW first — the preview
     /// names the event and its time so the user can confirm it's the right one.
+    /// Get their approval before CONFIRM; a deletion cannot be undone.
     async fn delete_event(
         &self,
         ctx: &Context<'_>,
