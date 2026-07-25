@@ -150,7 +150,7 @@ impl CalDavClient {
             // iCloud rejects requests with no User-Agent outright (403), and
             // reqwest sends none by default. Identifying ourselves is also
             // just good manners toward the servers we talk to.
-            .user_agent(concat!("caldav-cli/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("caldav/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
         Self {

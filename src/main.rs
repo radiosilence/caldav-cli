@@ -115,7 +115,7 @@ impl From<&EventOpts> for commands::EventArgs {
 }
 
 #[derive(Parser)]
-#[command(name = "caldav-cli")]
+#[command(name = "caldav")]
 #[command(version, about = "CLI for CalDAV calendars (iCloud by default)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -370,7 +370,7 @@ async fn main() {
         Commands::FreeBusy { range } => commands::free_busy(&(&range).into()).await,
 
         Commands::Completions { shell } => {
-            generate(shell, &mut Cli::command(), "caldav-cli", &mut io::stdout());
+            generate(shell, &mut Cli::command(), "caldav", &mut io::stdout());
             return;
         }
 

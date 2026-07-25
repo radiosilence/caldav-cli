@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Not configured. Run `caldav-cli auth --username <email>` first.")]
+    #[error("Not configured. Run `caldav auth --username <email>` first.")]
     NotAuthenticated,
 
     /// Authentication was rejected by the server.

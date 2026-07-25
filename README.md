@@ -9,11 +9,11 @@ a Rust binary that is both a scriptable JSON-output CLI and a
 composable GraphQL interface instead of a tool per operation.
 
 ```bash
-caldav-cli agenda --days 1 --tz Europe/London
-caldav-cli create --summary "Coffee" --start "tomorrow 15:00" --duration 30 --tz Europe/London
-caldav-cli mcp                             # stdio MCP server for Claude
-caldav-cli mcp --http --graphiql --browser # GraphiQL in your browser
-caldav-cli mcp --http 0.0.0.0:8080         # hosted mode, credentials per request
+caldav agenda --days 1 --tz Europe/London
+caldav create --summary "Coffee" --start "tomorrow 15:00" --duration 30 --tz Europe/London
+caldav mcp                             # stdio MCP server for Claude
+caldav mcp --http --graphiql --browser # GraphiQL in your browser
+caldav mcp --http 0.0.0.0:8080         # hosted mode, credentials per request
 ```
 
 ## Why this exists
@@ -30,7 +30,8 @@ per request and never sees the secret.
 cargo install --git https://github.com/radiosilence/caldav-cli
 ```
 
-Or grab a binary from [releases](https://github.com/radiosilence/caldav-cli/releases).
+The installed binary is `caldav`. Or grab one from
+[releases](https://github.com/radiosilence/caldav-cli/releases).
 
 ## Setup
 
@@ -46,10 +47,10 @@ your normal Apple ID password for CalDAV, and Fastmail rejects API tokens.
 
 ```bash
 # Reads the password from stdin so it stays out of `ps` and shell history
-caldav-cli auth --username you@icloud.com
+caldav auth --username you@icloud.com
 
 # Or name a different server
-caldav-cli auth --username you@fastmail.com --server-url https://caldav.fastmail.com
+caldav auth --username you@fastmail.com --server-url https://caldav.fastmail.com
 ```
 
 `auth` verifies the credentials against the server before writing anything, so
@@ -71,29 +72,29 @@ Environment variables override the file: `CALDAV_SERVER_URL`,
 `calendar` is where new events go when none is named. Leave it unset and the
 account's own default calendar wins — the one the server advertises via
 `schedule-default-calendar-URL` and your calendar app writes to, flagged as
-`isDefault` in `caldav-cli calendars`.
+`isDefault` in `caldav calendars`.
 
-Debug the wire traffic with `RUST_LOG=debug caldav-cli [cmd]`.
+Debug the wire traffic with `RUST_LOG=debug caldav [cmd]`.
 
 ## Commands
 
 All output is JSON: `{"success": true, "data": ...}`.
 
 ```bash
-caldav-cli calendars                      # discover calendars and their ids
+caldav calendars                      # discover calendars and their ids
 
-caldav-cli agenda [--days N] [--tz TZ] [-c CAL] [-l LIMIT]
-caldav-cli list [-c CAL] [--start S] [--end E] [--days N] [--tz TZ] [-l N] [--no-expand]
-caldav-cli get EVENT_UID [-c CAL]
-caldav-cli search QUERY [-c CAL] [--start S] [--end E] [--days N] [-l N]
-caldav-cli free-busy [--start S] [--end E] [--days N] [--tz TZ]
+caldav agenda [--days N] [--tz TZ] [-c CAL] [-l LIMIT]
+caldav list [-c CAL] [--start S] [--end E] [--days N] [--tz TZ] [-l N] [--no-expand]
+caldav get EVENT_UID [-c CAL]
+caldav search QUERY [-c CAL] [--start S] [--end E] [--days N] [-l N]
+caldav free-busy [--start S] [--end E] [--days N] [--tz TZ]
 
-caldav-cli create [-c CAL] --summary S --start S [OPTIONS]
-caldav-cli update EVENT_UID [OPTIONS]
-caldav-cli delete EVENT_UID -y
+caldav create [-c CAL] --summary S --start S [OPTIONS]
+caldav update EVENT_UID [OPTIONS]
+caldav delete EVENT_UID -y
 
-caldav-cli completions bash|zsh|fish
-caldav-cli mcp [--http [ADDR]] [--graphql] [--graphiql] [--browser]
+caldav completions bash|zsh|fish
+caldav mcp [--http [ADDR]] [--graphql] [--graphiql] [--browser]
 ```
 
 Event options shared by `create` and `update`:
@@ -137,7 +138,7 @@ calendar. Connecting this server costs ~230 tokens until something actually
 asks about the calendar.
 
 ```bash
-claude mcp add --scope user caldav -- caldav-cli mcp
+claude mcp add --scope user caldav -- caldav mcp
 ```
 
 ```graphql
@@ -310,7 +311,7 @@ Server-side overrides are respected: an edited occurrence replaces its
 generated slot, and one marked `CANCELLED` removes it.
 
 To **edit** a series, fetch it unexpanded (`events(expand: false)` or
-`caldav-cli list --no-expand`) and update the master event. From an expanded
+`caldav list --no-expand`) and update the master event. From an expanded
 occurrence, `series { ... }` walks to that master directly — a whole page of
 occurrences resolves through one `calendar-multiget`.
 
@@ -349,10 +350,10 @@ Three independent surfaces, each opt-in, sharing one port (default
 | `--browser`  | opens the IDE once the port is bound         |
 
 ```bash
-caldav-cli mcp                                   # stdio MCP, no listener
-caldav-cli mcp --graphiql --browser              # just the IDE, opened for you
-caldav-cli mcp --http                            # just /mcp
-caldav-cli mcp --http 0.0.0.0:8080 --graphql     # both, explicit address
+caldav mcp                                   # stdio MCP, no listener
+caldav mcp --graphiql --browser              # just the IDE, opened for you
+caldav mcp --http                            # just /mcp
+caldav mcp --http 0.0.0.0:8080 --graphql     # both, explicit address
 ```
 
 Asking for any surface binds the listener; there is nowhere to mount an HTTP
@@ -470,7 +471,7 @@ drifted. The quirks that actually bite, and what this client does about them:
 | Quirk | Handling |
 | --- | --- |
 | **Partition hosts.** You authenticate against `caldav.icloud.com`, but your `calendar-home-set` comes back on a per-account shard like `p42-caldav.icloud.com`, and every later request must address *that* host. | Discovery keeps absolute URLs and resolves each href against the response it came from, never against the configured server URL. |
-| **Requires a `User-Agent`.** A request without one is refused outright — and most HTTP clients (reqwest included) send none by default. | Every request identifies as `caldav-cli/<version>`. |
+| **Requires a `User-Agent`.** A request without one is refused outright — and most HTTP clients (reqwest included) send none by default. | Every request identifies as `caldav/<version>`. |
 | **`<C:expand>` is unreliable**, so an agenda can come back as master events at the wrong times. | Expansion falls back to client-side, transparently. |
 | **No free/busy.** iCloud doesn't answer the free-busy REPORT for a personal calendar home. | Falls back to deriving busy periods from the events. |
 | **App-specific passwords only** — the Apple ID password is rejected, and there is no OAuth. | `auth` verifies credentials against the server before storing them, so a wrong password fails immediately with a clear message instead of a confusing discovery error. |

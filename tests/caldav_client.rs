@@ -791,8 +791,8 @@ async fn sends_a_user_agent() {
         .get("user-agent")
         .map(|v| v.to_str().unwrap().to_string());
     assert!(
-        ua.as_deref().is_some_and(|v| v.starts_with("caldav-cli/")),
-        "expected a caldav-cli User-Agent, got {ua:?}"
+        ua.as_deref().is_some_and(|v| v.starts_with("caldav/")),
+        "expected a caldav User-Agent, got {ua:?}"
     );
 }
 

@@ -1,18 +1,18 @@
 ---
 name: caldav
-description: Complete reference for caldav-cli — all commands, flags, config, and common patterns
+description: Complete reference for the caldav CLI — all commands, flags, config, and common patterns
 ---
 
-# caldav-cli — Complete Reference
+# caldav — Complete Reference
 
-caldav-cli is a Rust CLI for CalDAV calendars (iCloud by default). All output is
+caldav is a Rust CLI for CalDAV calendars (iCloud by default). All output is
 JSON: `{"success": true, "data": {...}}`.
 
 ## Setup
 
 ```bash
-caldav-cli auth --username you@icloud.com          # password read from stdin
-caldav-cli auth --username you@fastmail.com --server-url https://caldav.fastmail.com
+caldav auth --username you@icloud.com          # password read from stdin
+caldav auth --username you@fastmail.com --server-url https://caldav.fastmail.com
 ```
 
 CalDAV needs an **app-specific password**, not the account password:
@@ -31,7 +31,7 @@ app_password = "abcd-efgh-ijkl-mnop"
 
 Or via env: `CALDAV_SERVER_URL`, `CALDAV_USERNAME`, `CALDAV_APP_PASSWORD`
 
-Debug: `RUST_LOG=debug caldav-cli [cmd]`
+Debug: `RUST_LOG=debug caldav [cmd]`
 
 ---
 
@@ -40,7 +40,7 @@ Debug: `RUST_LOG=debug caldav-cli [cmd]`
 ### Calendars
 
 ```bash
-caldav-cli calendars           # ids, names, colours, readOnly, supportsEvents
+caldav calendars           # ids, names, colours, readOnly, supportsEvents
 ```
 
 Use the `id` (or the display name) anywhere `-c/--calendar` is accepted.
@@ -48,11 +48,11 @@ Use the `id` (or the display name) anywhere `-c/--calendar` is accepted.
 ### Reading
 
 ```bash
-caldav-cli agenda [--days N] [--tz TZ] [-c CAL] [-l LIMIT]    # default: today
-caldav-cli list [-c CAL] [--start S] [--end E] [--days N] [--tz TZ] [-l N] [--no-expand]
-caldav-cli get EVENT_UID [-c CAL]
-caldav-cli search QUERY [-c CAL] [--start S] [--end E] [--days N] [-l N]
-caldav-cli free-busy [--start S] [--end E] [--days N] [--tz TZ]
+caldav agenda [--days N] [--tz TZ] [-c CAL] [-l LIMIT]    # default: today
+caldav list [-c CAL] [--start S] [--end E] [--days N] [--tz TZ] [-l N] [--no-expand]
+caldav get EVENT_UID [-c CAL]
+caldav search QUERY [-c CAL] [--start S] [--end E] [--days N] [-l N]
+caldav free-busy [--start S] [--end E] [--days N] [--tz TZ]
 ```
 
 Window defaults: start = today, span = 7 days (`agenda` defaults to 1 day).
@@ -64,9 +64,9 @@ Window defaults: start = today, span = 7 days (`agenda` defaults to 1 day).
 ### Writing
 
 ```bash
-caldav-cli create [-c CAL] --summary "Coffee" --start "tomorrow 15:00" --duration 30 --tz Europe/London
-caldav-cli update EVENT_UID --start "+1d" --location "Room 5"
-caldav-cli delete EVENT_UID -y
+caldav create [-c CAL] --summary "Coffee" --start "tomorrow 15:00" --duration 30 --tz Europe/London
+caldav update EVENT_UID --start "+1d" --location "Room 5"
+caldav delete EVENT_UID -y
 ```
 
 Shared event flags:
@@ -118,8 +118,8 @@ their local wall-clock time across DST.
 To edit a series, fetch the master first:
 
 ```bash
-caldav-cli list --no-expand -c Home --days 30     # master events, with rrule
-caldav-cli update SERIES_UID --start "2026-08-01 10:00"
+caldav list --no-expand -c Home --days 30     # master events, with rrule
+caldav update SERIES_UID --start "2026-08-01 10:00"
 ```
 
 Editing an expanded occurrence's UID edits the whole series.
@@ -130,21 +130,21 @@ Editing an expanded occurrence's UID edits the whole series.
 
 ```bash
 # What's on today, in local time
-caldav-cli agenda --tz Europe/London
+caldav agenda --tz Europe/London
 
 # The week ahead, work calendar only
-caldav-cli list -c Work --days 7 --tz Europe/London
+caldav list -c Work --days 7 --tz Europe/London
 
 # Find a free slot before proposing a meeting
-caldav-cli free-busy --days 3 --tz Europe/London
+caldav free-busy --days 3 --tz Europe/London
 
 # Next occurrence of something, searching a year out
-caldav-cli search dentist --days 365
+caldav search dentist --days 365
 
 # Book something and check it landed
-caldav-cli create --summary "1:1" --start "tomorrow 14:00" --duration 45 \
+caldav create --summary "1:1" --start "tomorrow 14:00" --duration 45 \
   --tz Europe/London --attendee 'Jane Doe <jane@x.test>'
-caldav-cli agenda --days 2 --tz Europe/London
+caldav agenda --days 2 --tz Europe/London
 ```
 
 ---
@@ -152,8 +152,8 @@ caldav-cli agenda --days 2 --tz Europe/London
 ## MCP mode
 
 ```bash
-caldav-cli mcp                        # stdio, credentials from config
-caldav-cli mcp --http 0.0.0.0:8080    # hosted, credentials per request
+caldav mcp                        # stdio, credentials from config
+caldav mcp --http 0.0.0.0:8080    # hosted, credentials per request
 ```
 
 Two tools: `calendar_schema` (the GraphQL schema) and `calendar` (run a query
