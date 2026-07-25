@@ -12,7 +12,7 @@ composable GraphQL interface instead of a tool per operation.
 caldav agenda --days 1 --tz Europe/London
 caldav create --summary "Coffee" --start "tomorrow 15:00" --duration 30 --tz Europe/London
 caldav mcp                             # stdio MCP server for Claude
-caldav mcp --http --graphiql --browser # GraphiQL in your browser
+caldav mcp --browser                    # GraphiQL in your browser
 caldav mcp --http 0.0.0.0:8080         # hosted mode, credentials per request
 ```
 
@@ -353,11 +353,11 @@ Three independent surfaces, each opt-in, sharing one port (default
 | `--http`     | MCP streamable-HTTP at `/mcp`                |
 | `--graphql`  | plain GraphQL-over-HTTP at `/graphql`        |
 | `--graphiql` | the GraphiQL IDE at `/`, and its `/graphql`  |
-| `--browser`  | opens the IDE once the port is bound         |
+| `--browser`  | opens the IDE once the port is bound, implying `--graphiql` |
 
 ```bash
 caldav mcp                                   # stdio MCP, no listener
-caldav mcp --graphiql --browser              # just the IDE, opened for you
+caldav mcp --browser                         # just the IDE, opened for you
 caldav mcp --http                            # just /mcp
 caldav mcp --http 0.0.0.0:8080 --graphql     # both, explicit address
 ```
@@ -365,7 +365,7 @@ caldav mcp --http 0.0.0.0:8080 --graphql     # both, explicit address
 Asking for any surface binds the listener; there is nowhere to mount an HTTP
 route over stdio. Only `--http` puts MCP on it — the transport a model connects
 through and a browsable endpoint for you are separate things. `--browser`
-requires `--graphiql`, since it opens the IDE.
+implies `--graphiql`, since the IDE is what it opens.
 
 `/graphql` is plain GraphQL-over-HTTP, which is what a browser speaks; `/mcp` is
 MCP JSON-RPC, which it doesn't. That is why GraphiQL needs its own route rather

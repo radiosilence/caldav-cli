@@ -3,6 +3,15 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-07-25
+
+### Changed
+
+- **`mcp --browser` implies `--graphiql`** instead of refusing to run without
+  it. Opening a browser at the IDE means serving the IDE, so making the user
+  spell out both was arithmetic the tool could do itself — and it already infers
+  the listener from any HTTP surface.
+
 ## [0.5.1] - 2026-07-25
 
 ### Fixed
