@@ -3,6 +3,39 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The image is now a static musl binary on `scratch`, not a compile on
+  `debian:bookworm-slim`.** 20.1MB down from a debian base, and the runtime
+  stage no longer builds anything — CI compiles once per arch and the image
+  build just copies the binary and the CA bundle in. `docker build .` still
+  compiles from source for local use; CI passes a prebuilt binary via
+  `BIN_SOURCE=prebuilt` to reuse what the release matrix already built, so the
+  binary never round-trips through the artifact store and the image never
+  waits on a second compile.
+- **CI now builds and lints on every PR, not just on push to `main`.** The
+  registry push and GitHub release stay gated to `main`, but a broken
+  Dockerfile or a clippy/fmt regression now fails before merge. `check` is
+  split into separate `test` / `lint` / `format` jobs so a formatting nit
+  doesn't block the test job's cache warm-up.
+- **Docker layer caching removed from the image build.** Nothing compiles
+  inside the image anymore, so there was nothing left for `cache-from`/
+  `cache-to` to usefully cache — `mode=max` was filling the repo-wide 10GB
+  GitHub Actions cache that `Swatinem/rust-cache` shares with the Rust build
+  jobs.
+- The container still runs as `USER 10001:10001`. `scratch` has no home
+  directory or `/etc/passwd`, so the `~/.config/caldav-cli/config.toml` file
+  the CLI reads on other platforms is unreachable in the container; this is
+  fine today since the image is normally driven entirely by
+  `CALDAV_SERVER_URL` / `CALDAV_USERNAME` / `CALDAV_APP_PASSWORD`, and
+  `Config::load()` degrades to defaults rather than erroring when the config
+  directory can't be resolved. Verified `caldav --version` and `caldav --help`
+  both succeed in the container with no config file and no `HOME` set.
+  Credential handling in the container is moving to request headers entirely
+  in a follow-up.
+
 ## [0.6.0] - 2026-07-26
 
 ### Added
