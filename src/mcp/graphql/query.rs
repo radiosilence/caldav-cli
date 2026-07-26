@@ -18,6 +18,17 @@ pub struct QueryRoot;
 #[Object]
 #[allow(clippy::too_many_arguments)]
 impl QueryRoot {
+    /// Who this connection is authenticated as, and whether the credentials
+    /// still work. One round trip, and no calendar need exist for it to answer.
+    ///
+    /// A rejected or unreachable server is reported in `status`, not raised as
+    /// an error: "not connected" is the answer to this question, not a failure
+    /// to answer it. So a caller polling for connection state branches on an
+    /// enum rather than parsing an error message.
+    async fn viewer(&self, ctx: &Context<'_>) -> Result<GqlViewer> {
+        Ok(GqlViewer::probe(ctx.data::<super::SharedClient>()?).await)
+    }
+
     /// Every calendar on the account. Start here to discover calendar ids, then
     /// walk into `events { ... }` without a second round trip for the listing.
     #[graphql(complexity = "page_complexity(first, last, child_complexity)")]

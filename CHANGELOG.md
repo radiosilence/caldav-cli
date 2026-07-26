@@ -3,6 +3,21 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-26
+
+### Added
+
+- **`viewer` — is this connection actually authenticated?** A status dot in a
+  UI previously had to fire a real query and read the error prose to tell "your
+  app password is dead, re-authenticate" from "iCloud is having a moment, wait".
+  `viewer` asks the server for `current-user-principal`, which is the cheapest
+  question it will only answer for a request it has authenticated, and reports
+  `CONNECTED` / `INVALID_CREDENTIALS` / `UNREACHABLE` as data rather than
+  raising an error — not being connected is the answer to this question, not a
+  failure to answer it. `detail` carries the server's own words for a tooltip;
+  the enum is what to branch on. `CalDavClient::principal` is public for it,
+  and stays uncached: a probe that answers from memory isn't a probe.
+
 ## [0.5.3] - 2026-07-26
 
 ### Changed

@@ -44,6 +44,65 @@ pub(crate) async fn all_calendars(ctx: &Context<'_>) -> Result<std::sync::Arc<Ve
 
 // ============ Output Types ============
 
+/// Whether the credentials behind this connection still work.
+///
+/// The split that matters is actionable: `INVALID_CREDENTIALS` means the user
+/// must re-authenticate, `UNREACHABLE` means wait and try again.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ConnectionStatus {
+    /// The server authenticated the request and named a principal.
+    Connected,
+    /// The server rejected the username or app password (401/403).
+    InvalidCredentials,
+    /// The server couldn't be reached, refused to answer, or answered with
+    /// nothing usable. Transient — the credentials may well be fine.
+    Unreachable,
+}
+
+/// The account this connection authenticates as, and whether it can actually
+/// reach it. Built by [`GqlViewer::probe`].
+#[derive(SimpleObject)]
+#[graphql(name = "Viewer")]
+pub struct GqlViewer {
+    /// Branch on this, not on `detail` — `detail` is prose and will change.
+    pub status: ConnectionStatus,
+    /// The account these credentials authenticate as.
+    pub username: String,
+    /// The CalDAV base URL being talked to.
+    pub server_url: String,
+    /// The server's `current-user-principal` href. Set only when connected.
+    pub principal: Option<String>,
+    /// Why it isn't connected, in human-readable form. Null when connected.
+    pub detail: Option<String>,
+}
+
+impl GqlViewer {
+    /// Ask the server who we are. One round trip, and the only question here
+    /// that doesn't need a calendar to exist.
+    pub(crate) async fn probe(client: &crate::caldav::CalDavClient) -> Self {
+        use crate::error::Error;
+
+        let (status, principal, detail) = match client.principal().await {
+            Ok(href) => (ConnectionStatus::Connected, Some(href), None),
+            // Discovery failing on a request the server *did* authenticate is
+            // a server or URL problem, not a credential one.
+            Err(e @ Error::InvalidCredentials(_)) => (
+                ConnectionStatus::InvalidCredentials,
+                None,
+                Some(e.to_string()),
+            ),
+            Err(e) => (ConnectionStatus::Unreachable, None, Some(e.to_string())),
+        };
+        Self {
+            status,
+            username: client.username().to_string(),
+            server_url: client.server_url().to_string(),
+            principal,
+            detail,
+        }
+    }
+}
+
 /// A calendar collection. Navigate into it with `events { ... }`.
 pub struct GqlCalendar(pub Calendar);
 

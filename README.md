@@ -402,6 +402,23 @@ authenticated the caller. That is the transport `jaritanet-mcp-gateway` puts
 behind OAuth; because CalDAV needs three values rather than one bearer token,
 the gateway stores a credential *set* for this MCP.
 
+#### Checking a connection
+
+`viewer` answers whether a credential set still works, and needs no calendar to
+exist to do it:
+
+```graphql
+{ viewer { status username serverUrl principal detail } }
+```
+
+One `PROPFIND` for `current-user-principal` — the cheapest question a CalDAV
+server will only answer for a request it has authenticated. `status` is
+`CONNECTED`, `INVALID_CREDENTIALS`, or `UNREACHABLE`, and a bad connection is
+reported there rather than raised as a GraphQL error: it is the answer to this
+question, not a failure to answer it. The split is the one a UI acts on — tell
+the user to re-authenticate, or tell them to wait. `detail` carries the server's
+own words for a tooltip; branch on `status`, which won't be reworded.
+
 Do **not** expose this to the internet without such an auth layer in front —
 the headers are trusted unconditionally. Equally, do not run it with local
 credentials present on a non-loopback address: anything that can reach the port

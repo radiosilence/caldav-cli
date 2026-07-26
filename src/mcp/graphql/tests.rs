@@ -1015,3 +1015,89 @@ async fn the_calendar_query_agrees_with_where_an_event_would_land() {
         .await;
     assert_eq!(explicit["calendar"]["name"], "Home");
 }
+
+const VIEWER: &str = "{ viewer { status username serverUrl principal detail } }";
+
+/// The `viewer` field, against a server mounting whatever the caller set up.
+/// Asserts the whole point of the field as it goes: it answers, always.
+async fn viewer_of(server: &MockServer) -> Value {
+    let schema = build_schema();
+    let client = Arc::new(CalDavClient::new(
+        server.uri(),
+        "me@example.com".into(),
+        "app-password".into(),
+    ));
+    let response = schema.execute(request(VIEWER, client, None)).await;
+    assert!(
+        response.errors.is_empty(),
+        "viewer must report a bad connection, not raise one: {:?}",
+        response.errors
+    );
+    response.data.into_json().unwrap()["viewer"].clone()
+}
+
+#[tokio::test]
+async fn viewer_reports_a_working_connection() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+
+    let viewer = viewer_of(&server).await;
+
+    assert_eq!(viewer["status"], "CONNECTED");
+    assert_eq!(viewer["username"], "me@example.com");
+    assert_eq!(viewer["serverUrl"], server.uri());
+    assert!(
+        viewer["principal"]
+            .as_str()
+            .unwrap()
+            .ends_with("/1234/principal/")
+    );
+    assert!(viewer["detail"].is_null());
+
+    // The cheap probe, not the full discovery walk: a status poll must not pay
+    // for a calendar listing it isn't going to read.
+    let paths: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        !paths.iter().any(|p| p.contains("/calendars")),
+        "probe walked past the principal: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn viewer_reports_rejected_credentials() {
+    let server = MockServer::start().await;
+    Mock::given(method("PROPFIND"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let viewer = viewer_of(&server).await;
+
+    // The actionable half of the split: this one means re-authenticate.
+    assert_eq!(viewer["status"], "INVALID_CREDENTIALS");
+    assert!(viewer["principal"].is_null());
+    assert!(viewer["detail"].as_str().unwrap().contains("rejected"));
+}
+
+#[tokio::test]
+async fn viewer_reports_a_server_that_wont_answer() {
+    let server = MockServer::start().await;
+    Mock::given(method("PROPFIND"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let viewer = viewer_of(&server).await;
+
+    // Not INVALID_CREDENTIALS — nothing here says the password is wrong, and
+    // telling the user to re-authenticate over a 503 would be a lie.
+    assert_eq!(viewer["status"], "UNREACHABLE");
+    assert!(viewer["principal"].is_null());
+    assert!(!viewer["detail"].is_null());
+}
