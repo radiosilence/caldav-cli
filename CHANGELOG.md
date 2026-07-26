@@ -3,6 +3,20 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-07-26
+
+### Changed
+
+- **The `mcp` flags state their own implications, and resolve them in one
+  place.** `--browser` implies `--graphiql` implies `--graphql`; `--http` is the
+  only flag that puts MCP on the listener, which `--help` now says outright —
+  the surface a model connects through and one you can poke at in a browser are
+  different things, and confusing them exposes an endpoint nobody asked for.
+  `HttpSurfaces` now describes what is mounted rather than what was typed, so
+  `graphql` is no longer false while `/graphql` is being served. Same routes as
+  before; tests pin each documented invocation. Matches `fastmail-cli`,
+  `tfl-mcp` and `mainlynorfolk-mcp`, which take the same three flags.
+
 ## [0.5.2] - 2026-07-25
 
 ### Changed
