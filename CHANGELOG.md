@@ -18,6 +18,16 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the enum is what to branch on. `CalDavClient::principal` is public for it,
   and stays uncached: a probe that answers from memory isn't a probe.
 
+### Fixed
+
+- **A stale `Cargo.lock` no longer reaches the image build.** `check` builds and
+  tests with `--locked`, so a lockfile that has drifted from `Cargo.toml` fails
+  in the pull request rather than in the Docker build, which was the only step
+  using `--locked` and so the only one that noticed.
+- **A version tag is never cut without an image behind it.** `publish` now waits
+  for the image builds as well as the tarballs. Previously they ran in parallel,
+  so a failed image build still produced a GitHub release with nothing to pull.
+
 ## [0.5.3] - 2026-07-26
 
 ### Changed
