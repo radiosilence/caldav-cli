@@ -87,9 +87,6 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: linux-x86_64
           - target: x86_64-apple-darwin
             os: macos-latest
             name: darwin-x86_64
@@ -134,10 +131,12 @@ jobs:
             platform: linux/amd64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            name: linux-x86_64
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+            name: linux-aarch64
     permissions:
       contents: read
       packages: write
@@ -171,11 +170,19 @@ jobs:
           cp target/${{ matrix.target }}/release/caldav \
             dist/caldav-linux-${{ matrix.arch }}-musl
 
-      - name: Upload binary
+      # Same tarball naming/contents as build-binaries' Package step, so
+      # create-release can pick these up without any special-casing.
+      - name: Package
+        run: |
+          mkdir -p pkg
+          cp dist/caldav-linux-${{ matrix.arch }}-musl pkg/caldav
+          tar -czvf caldav-${{ matrix.name }}.tar.gz -C pkg caldav
+
+      - name: Upload release tarball
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: caldav-linux-${{ matrix.arch }}-musl
-          path: dist/caldav-linux-${{ matrix.arch }}-musl
+          name: bin-${{ matrix.name }}
+          path: caldav-${{ matrix.name }}.tar.gz
 
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
@@ -240,7 +247,16 @@ jobs:
   # the GitHub release too.
   create-release:
     name: Create Release
-    needs: [test, lint, format, build-binaries, check-version, create-manifest]
+    needs:
+      [
+        test,
+        lint,
+        format,
+        build-binaries,
+        build-image,
+        check-version,
+        create-manifest,
+      ]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
