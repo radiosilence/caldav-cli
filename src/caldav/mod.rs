@@ -211,7 +211,13 @@ impl CalDavClient {
     // ---- Discovery ----
 
     /// `current-user-principal` for the authenticated user.
-    async fn principal(&self) -> Result<String> {
+    ///
+    /// Public because it doubles as the credential check: it is the cheapest
+    /// question a CalDAV server will only answer for a request it has
+    /// authenticated, so succeeding here means the username and app password
+    /// are still good. Deliberately uncached, unlike [`Self::calendar_home`] —
+    /// a probe that answers from memory isn't a probe.
+    pub async fn principal(&self) -> Result<String> {
         const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
   <d:prop><d:current-user-principal/></d:prop>
@@ -371,6 +377,11 @@ impl CalDavClient {
     /// of an event's attendee list.
     pub fn username(&self) -> &str {
         &self.username
+    }
+
+    /// The CalDAV base URL this client authenticates against.
+    pub fn server_url(&self) -> &str {
+        &self.base
     }
 
     // ---- Writing properties ----
