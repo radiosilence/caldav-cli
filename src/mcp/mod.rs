@@ -410,6 +410,9 @@ async fn graphql_endpoint(
     let mut request = if is_introspection_only(&req.query) {
         async_graphql::Request::new(&req.query)
     } else {
+        // GraphiQL runs in a browser and cannot attach X-CalDAV-* headers, so this
+        // must keep honouring `default_credentials` — passing `None` here strands
+        // the IDE with no way to authenticate.
         let Some(resolved) = resolve(
             Some(&headers),
             mcp.default_credentials.as_ref(),
@@ -687,5 +690,49 @@ mod tests {
         // hosted mode with no upstream-injected credentials — must refuse.
         assert_eq!(resolved_credentials(Some(&headers_with(&[])), None), None);
         assert_eq!(resolved_credentials(None, None), None);
+    }
+
+    /// GraphiQL runs in a browser, which cannot attach X-CalDAV-* headers —
+    /// the only way it can ever authenticate is by `/graphql` falling back to
+    /// the local default, exactly like the `calendar` tool does. If that
+    /// fallback is ever dropped from this endpoint, local development becomes
+    /// unusable even though every other test in this file still passes.
+    #[tokio::test]
+    async fn graphql_falls_back_to_local_config_when_no_headers() {
+        let mcp = CalDavMcp::build(
+            Some(Credentials {
+                // Loopback, unassigned port: refuses instantly, no DNS, no
+                // external traffic — just enough to prove the request got
+                // past credential resolution.
+                server_url: "http://127.0.0.1:1".into(),
+                username: "me@x.test".into(),
+                password: "pw".into(),
+            }),
+            None,
+        );
+
+        let req = HttpGraphqlRequest {
+            // A real field selection, not introspection, so this exercises
+            // the credential-resolving branch rather than the short-circuit.
+            query: "{ calendars { nodes { name } } }".into(),
+            variables: None,
+            operation_name: None,
+        };
+
+        let response = graphql_endpoint(
+            axum::extract::State(mcp),
+            http::HeaderMap::new(),
+            axum::Json(req),
+        )
+        .await;
+
+        let body = serde_json::to_string(&response.0).unwrap();
+        // A connection error is expected and fine here — it proves credential
+        // resolution succeeded and execution reached the network. What must
+        // never happen is falling through to the "no credentials" error.
+        assert!(
+            !body.contains("No CalDAV credentials available"),
+            "expected the local default to be used, got: {body}"
+        );
     }
 }
