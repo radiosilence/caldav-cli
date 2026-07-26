@@ -1,6 +1,6 @@
 [package]
 name = "caldav-cli"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "CLI and MCP server for CalDAV calendars (iCloud by default)"
 repository = "https://github.com/radiosilence/caldav-cli"
@@ -53,5 +53,5 @@ wiremock = "0.6"
 
 [profile.release]
 strip = true
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
