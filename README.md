@@ -348,16 +348,17 @@ request at all.
 Three independent surfaces, each opt-in, sharing one port (default
 `127.0.0.1:8080`, or pass an address to `--http`):
 
-| Flag         | Serves                                       |
-| ------------ | -------------------------------------------- |
-| `--http`     | MCP streamable-HTTP at `/mcp`                |
-| `--graphql`  | plain GraphQL-over-HTTP at `/graphql`        |
-| `--graphiql` | the GraphiQL IDE at `/`, and its `/graphql`  |
-| `--browser`  | opens the IDE once the port is bound, implying `--graphiql` |
+| Flag         | Serves                                                  |
+| ------------ | ------------------------------------------------------- |
+| `--http`     | MCP streamable-HTTP at `/mcp`                           |
+| `--graphql`  | plain GraphQL-over-HTTP at `/graphql`                   |
+| `--graphiql` | the GraphiQL IDE at `/`; implies `--graphql`             |
+| `--browser`  | opens the IDE once bound; implies `--graphiql`           |
 
 ```bash
 caldav mcp                                   # stdio MCP, no listener
 caldav mcp --browser                         # just the IDE, opened for you
+caldav mcp --graphiql --http                 # the IDE and /mcp, nothing opened
 caldav mcp --http                            # just /mcp
 caldav mcp --http 0.0.0.0:8080 --graphql     # both, explicit address
 ```

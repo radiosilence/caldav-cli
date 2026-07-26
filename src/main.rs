@@ -261,9 +261,11 @@ enum Commands {
     /// Run as MCP (Model Context Protocol) server for Claude integration
     Mcp {
         /// Serve MCP over streamable HTTP at /mcp instead of stdio, on this
-        /// address (default 127.0.0.1:8080). The `X-CalDAV-*` headers override
-        /// the configured credentials per request, which is how a hosted
-        /// deployment serves many users.
+        /// address (default 127.0.0.1:8080). **The only flag that puts MCP on
+        /// HTTP** — the web surfaces below bring up a listener for themselves
+        /// without exposing MCP on it. The `X-CalDAV-*` headers override the
+        /// configured credentials per request, which is how a hosted deployment
+        /// serves many users.
         #[arg(
             long,
             value_name = "ADDR",
@@ -276,15 +278,46 @@ enum Commands {
         #[arg(long)]
         graphql: bool,
 
-        /// Serve the GraphiQL IDE at /, and the /graphql it talks to
+        /// Serve the GraphiQL IDE at /. Implies --graphql, which is what the
+        /// IDE talks to
         #[arg(long)]
         graphiql: bool,
 
-        /// Open the GraphiQL IDE in your browser once listening (implies
-        /// --graphiql)
+        /// Open the GraphiQL IDE in your browser once listening. Implies
+        /// --graphiql, and so --graphql
         #[arg(long)]
         browser: bool,
     },
+}
+
+/// Resolve the `mcp` flags into a listen address and the surfaces to mount, or
+/// `None` for stdio.
+///
+/// Each flag turns on whatever it needs: `--browser` opens the IDE, so it serves
+/// the IDE, which talks to `/graphql`. Asking for any web surface binds a
+/// listener, because there is nowhere to mount an HTTP route over stdio — but
+/// only `--http` puts MCP on it. Someone opening GraphiQL locally has not asked
+/// to expose an MCP endpoint, and a deployment that wants one says so.
+fn resolve_mcp(
+    http: Option<String>,
+    graphql: bool,
+    graphiql: bool,
+    browser: bool,
+) -> Option<(String, mcp::HttpSurfaces)> {
+    let graphiql = graphiql || browser;
+    let graphql = graphql || graphiql;
+    let addr = http
+        .clone()
+        .or_else(|| graphql.then(|| mcp::DEFAULT_HTTP_ADDR.to_string()))?;
+    Some((
+        addr,
+        mcp::HttpSurfaces {
+            mcp: http.is_some(),
+            graphql,
+            graphiql,
+            browser,
+        },
+    ))
 }
 
 #[tokio::main]
@@ -380,37 +413,61 @@ async fn main() {
             graphql,
             graphiql,
             browser,
-        } => {
-            // Asking for a surface is asking for what it needs: opening a
-            // browser at the IDE means serving the IDE, which means serving the
-            // /graphql it talks to. Refusing to infer that leaves the user
-            // spelling out three flags to mean one thing.
-            let graphiql = graphiql || browser;
-
-            // `--http` is MCP's own transport; `--graphql`/`--graphiql` are
-            // separate surfaces that happen to need a listener too. Asking for
-            // any of them binds one — there is nowhere to mount an HTTP route
-            // over stdio — and only `--http` puts MCP on it.
-            let addr = http
-                .clone()
-                .or_else(|| (graphql || graphiql).then(|| mcp::DEFAULT_HTTP_ADDR.to_string()));
-            match addr {
-                Some(addr) => {
-                    let surfaces = mcp::HttpSurfaces {
-                        mcp: http.is_some(),
-                        graphql,
-                        graphiql,
-                        browser,
-                    };
-                    mcp::run_http_server(&addr, surfaces).await
-                }
-                None => mcp::run_server().await,
-            }
-        }
+        } => match resolve_mcp(http, graphql, graphiql, browser) {
+            Some((addr, surfaces)) => mcp::run_http_server(&addr, surfaces).await,
+            None => mcp::run_server().await,
+        },
     };
 
     if let Err(e) = result {
         Output::<()>::error(e.to_string()).print();
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve(args: &[&str]) -> Option<(String, mcp::HttpSurfaces)> {
+        let cli = Cli::parse_from(std::iter::once("caldav").chain(args.iter().copied()));
+        let Commands::Mcp {
+            http,
+            graphql,
+            graphiql,
+            browser,
+        } = cli.command
+        else {
+            panic!("not an mcp invocation");
+        };
+        resolve_mcp(http, graphql, graphiql, browser)
+    }
+
+    #[test]
+    fn bare_mcp_stays_on_stdio() {
+        assert!(resolve(&["mcp"]).is_none());
+    }
+
+    #[test]
+    fn browser_serves_the_ide_and_its_endpoint_but_not_mcp() {
+        let (addr, s) = resolve(&["mcp", "--browser"]).expect("binds a listener");
+        assert_eq!(addr, mcp::DEFAULT_HTTP_ADDR);
+        assert!(s.graphiql && s.graphql && s.browser);
+        assert!(!s.mcp, "opening GraphiQL is not asking to expose MCP");
+    }
+
+    #[test]
+    fn graphiql_with_http_serves_both_without_opening_anything() {
+        let (_, s) = resolve(&["mcp", "--graphiql", "--http"]).expect("binds a listener");
+        assert!(s.mcp && s.graphiql && s.graphql);
+        assert!(!s.browser);
+    }
+
+    #[test]
+    fn http_alone_serves_only_mcp() {
+        let (addr, s) = resolve(&["mcp", "--http", "0.0.0.0:9000"]).expect("binds a listener");
+        assert_eq!(addr, "0.0.0.0:9000");
+        assert!(s.mcp);
+        assert!(!s.graphql && !s.graphiql && !s.browser);
     }
 }

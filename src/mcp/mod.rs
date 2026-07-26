@@ -447,9 +447,11 @@ pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
 pub struct HttpSurfaces {
     /// MCP streamable-HTTP at `/mcp`.
     pub mcp: bool,
-    /// Plain GraphQL-over-HTTP at `/graphql`.
+    /// Plain GraphQL-over-HTTP at `/graphql`. Always set alongside `graphiql`,
+    /// which has nothing to talk to without it — the caller resolves that, so
+    /// these fields say what is mounted rather than what was typed.
     pub graphql: bool,
-    /// The GraphiQL IDE at `/`. Implies `graphql` — it is the IDE's endpoint.
+    /// The GraphiQL IDE at `/`.
     pub graphiql: bool,
     /// Open the IDE in the default browser once listening.
     pub browser: bool,
@@ -495,7 +497,7 @@ pub async fn run_http_server(addr: &str, surfaces: HttpSurfaces) -> anyhow::Resu
         tracing::info!("MCP streamable-HTTP listening on http://{addr}/mcp");
     }
 
-    if surfaces.graphql || surfaces.graphiql {
+    if surfaces.graphql {
         router = router.route("/graphql", axum::routing::post(graphql_endpoint));
         tracing::info!("GraphQL endpoint on http://{addr}/graphql");
     }
