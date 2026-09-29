@@ -978,7 +978,9 @@ async fn deleting_a_calendar_previews_how_much_would_be_lost() {
 
     let text = data["deleteCalendar"]["preview"].as_str().unwrap();
     // "This deletes the calendar" says nothing about the scale of the loss.
-    assert!(text.contains("event(s)"), "no count of the loss: {text}");
+    // The count covers the year from now, so whether the fixture events fall
+    // in it depends on the date; either wording states the scale.
+    assert!(text.contains("in the coming year"), "no count of the loss: {text}");
     assert!(text.contains("Every event in it is deleted too"), "{text}");
     assert!(text.contains("cannot be undone"), "{text}");
 }
