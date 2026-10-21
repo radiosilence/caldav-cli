@@ -15,7 +15,8 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities,
+        ServerConfig,
     },
     schemars,
     service::RequestContext,
@@ -233,11 +234,13 @@ impl CalDavMcp {
     }
 
     fn text_result(text: impl Into<String>) -> ToolResult {
-        Ok(CallToolResult::success(vec![Content::text(text.into())]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            text.into(),
+        )]))
     }
 
     fn error_result(msg: impl Into<String>) -> ToolResult {
-        Ok(CallToolResult::error(vec![Content::text(msg.into())]))
+        Ok(CallToolResult::error(vec![ContentBlock::text(msg.into())]))
     }
 }
 
@@ -308,12 +311,12 @@ impl CalDavMcp {
 
 #[tool_handler]
 impl ServerHandler for CalDavMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let server_info = Implementation::new("caldav", env!("CARGO_PKG_VERSION"))
             .with_title("CalDAV MCP Server")
             .with_website_url("https://github.com/radiosilence/caldav-cli");
 
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             // Only the fallback for a client asking for a version the SDK
             // doesn't know; anything known is echoed back during negotiation.
             .with_protocol_version(ProtocolVersion::LATEST)
