@@ -20,8 +20,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # Releases whatever version is not yet released: how a failed release is
-  # retried.
+  # Releases whatever version has no GitHub release yet: how a release that
+  # failed before publishing is retried.
   workflow_dispatch:
 
 permissions:
