@@ -545,6 +545,20 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```
 
+## CI/CD
+
+`.github/workflows/ci-cd.yml` is one pipeline. CI ends in `Checks`, the only status a ruleset should require; CD runs after it on main, in the same run, and ships what CI built.
+
+Most jobs run only when the change touches their domain, so a skipped job is expected and passes `Checks`; a failed or cancelled one fails it. The `changes` job decides from the diff (against the base on a pull request, against the last main commit whose run passed on a push). A manual run, a push with no passed commit within reach, a release pull request or a diff it cannot compute runs everything. Markdown never counts, and anything under `.github/` counts for every domain.
+
+- `rust`: `src/`, `tests/`, `templates/`, the manifest and lockfile, `.cargo/`, the toolchain, rustfmt and clippy settings. Runs `Format` and `Linux` (clippy and the tests).
+- `apple`: the native inputs the Linux jobs cannot vouch for on macOS (`Cargo.toml`, `Cargo.lock`, a build script, `.cargo/`, the toolchain), code near a `cfg` for an Apple target, or a release. Runs `macOS`. The account's macOS runners are few and shared, so a plain source change does not take one.
+- `docker`: the `Dockerfile` or a native input on a pull request; on main any `rust` change, since CD ships the binaries. Runs the musl builds and the image.
+
+To add a domain, add its output to `changes` with an allowlist of paths, gate its jobs with a job-level `if:`, and add them to the `needs:` of `checks`.
+
+A push to main that changes the version in `Cargo.toml` releases it, as does `gh workflow run ci-cd.yml` on main when that version is not yet released, which is how a failed release is retried. Main pushes the image as `:<sha>` while the checks run; CD tags it `sha-<short>` once they pass and moves `main` onto it when the commit descends from the one `main` holds (its `org.opencontainers.image.revision` label), so a release finishing late never moves `main` backwards. A release adds the `vX.Y.Z`, `vX.Y`, `vX` and `latest` tags, then the GitHub release with the Linux tarballs the image was built from and the signed, notarised macOS ones, built alongside the checks.
+
 ## License
 
 MIT

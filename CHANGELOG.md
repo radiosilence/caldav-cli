@@ -5,6 +5,10 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **CI and CD are one pipeline, gated by `Checks`.** Jobs run only for the parts of the repository a change touches, the Linux binaries are built once and are both what the image holds and what the release attaches, and nothing is tagged or released until every check has passed. A push releases only when it changes the version, and a manual run retries a release that failed part way.
+
 ## [0.6.4] - 2026-09-29
 
 ### Changed
