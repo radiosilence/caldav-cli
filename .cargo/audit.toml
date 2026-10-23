@@ -1,0 +1,13 @@
+# Advisories present in the current lockfile that no available release clears,
+# acknowledged so that `cargo audit` still fails on anything new. Remove each
+# entry as soon as its cause moves; an ignore that outlives its cause is worse
+# than no gate at all.
+[advisories]
+ignore = [
+    # lru, panic safety in `LruCache::pop`. Patched in 0.18.2; the affected
+    # 0.16.4 is held by async-graphql 7.2.1, its latest stable release.
+    "RUSTSEC-2026-0253",
+    # basic-toml, unmaintained. Held by askama_derive 0.16.1, askama's latest
+    # release, which reads askama.toml at compile time only.
+    "RUSTSEC-2026-0374",
+]
