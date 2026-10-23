@@ -1,0 +1,1 @@
+- **RustSec advisories fixed.** Dependency updates clear advisories in h2 (RUSTSEC-2026-0258), quinn-proto (RUSTSEC-2026-0338 to 0342), rustls (RUSTSEC-2026-0285/0346/0348/0349), rustls-webpki (RUSTSEC-2026-0382) and webpki-root-certs (RUSTSEC-2026-0383).
