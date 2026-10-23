@@ -539,12 +539,25 @@ code path; iCloud is simply the one that needs the accommodations.
 
 ## Development
 
+Tools are pinned in `mise.toml` and tasks live in the `justfile`.
+
 ```bash
-cargo test          # 251 tests, including an end-to-end suite against a mock server
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all
-actionlint          # workflow lint, with shellcheck on the run: scripts
+just check          # what CI runs: actionlint, fmt, clippy -D warnings, tests, the changelog
+just fast           # the checks that take seconds; the pre-push hook runs these
+just hooks          # install the lefthook git hooks
 ```
+
+The tests include an end-to-end suite against a mock server.
+
+`CHANGELOG.md` is generated from fragments in `changelog.d/` and never edited
+by hand, so pull requests never conflict on it. Each change adds one
+`- **Lead.** Detail.` file under `changelog.d/unreleased/<section>/`, named
+`<pr>-<slug>.md`; see `changelog.d/README.md`.
+
+`just release patch|minor|major` (or an exact `X.Y.Z`) opens a release PR that
+bumps the version and turns the unreleased fragments into the release.
+Merging it is the release: CI pushes the image's version tags, then creates
+the GitHub release with the binaries and that changelog section as notes.
 
 ## License
 

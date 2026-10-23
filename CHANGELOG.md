@@ -1,23 +1,24 @@
 # Changelog
 
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
-versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
+## Unreleased
 
 ### Security
 
-- Updated dependencies to fix RustSec advisories in h2 (RUSTSEC-2026-0258), quinn-proto (RUSTSEC-2026-0338 to 0342), rustls (RUSTSEC-2026-0285/0346/0348/0349), rustls-webpki (RUSTSEC-2026-0382) and webpki-root-certs (RUSTSEC-2026-0383).
-- Updated tokio to 1.54.1 for a race condition in `tokio::time::Interval` (RUSTSEC-2026-0384); 1.54.0 is yanked.
+- **RustSec advisories fixed.** Dependency updates clear advisories in h2 (RUSTSEC-2026-0258), quinn-proto (RUSTSEC-2026-0338 to 0342), rustls (RUSTSEC-2026-0285/0346/0348/0349), rustls-webpki (RUSTSEC-2026-0382) and webpki-root-certs (RUSTSEC-2026-0383).
+- **tokio 1.54.1.** Fixes a race condition in `tokio::time::Interval` (RUSTSEC-2026-0384); 1.54.0 is yanked.
 - **CI runs `cargo audit` on every push and gates image manifests and releases on it.** Advisories that no available release clears are acknowledged in `.cargo/audit.toml` with the reason, so the job fails only on new ones.
 
-## [0.6.4] - 2026-09-29
+### Internal
+
+- **Releases go through `just release`, and CI/CD is one pipeline gated on `Checks`.** The release PR bumps the version and turns the fragments in `changelog.d/` into the release; merging it publishes, with that changelog section as the release notes. CHANGELOG.md is generated from the fragments, so concurrent pull requests no longer conflict on it. Jobs run only for the domains a change touches, and macOS runners are used only by releases. The image is pushed as `:<sha>` and the per-architecture `:main-amd64` and `:main-arm64` tags are no longer updated.
+
+## 0.6.4
 
 ### Changed
 
 - **macOS release binaries are signed with a Developer ID and notarised.** Downloaded through a browser, the ad-hoc signed binaries were quarantined and Gatekeeper refused to run them until the quarantine attribute was cleared.
 
-## [0.6.3] - 2026-07-26
+## 0.6.3
 
 ### Changed
 
@@ -36,7 +37,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   statically linked musl binary instead of a glibc build — strictly more
   portable, and the same binary the published container images already run.
 
-## [0.6.2] - 2026-07-26
+## 0.6.2
 
 ### Changed
 
@@ -47,7 +48,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   this slow path. Thin LTO with concurrent codegen dramatically speeds iteration
   while still providing the performance LTO is installed to deliver.
 
-## [0.6.1] - 2026-07-26
+## 0.6.1
 
 ### Changed
 
@@ -88,7 +89,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   request headers entirely in a follow-up, so no HOME/config scaffolding was
   added.
 
-## [0.6.0] - 2026-07-26
+## 0.6.0
 
 ### Added
 
@@ -113,7 +114,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for the image builds as well as the tarballs. Previously they ran in parallel,
   so a failed image build still produced a GitHub release with nothing to pull.
 
-## [0.5.3] - 2026-07-26
+## 0.5.3
 
 ### Changed
 
@@ -127,7 +128,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before; tests pin each documented invocation. Matches `fastmail-cli`,
   `tfl-mcp` and `mainlynorfolk-mcp`, which take the same three flags.
 
-## [0.5.2] - 2026-07-25
+## 0.5.2
 
 ### Changed
 
@@ -136,7 +137,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   spell out both was arithmetic the tool could do itself — and it already infers
   the listener from any HTTP surface.
 
-## [0.5.1] - 2026-07-25
+## 0.5.1
 
 ### Fixed
 
@@ -155,7 +156,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a missing event, sending you to look for a data problem that wasn't there. A
   lookup that fails now fails.
 
-## [0.5.0] - 2026-07-25
+## 0.5.0
 
 ### Changed
 
@@ -169,7 +170,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Config still lives at `~/.config/caldav-cli/`, deliberately: moving it would
   make existing installs re-authenticate for a cosmetic rename.
 
-## [0.4.0] - 2026-07-25
+## 0.4.0
 
 ### Added
 
@@ -219,7 +220,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   counts what would be lost, because "this deletes the calendar" says nothing
   about the scale of it.
 
-## [0.3.0] - 2026-07-25
+## 0.3.0
 
 ### Added
 
@@ -245,7 +246,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   must still carry its own headers. Do not run it with local credentials on a
   non-loopback address: anything that can reach the port gets your calendar.
 
-## [0.2.0] - 2026-07-25
+## 0.2.0
 
 ### Added
 
@@ -393,7 +394,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `CalDavClient::list_calendars` returns `Vec<Calendar>` rather than
   `&[Calendar]`, following the cache removal.
 
-## [0.1.0] - 2026-07-24
+## 0.1.0
 
 The initial feature set rather than a set of changes against a released
 version.

@@ -1,0 +1,1 @@
+- **tokio 1.54.1.** Fixes a race condition in `tokio::time::Interval` (RUSTSEC-2026-0384); 1.54.0 is yanked.

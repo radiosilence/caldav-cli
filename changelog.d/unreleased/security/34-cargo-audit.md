@@ -1,0 +1,1 @@
+- **CI runs `cargo audit` on every push and gates image manifests and releases on it.** Advisories that no available release clears are acknowledged in `.cargo/audit.toml` with the reason, so the job fails only on new ones.
