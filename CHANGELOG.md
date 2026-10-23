@@ -7,7 +7,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
-- **Dependencies refreshed to clear twelve RustSec advisories**, among them rustls, rustls-webpki and webpki-root-certs (TLS verification and distrusted roots). caldav talks to CalDAV servers over TLS, so these sat on its main network path.
+- Updated dependencies to fix RustSec advisories in h2 (RUSTSEC-2026-0258), quinn-proto (RUSTSEC-2026-0338 to 0342), rustls (RUSTSEC-2026-0285/0346/0348/0349), rustls-webpki (RUSTSEC-2026-0382) and webpki-root-certs (RUSTSEC-2026-0383).
 - **CI runs `cargo audit` on every push and gates image manifests and releases on it.** Advisories that no available release clears are acknowledged in `.cargo/audit.toml` with the reason, so the job fails only on new ones.
 
 ## [0.6.4] - 2026-09-29
