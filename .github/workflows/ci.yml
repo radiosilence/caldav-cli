@@ -53,6 +53,16 @@ jobs:
       # No rust-cache here on purpose: `cargo fmt --check` compiles nothing.
       - run: cargo fmt --all -- --check
 
+  actionlint:
+    name: Actionlint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      # The image bundles shellcheck, which checks the `run:` scripts.
+      - run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
   check-version:
     name: Check Version
     runs-on: ubuntu-latest
@@ -71,13 +81,16 @@ jobs:
           LATEST_RELEASE=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || echo "")
           LATEST_VERSION=${LATEST_RELEASE#v}
           if [ -z "$LATEST_RELEASE" ] || [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
-            echo "should_release=true" >> $GITHUB_OUTPUT
+            should_release=true
           else
-            echo "should_release=false" >> $GITHUB_OUTPUT
+            should_release=false
           fi
-          echo "version=${CURRENT_VERSION}" >> $GITHUB_OUTPUT
-          echo "major=$(echo $CURRENT_VERSION | cut -d. -f1)" >> $GITHUB_OUTPUT
-          echo "major_minor=$(echo $CURRENT_VERSION | cut -d. -f1-2)" >> $GITHUB_OUTPUT
+          {
+            echo "should_release=$should_release"
+            echo "version=${CURRENT_VERSION}"
+            echo "major=$(cut -d. -f1 <<< "$CURRENT_VERSION")"
+            echo "major_minor=$(cut -d. -f1-2 <<< "$CURRENT_VERSION")"
+          } >> "$GITHUB_OUTPUT"
 
   # Runs on PRs too. Existing release asset packaging (.tar.gz) and names are
   # preserved verbatim — only the job structure changes.
@@ -232,7 +245,7 @@ jobs:
   # :vX.Y.Z / :vX.Y / :vX / :latest) is preserved verbatim.
   create-manifest:
     name: Push image manifest
-    needs: [test, lint, format, build-image, check-version]
+    needs: [test, lint, format, actionlint, build-image, check-version]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -248,7 +261,7 @@ jobs:
         run: |
           for tag in main "sha-$(echo ${{ github.sha }} | cut -c1-7)"; do
             docker buildx imagetools create \
-              --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag \
+              --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:"$tag" \
               ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-amd64 \
               ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-arm64
           done
@@ -273,6 +286,7 @@ jobs:
         test,
         lint,
         format,
+        actionlint,
         build-binaries,
         build-image,
         check-version,

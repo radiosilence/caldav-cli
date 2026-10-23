@@ -543,6 +543,7 @@ code path; iCloud is simply the one that needs the accommodations.
 cargo test          # 251 tests, including an end-to-end suite against a mock server
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
+actionlint          # workflow lint, with shellcheck on the run: scripts
 ```
 
 ## License
