@@ -8,6 +8,7 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Security
 
 - Updated dependencies to fix RustSec advisories in h2 (RUSTSEC-2026-0258), quinn-proto (RUSTSEC-2026-0338 to 0342), rustls (RUSTSEC-2026-0285/0346/0348/0349), rustls-webpki (RUSTSEC-2026-0382) and webpki-root-certs (RUSTSEC-2026-0383).
+- Updated tokio to 1.54.1 for a race condition in `tokio::time::Interval` (RUSTSEC-2026-0384); 1.54.0 is yanked.
 - **CI runs `cargo audit` on every push and gates image manifests and releases on it.** Advisories that no available release clears are acknowledged in `.cargo/audit.toml` with the reason, so the job fails only on new ones.
 
 ## [0.6.4] - 2026-09-29
