@@ -2004,6 +2004,9 @@ pub fn resolve_occurrence(
     occurrence: &str,
     tzid: Option<&str>,
 ) -> Result<DateTime<Utc>> {
+    // A floating series has no TZID but does have a zone: the one it is read
+    // in. Its days are that zone's days, or a bare date names a neighbour.
+    let tzid = tzid.or(event.start.floating_zone.map(|zone| zone.name()));
     let parsed = util::parse_datetime(occurrence, tzid)?;
     // All-day times are anchored at UTC midnight so the date survives the round
     // trip; resolving their "day" through a zone would move it.
@@ -3084,6 +3087,17 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    /// 00:30 in London is the previous day in UTC, so bucketing by UTC days
+    /// would name the wrong meeting.
+    #[test]
+    fn a_floating_series_resolves_dates_in_its_own_zone() {
+        let ics = "BEGIN:VCALENDAR\r\nX-WR-TIMEZONE:Europe/London\r\nBEGIN:VEVENT\r\nUID:late\r\n\
+SUMMARY:Late\r\nDTSTART:20260701T003000\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let series = ical::parse_events(ics, "Home", "/c/", "/c/late.ics", None).remove(0);
+        let at = resolve_occurrence(&series, "2026-08-03", None).unwrap();
+        assert_eq!(util::format_rfc3339(at), "2026-08-02T23:30:00Z");
     }
 
     #[test]
