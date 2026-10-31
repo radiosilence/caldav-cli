@@ -1036,6 +1036,7 @@ impl CalDavClient {
         calendar: Option<&str>,
         fields: &EventFields<'_>,
     ) -> Result<Event> {
+        check_structured(fields)?;
         let summary = fields
             .summary
             .ok_or_else(|| Error::Server("summary is required to create an event".into()))?;
@@ -1052,6 +1053,7 @@ impl CalDavClient {
         }
 
         let (start, end) = resolve_span(start_raw, fields, None)?;
+        check_rule(fields.recurrence, &start.spec(fields.tzid))?;
         let uid = uuid::Uuid::new_v4().to_string();
         let attendees = fields.attendees.unwrap_or(&[]).to_vec();
         let categories = fields.categories.unwrap_or(&[]).to_vec();
@@ -1112,6 +1114,7 @@ impl CalDavClient {
             .get_event(uid, calendar)
             .await?
             .ok_or_else(|| Error::EventNotFound(uid.to_string()))?;
+        check_structured(fields)?;
 
         let summary = fields
             .summary
@@ -1163,6 +1166,10 @@ impl CalDavClient {
             Some(_) => Vec::new(),
             None => ical::recur_extra_lines(existing.recur_source.as_deref()),
         };
+
+        // Only what the caller sent is checked. A stored rule is written back as
+        // the server holds it, or one odd event could never be edited again.
+        check_rule(fields.recurrence, &start.spec(tzid))?;
 
         let ics = ical::build_vcalendar(&VEventSpec {
             uid,
@@ -1570,6 +1577,58 @@ impl CalDavClient {
             }),
         }
     }
+}
+
+/// Refuse a line break in any caller-supplied value written outside a TEXT
+/// property. iCalendar escapes line breaks only in TEXT, so one anywhere else
+/// would end the property and let the rest of the value write properties, or
+/// whole components, of its own.
+fn check_structured(fields: &EventFields<'_>) -> Result<()> {
+    let attendees = fields.attendees.unwrap_or(&[]);
+    let values = [
+        ("url", fields.url),
+        ("status", fields.status),
+        ("tz", fields.tzid),
+        ("recurrence", fields.recurrence),
+    ]
+    .into_iter()
+    .chain(attendees.iter().flat_map(|a| {
+        [
+            ("attendee", Some(a.email.as_str())),
+            ("attendee name", a.name.as_deref()),
+            ("attendee role", a.role.as_deref()),
+            ("attendee status", a.status.as_deref()),
+        ]
+    }));
+    for (field, value) in values {
+        if value.is_some_and(|v| v.contains(['\r', '\n'])) {
+            return Err(Error::Server(format!(
+                "{field} cannot contain a line break"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a caller's RRULE that would not expand, before it is written. It is
+/// checked the way expansion will read it, against the `DTSTART` being written,
+/// so a rule accepted here is one that shows up.
+fn check_rule(rule: Option<&str>, start: &TimeSpec<'_>) -> Result<()> {
+    let Some(rule) = rule.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(());
+    };
+    recur::check_rule(&start.render("DTSTART"), rule).map_err(|reason| {
+        let hint = match reason.contains("`UNTIL`") {
+            true => {
+                " With a timed start, write UNTIL as a UTC time (UNTIL=20261231T235959Z); \
+                 with an all-day start, as a date (UNTIL=20261231)."
+            }
+            false => "",
+        };
+        Error::Server(format!(
+            "recurrence {rule:?} is not a rule this calendar can expand: {reason}.{hint}"
+        ))
+    })
 }
 
 /// A user-supplied time resolved to an instant plus its all-day-ness.
@@ -2414,6 +2473,58 @@ END:VCALENDAR
         assert!(!matches_query(&e, "unrelated"));
         // An empty needle matches everything.
         assert!(matches_query(&e, ""));
+    }
+
+    #[test]
+    fn a_line_break_in_a_structured_value_is_refused() {
+        let url = EventFields {
+            url: Some("https://x.test/\r\nBEGIN:VEVENT"),
+            ..Default::default()
+        };
+        assert!(
+            check_structured(&url)
+                .unwrap_err()
+                .to_string()
+                .contains("url")
+        );
+        let attendees = [Attendee {
+            email: "a@x.test".into(),
+            name: Some("Eve\nX".into()),
+            role: None,
+            status: None,
+        }];
+        let invite = EventFields {
+            attendees: Some(&attendees),
+            ..Default::default()
+        };
+        assert!(check_structured(&invite).is_err());
+        // TEXT values are escaped on the way out, so line breaks are theirs.
+        let text = EventFields {
+            description: Some("one\ntwo"),
+            ..Default::default()
+        };
+        assert!(check_structured(&text).is_ok());
+    }
+
+    #[test]
+    fn a_rule_that_would_not_expand_is_refused_with_the_fix() {
+        let timed = TimeSpec {
+            instant: Utc.with_ymd_and_hms(2026, 7, 6, 8, 0, 0).unwrap(),
+            all_day: false,
+            tzid: Some("Europe/London"),
+        };
+        assert!(check_rule(Some("FREQ=WEEKLY;BYDAY=MO"), &timed).is_ok());
+        assert!(check_rule(Some("FREQ=WEEKLY;UNTIL=20261231T235959Z"), &timed).is_ok());
+        let err = check_rule(Some("FREQ=WEEKLY;UNTIL=20261231"), &timed).unwrap_err();
+        assert!(err.to_string().contains("UNTIL=20261231T235959Z"), "{err}");
+        assert!(check_rule(Some("FREQ=FORTNIGHTLY"), &timed).is_err());
+
+        let all_day = TimeSpec {
+            all_day: true,
+            ..timed
+        };
+        assert!(check_rule(Some("FREQ=WEEKLY;UNTIL=20261231"), &all_day).is_ok());
+        assert!(check_rule(None, &timed).is_ok());
     }
 
     #[test]

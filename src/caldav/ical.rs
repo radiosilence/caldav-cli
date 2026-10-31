@@ -681,7 +681,7 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
         "PRODID:-//radiosilence//caldav//EN".to_string(),
         "CALSCALE:GREGORIAN".to_string(),
         "BEGIN:VEVENT".to_string(),
-        format!("UID:{}", spec.uid),
+        format!("UID:{}", one_line(spec.uid)),
         format!("DTSTAMP:{}", util::format_ical_utc(spec.stamp)),
         format!("SEQUENCE:{}", spec.sequence),
         spec.start.render("DTSTART"),
@@ -696,14 +696,17 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
         lines.push(format!("LOCATION:{}", escape_text(v)));
     }
     if let Some(v) = spec.url.filter(|s| !s.is_empty()) {
-        lines.push(format!("URL:{v}"));
+        lines.push(format!("URL:{}", one_line(v)));
     }
     if let Some(v) = spec.status.filter(|s| !s.is_empty()) {
-        lines.push(format!("STATUS:{}", v.to_ascii_uppercase()));
+        lines.push(format!("STATUS:{}", one_line(&v.to_ascii_uppercase())));
     }
     if let Some(v) = spec.recurrence.filter(|s| !s.is_empty()) {
         // RRULE is structured, not TEXT — it must not be escaped.
-        lines.push(format!("RRULE:{}", v.trim_start_matches("RRULE:")));
+        lines.push(format!(
+            "RRULE:{}",
+            one_line(v.trim_start_matches("RRULE:"))
+        ));
     }
     // Already complete content lines, straight off the wire — not escaped, and
     // only meaningful next to the RRULE they qualify.
@@ -734,16 +737,23 @@ fn render_participant(name: &str, p: &Attendee) -> String {
     let mut line = String::from(name);
     if let Some(cn) = p.name.as_deref().filter(|s| !s.is_empty()) {
         // CN is quoted so commas and colons in a display name stay in-parameter.
-        line.push_str(&format!(";CN=\"{}\"", cn.replace('"', "'")));
+        line.push_str(&format!(";CN=\"{}\"", one_line(&cn.replace('"', "'"))));
     }
     if let Some(role) = p.role.as_deref().filter(|s| !s.is_empty()) {
-        line.push_str(&format!(";ROLE={role}"));
+        line.push_str(&format!(";ROLE={}", one_line(role)));
     }
     if let Some(status) = p.status.as_deref().filter(|s| !s.is_empty()) {
-        line.push_str(&format!(";PARTSTAT={status}"));
+        line.push_str(&format!(";PARTSTAT={}", one_line(status)));
     }
-    line.push_str(&format!(":mailto:{}", p.email));
+    line.push_str(&format!(":mailto:{}", one_line(&p.email)));
     line
+}
+
+/// A value outside a TEXT property, with any line break removed. Callers'
+/// values are refused before this point; what reaches here with one came from a
+/// server, and a property must still end where it is meant to.
+fn one_line(value: &str) -> String {
+    value.replace(['\r', '\n'], "")
 }
 
 #[cfg(test)]
@@ -923,6 +933,49 @@ END:VCALENDAR\r\n";
     #[test]
     fn short_lines_are_not_folded() {
         assert_eq!(fold_line("UID:x"), "UID:x");
+    }
+
+    /// A line break that reached the builder in a structured value must not end
+    /// its property and start another.
+    #[test]
+    fn structured_values_stay_on_their_line() {
+        let stamp = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+        let at = TimeSpec {
+            instant: stamp,
+            all_day: false,
+            tzid: None,
+        };
+        let attendees = vec![Attendee {
+            email: "a@x.test\r\nBEGIN:VTODO".into(),
+            name: Some("Eve\nEND:VEVENT".into()),
+            role: None,
+            status: None,
+        }];
+        let ics = build_vcalendar(&VEventSpec {
+            uid: "u",
+            summary: "s",
+            start: TimeSpec { ..at },
+            end: TimeSpec { ..at },
+            description: None,
+            location: None,
+            url: Some("https://x.test/\r\nATTACH:evil"),
+            status: None,
+            recurrence: Some("FREQ=DAILY\nRDATE:20260101"),
+            recur_extra: &[],
+            attendees: &attendees,
+            organizer: None,
+            categories: &[],
+            sequence: 0,
+            stamp,
+        });
+        let names: Vec<&str> = ics.lines().map(line_name).collect();
+        for injected in ["BEGIN:VTODO", "ATTACH", "RDATE"] {
+            assert!(
+                !names.contains(&injected),
+                "{injected} became a property:\n{ics}"
+            );
+        }
+        assert_eq!(names.iter().filter(|n| **n == "END").count(), 2);
     }
 
     #[test]

@@ -243,6 +243,16 @@ pub fn expand_all(
 /// the last occurrence lands on. On a timed series a date `UNTIL` is invalid,
 /// and no single instant says "through the end of that day" in every zone, so it
 /// is left for rrule to refuse.
+/// Whether `rule` parses against `dtstart` (a full `DTSTART` content line) the
+/// way expansion will read it; the reason when it does not.
+pub fn check_rule(dtstart: &str, rule: &str) -> std::result::Result<(), String> {
+    let source = format!("{dtstart}\nRRULE:{}", rule.trim_start_matches("RRULE:"));
+    pin_dates_to_utc(&source)
+        .parse::<RRuleSet>()
+        .map(drop)
+        .map_err(|e| e.to_string().trim_end_matches('.').to_string())
+}
+
 fn pin_dates_to_utc(source: &str) -> String {
     let is_bare_date = |v: &str| v.len() == 8 && v.bytes().all(|b| b.is_ascii_digit());
     let all_day = source.lines().any(|line| {
