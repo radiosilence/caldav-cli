@@ -13,6 +13,7 @@
 
 use std::borrow::Borrow;
 use std::cell::OnceCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_graphql::{Enum, InputObject};
 
@@ -41,7 +42,8 @@ impl GqlEventStatus {
 ///
 /// Scalar fields on one filter object are AND-ed together; `and` / `or` / `not`
 /// take further filters and nest arbitrarily, so "anything with Alice on it that
-/// isn't a declined standup" is one filter rather than three queries.
+/// isn't a declined standup" is one filter rather than three queries. One filter
+/// holds at most 1,000 nested filters, itself included, and one request 10,000.
 ///
 /// All text matching is case-insensitive substring matching.
 #[derive(InputObject, Default, Clone, Debug)]
@@ -77,10 +79,20 @@ pub struct EventFilter {
     pub not: Option<Vec<EventFilter>>,
 }
 
-/// Most nodes one filter may have, counting every nested `and`/`or`/`not`
-/// entry. Matching costs a pass over every event per node, so this bounds a
-/// request's filtering work; real filters have a handful.
+/// Most nested filters one filter may hold, counting itself and every
+/// `and`/`or`/`not` entry at any depth. Matching costs a pass over every event
+/// per filter, so this bounds the work one filter can ask for; real filters
+/// have a handful.
 pub const MAX_FILTER_NODES: usize = 1000;
+
+/// Most nested filters one request may prepare in all, so a filter repeated
+/// under every event of a page (`conflicts`, `occurrences`) or across aliases
+/// cannot multiply past the single-filter cap.
+const MAX_REQUEST_FILTER_NODES: usize = 10 * MAX_FILTER_NODES;
+
+/// What a request has left of [`MAX_REQUEST_FILTER_NODES`].
+#[derive(Default)]
+pub struct FilterBudget(AtomicUsize);
 
 /// An [`EventFilter`] ready to run: needles lowercased once, and its size
 /// checked against [`MAX_FILTER_NODES`].
@@ -102,26 +114,53 @@ pub struct PreparedFilter {
 }
 
 impl EventFilter {
-    /// Lower every needle once and refuse a filter past [`MAX_FILTER_NODES`].
-    pub fn prepare(&self) -> async_graphql::Result<PreparedFilter> {
+    /// Count this filter's nodes against [`MAX_FILTER_NODES`] and the request's
+    /// `budget`, then lower every needle once. Nothing is lowered or copied for
+    /// a filter that is refused.
+    pub fn prepare(&self, budget: Option<&FilterBudget>) -> async_graphql::Result<PreparedFilter> {
         let mut left = MAX_FILTER_NODES;
-        self.prepare_within(&mut left).ok_or_else(|| {
-            async_graphql::Error::new(format!(
-                "filter has more than {MAX_FILTER_NODES} parts; combine conditions or split the query"
-            ))
-        })
+        if !self.count_within(&mut left) {
+            return Err(async_graphql::Error::new(format!(
+                "filter has more than {MAX_FILTER_NODES} nested filters; combine conditions or \
+                 split the query"
+            )));
+        }
+        let nodes = MAX_FILTER_NODES - left;
+        if let Some(budget) = budget {
+            budget
+                .0
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    used.checked_add(nodes)
+                        .filter(|total| *total <= MAX_REQUEST_FILTER_NODES)
+                })
+                .map_err(|_| {
+                    async_graphql::Error::new(format!(
+                        "filters in this request hold more than {MAX_REQUEST_FILTER_NODES} nested \
+                         filters in all; filter fewer fields or page smaller"
+                    ))
+                })?;
+        }
+        Ok(self.lowered())
     }
 
-    fn prepare_within(&self, left: &mut usize) -> Option<PreparedFilter> {
-        *left = left.checked_sub(1)?;
-        let lower = |s: &Option<String>| s.as_deref().map(str::to_lowercase);
-        let nested = |list: &Option<Vec<EventFilter>>, left: &mut usize| {
-            list.iter()
-                .flatten()
-                .map(|f| f.prepare_within(left))
-                .collect::<Option<Vec<_>>>()
+    fn count_within(&self, left: &mut usize) -> bool {
+        let Some(rest) = left.checked_sub(1) else {
+            return false;
         };
-        Some(PreparedFilter {
+        *left = rest;
+        [&self.and, &self.or, &self.not]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .all(|f| f.count_within(left))
+    }
+
+    fn lowered(&self) -> PreparedFilter {
+        let lower = |s: &Option<String>| s.as_deref().map(str::to_lowercase);
+        let nested = |list: &Option<Vec<EventFilter>>| {
+            list.iter().flatten().map(EventFilter::lowered).collect()
+        };
+        PreparedFilter {
             text: lower(&self.text),
             summary: lower(&self.summary),
             description: lower(&self.description),
@@ -133,15 +172,15 @@ impl EventFilter {
             all_day: self.all_day,
             recurring: self.recurring,
             has_attendees: self.has_attendees,
-            and: nested(&self.and, left)?,
-            or: nested(&self.or, left)?,
-            not: nested(&self.not, left)?,
-        })
+            and: nested(&self.and),
+            or: nested(&self.or),
+            not: nested(&self.not),
+        }
     }
 
     #[cfg(test)]
     fn matches(&self, event: &Event) -> bool {
-        self.prepare().unwrap().matches(event)
+        self.prepare(None).unwrap().matches(event)
     }
 }
 
@@ -345,8 +384,33 @@ pub fn sort_events<E: Borrow<Event>>(events: &mut [E], sort: Option<&[EventSort]
         return;
     };
 
-    // Each event's key is built once, so a text sort lowers each title once
-    // rather than twice per comparison.
+    // A text sort builds each event's key once, so each title is lowered once
+    // rather than twice per comparison. Other sorts compare in place.
+    if !sort
+        .iter()
+        .any(|level| level.property == SortProperty::Summary)
+    {
+        events.sort_by(|a, b| {
+            let (a, b) = (a.borrow(), b.borrow());
+            sort.iter()
+                .map(|level| {
+                    let ordering = match level.property {
+                        SortProperty::Start => a.start.sort_key().cmp(&b.start.sort_key()),
+                        SortProperty::End => a.end.sort_key().cmp(&b.end.sort_key()),
+                        SortProperty::Created => a.created.cmp(&b.created),
+                        SortProperty::LastModified => a.last_modified.cmp(&b.last_modified),
+                        SortProperty::Summary => std::cmp::Ordering::Equal,
+                    };
+                    match level.ascending.unwrap_or(true) {
+                        true => ordering,
+                        false => ordering.reverse(),
+                    }
+                })
+                .find(|ordering| ordering.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        return;
+    }
     events.sort_by_cached_key(|e| {
         let e = e.borrow();
         sort.iter()
@@ -387,6 +451,7 @@ enum Directed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{Attendee, EventTime};
 
     #[test]
     fn a_filter_past_the_node_cap_is_refused() {
@@ -400,10 +465,15 @@ mod tests {
         };
         // The root counts as one node. Depth is bounded by the parser's
         // recursion limit, so breadth is what the cap is for.
-        assert!(wide(MAX_FILTER_NODES - 1).prepare().is_ok());
-        assert!(wide(MAX_FILTER_NODES).prepare().is_err());
+        assert!(wide(MAX_FILTER_NODES - 1).prepare(None).is_ok());
+        assert!(wide(MAX_FILTER_NODES).prepare(None).is_err());
+        // Nested lists draw on the same count as their parent's.
+        let nested = EventFilter {
+            and: Some(vec![wide(MAX_FILTER_NODES / 2), wide(MAX_FILTER_NODES / 2)]),
+            ..Default::default()
+        };
+        assert!(nested.prepare(None).is_err());
     }
-    use crate::models::{Attendee, EventTime};
 
     fn event(summary: &str) -> Event {
         Event {

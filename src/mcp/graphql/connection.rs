@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_graphql::connection::{Connection, Edge};
 use async_graphql::{Context, OutputType, Result, SimpleObject};
 
-use super::filter::{EventFilter, EventSort, sort_events};
+use super::filter::{EventFilter, EventSort, FilterBudget, PreparedFilter, sort_events};
 use super::loaders::{EventWindows, Window, to_gql_error};
 use super::types::{GqlEvent, all_calendars, clamp_page};
 use crate::caldav::resolve_calendar;
@@ -181,12 +181,11 @@ pub fn paginate<T: OutputType>(
 pub fn events_connection_of<E: Borrow<Event>>(
     mut events: Vec<E>,
     args: PageArgs,
-    filter: Option<&EventFilter>,
+    filter: Option<&PreparedFilter>,
     sort: Option<&[EventSort]>,
     calendars_queried: u64,
 ) -> Result<EventConnection> {
     if let Some(filter) = filter {
-        let filter = filter.prepare()?;
         events.retain(|e| filter.matches(e.borrow()));
     }
     sort_events(&mut events, sort);
@@ -279,12 +278,24 @@ pub fn wants_events(ctx: &Context<'_>) -> bool {
         .any(|field| ctx.look_ahead().field(field).exists())
 }
 
+/// Check and prepare a field's filter before anything is fetched for it, so a
+/// filter that will be refused costs no requests, whichever fields are selected.
+pub fn prepare_filter(
+    ctx: &Context<'_>,
+    filter: Option<&EventFilter>,
+) -> Result<Option<PreparedFilter>> {
+    filter
+        .map(|f| f.prepare(ctx.data_opt::<FilterBudget>()))
+        .transpose()
+}
+
 /// Fetch a time range and build the connection.
 pub async fn events_connection(
     ctx: &Context<'_>,
     args: PageArgs,
     query: EventQuery,
 ) -> Result<EventConnection> {
+    let filter = prepare_filter(ctx, query.filter.as_ref())?;
     let targets = read_targets(ctx, query.calendar.as_deref()).await?;
 
     if !wants_events(ctx) {
@@ -296,7 +307,7 @@ pub async fn events_connection(
     events_connection_of(
         loaded.iter().flat_map(|events| events.iter()).collect(),
         args,
-        query.filter.as_ref(),
+        filter.as_ref(),
         query.sort.as_deref(),
         targets.len() as u64,
     )
