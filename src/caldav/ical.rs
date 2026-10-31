@@ -199,14 +199,15 @@ pub fn parse_duration(value: &str) -> Option<Duration> {
             unit => {
                 let n: i64 = digits.parse().ok()?;
                 digits.clear();
-                total += match (unit, in_time) {
-                    ('W', _) => Duration::weeks(n),
-                    ('D', _) => Duration::days(n),
-                    ('H', true) => Duration::hours(n),
-                    ('M', true) => Duration::minutes(n),
-                    ('S', true) => Duration::seconds(n),
+                let part = match (unit, in_time) {
+                    ('W', _) => Duration::try_weeks(n),
+                    ('D', _) => Duration::try_days(n),
+                    ('H', true) => Duration::try_hours(n),
+                    ('M', true) => Duration::try_minutes(n),
+                    ('S', true) => Duration::try_seconds(n),
                     _ => return None,
                 };
+                total = total.checked_add(&part?)?;
                 saw_unit = true;
             }
         }
@@ -215,7 +216,7 @@ pub fn parse_duration(value: &str) -> Option<Duration> {
     if !digits.is_empty() || !saw_unit {
         return None;
     }
-    Some(total * sign)
+    total.checked_mul(sign)
 }
 
 /// Interpret a DATE / DATE-TIME property value with its parameters.
@@ -485,7 +486,7 @@ fn build_event(
 
 /// Build the implied DTEND from DTSTART plus a span.
 fn derive_end(start: &EventTime, span: Duration) -> EventTime {
-    let Some(instant) = start.instant.map(|i| i + span) else {
+    let Some(instant) = start.instant.and_then(|i| i.checked_add_signed(span)) else {
         return start.clone();
     };
     EventTime {
@@ -523,7 +524,7 @@ pub fn parse_freebusy(ics: &str) -> Vec<BusyPeriod> {
                 continue;
             };
             let end = parse_utc_stamp(end_raw)
-                .or_else(|| parse_duration(end_raw).map(|d| start + d))
+                .or_else(|| parse_duration(end_raw).and_then(|d| start.checked_add_signed(d)))
                 .unwrap_or(start);
             out.push(BusyPeriod {
                 start: util::format_rfc3339(start),
@@ -898,6 +899,23 @@ END:VCALENDAR\r\n";
         assert_eq!(parse_duration("PT"), None);
         assert_eq!(parse_duration("P1"), None);
         assert_eq!(parse_duration("garbage"), None);
+        assert_eq!(parse_duration("P99999999999999W"), None);
+        assert_eq!(
+            parse_duration("P9223372036854775807DT9223372036854775807H"),
+            None
+        );
+    }
+
+    /// A server's DURATION is untrusted; one too long to add must not panic the
+    /// read of every event in its calendar.
+    #[test]
+    fn an_unrepresentable_duration_ends_the_event_where_it_starts() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nSUMMARY:x\r\n\
+DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let event = parse_one(ics);
+        assert_eq!(event.end.instant, event.start.instant);
+        let busy = "BEGIN:VFREEBUSY\r\nFREEBUSY:20260724T090000Z/P100000000D\r\nEND:VFREEBUSY\r\n";
+        assert_eq!(parse_freebusy(busy)[0].end, "2026-07-24T09:00:00Z");
     }
 
     #[test]

@@ -55,6 +55,23 @@ pub enum Error {
     #[error("{url} answered with more than {limit_mib} MiB, the most this client reads")]
     ResponseTooLarge { url: String, limit_mib: usize },
 
+    /// Raised instead of truncating, so a partial expansion is never mistaken
+    /// for the whole window.
+    #[error(
+        "the window holds more than {0} occurrences of recurring events; narrow the \
+         window, name a calendar, or read without expanding recurrences"
+    )]
+    TooManyOccurrences(usize),
+
+    /// Names the series that cost the most, since that is the one to delete or
+    /// read unexpanded.
+    #[error(
+        "recurring events in this read take too many steps to expand, most of all \
+         {summary:?} ({uid}); read without expanding recurrences, narrow the window, \
+         or delete that series"
+    )]
+    ExpansionTooCostly { uid: String, summary: String },
+
     #[error("Server error: {0}")]
     Server(String),
 }
