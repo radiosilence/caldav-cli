@@ -273,7 +273,7 @@ fn conflict_window(event: &Event) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         .succ_opt()?
         .and_hms_opt(0, 0, 0)?
         .and_utc()
-        .max(floor + Duration::days(1));
+        .max(floor.checked_add_signed(Duration::days(1))?);
     Some((floor, ceil))
 }
 
