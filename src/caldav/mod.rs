@@ -9,6 +9,8 @@
 pub mod ical;
 pub mod recur;
 
+use std::sync::LazyLock;
+
 use chrono::{DateTime, Duration, Utc};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
@@ -133,6 +135,20 @@ pub(crate) async fn fan_out<F: std::future::Future>(tasks: Vec<F>) -> Vec<F::Out
         .await
 }
 
+/// One HTTP client for the process. Authentication is per request and there is
+/// no cookie store, so accounts can share it, and with it one connection pool
+/// and one TLS configuration rather than a copy of each per account.
+static HTTP: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        // iCloud rejects requests with no User-Agent outright (403), and
+        // reqwest sends none by default. Identifying ourselves is also just
+        // good manners toward the servers we talk to.
+        .user_agent(concat!("caldav/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("the HTTP client is built from fixed settings")
+});
+
 pub struct CalDavClient {
     client: Client,
     base: String,
@@ -145,16 +161,8 @@ pub struct CalDavClient {
 
 impl CalDavClient {
     pub fn new(base: String, username: String, password: String) -> Self {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            // iCloud rejects requests with no User-Agent outright (403), and
-            // reqwest sends none by default. Identifying ourselves is also
-            // just good manners toward the servers we talk to.
-            .user_agent(concat!("caldav/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .unwrap_or_default();
         Self {
-            client,
+            client: HTTP.clone(),
             base: base.trim_end_matches('/').to_string(),
             username,
             password,
@@ -380,6 +388,11 @@ impl CalDavClient {
     /// of an event's attendee list.
     pub fn username(&self) -> &str {
         &self.username
+    }
+
+    /// Whether discovery has succeeded, which only an authenticated request can.
+    pub fn has_authenticated(&self) -> bool {
+        self.home.initialized()
     }
 
     /// The CalDAV base URL this client authenticates against.
