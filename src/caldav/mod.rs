@@ -1249,6 +1249,15 @@ impl CalDavClient {
                 target.name
             )));
         }
+        // A move deletes from the source. Refused up front, since the copy
+        // fallback would otherwise write the event and then fail to remove it.
+        let source = self.find_calendar(Some(&existing.calendar_href)).await?;
+        if source.read_only {
+            return Err(Error::Server(format!(
+                "calendar '{}' is read-only, so the event cannot be moved out of it",
+                source.name
+            )));
+        }
 
         let file = util::last_segment(&existing.href);
         let dest_url = format!("{}{}", ensure_trailing_slash(&target.url), file);
@@ -1268,32 +1277,29 @@ impl CalDavClient {
 
         match moved {
             Ok(response) if response.status().is_success() => {}
-            // A refusal here is the server saying it doesn't implement MOVE
-            // across collections; a 412 is it saying something is already there,
-            // which copying would hit too.
+            // Something is already there, which copying would hit too.
             Ok(response) if response.status().as_u16() == 412 => {
                 return Err(Error::Server(format!(
                     "something already exists at {dest_url} — the event was not moved"
                 )));
             }
-            // The statuses a server answers when it does not do MOVE across
-            // collections. Anything else is a real failure, and copying would
-            // only meet it again, or worse, half succeed.
-            Ok(response) if matches!(response.status().as_u16(), 403 | 405 | 501 | 502) => {
+            Ok(response) if refuses_move(response.status().as_u16()) => {
                 let status = response.status().as_u16();
                 debug!(status, "MOVE refused, falling back to copy and delete");
                 self.copy_then_delete(&source_url, &dest_url, existing.etag.as_deref())
                     .await?;
             }
             Ok(response) => {
-                return Err(match response.status().as_u16() {
+                let status = response.status().as_u16();
+                let body = error_body(response).await;
+                return Err(match status {
                     401 => Error::InvalidCredentials("server rejected the username/app password"),
                     429 => Error::RateLimited,
                     status => Error::Dav {
                         method: "MOVE".into(),
                         url: source_url,
                         status,
-                        body: error_body(response).await,
+                        body,
                     },
                 });
             }
@@ -1734,17 +1740,31 @@ fn check_rule(rule: Option<&str>, start: &TimeSpec<'_>) -> Result<()> {
 /// Whether a failed `<expand>` query is worth asking again without it.
 ///
 /// Servers refuse `<expand>` in ways nobody has catalogued, so this names what
-/// is not a refusal rather than what is. A rate limit fails the same way twice,
-/// and a timeout or a refused connection would double the wait for the same
-/// answer. A 403 arrives as [`Error::InvalidCredentials`] but is retried: by
-/// now discovery has authenticated, so it is a refusal of `<expand>`. A
-/// response too large is retried too: unexpanded, it holds one master per
-/// series rather than one event per occurrence.
+/// is not a refusal rather than what is: a transport failure, a rate limit, a
+/// missing collection, and a server or gateway that is down or timing out all
+/// answer the same way twice, and asking again doubles the wait. A 403 arrives
+/// as [`Error::InvalidCredentials`] but is retried: by now discovery has
+/// authenticated, so it is most likely a refusal of `<expand>`. A response too
+/// large is retried too: unexpanded, it holds one master per series rather than
+/// one event per occurrence.
 fn worth_retrying_unexpanded(error: &Error) -> bool {
     match error {
-        Error::RateLimited => false,
-        Error::Http(e) => !(e.is_timeout() || e.is_connect()),
+        Error::RateLimited | Error::Http(_) => false,
+        Error::Dav { status, .. } => !matches!(status, 404 | 408 | 503 | 504),
         _ => true,
+    }
+}
+
+/// Whether a MOVE status says the server will not move across collections,
+/// which copying and deleting can do instead. Named by exclusion for the same
+/// reason as [`worth_retrying_unexpanded`]: credentials, a missing source, an
+/// existing destination, a lock and a rate limit would fail the copy too, and a
+/// server error may have moved the event already.
+fn refuses_move(status: u16) -> bool {
+    match status {
+        401 | 404 | 408 | 412 | 423 | 429 => false,
+        400..=499 | 501 => true,
+        _ => false,
     }
 }
 

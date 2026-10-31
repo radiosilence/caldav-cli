@@ -319,6 +319,31 @@ async fn an_expanded_query_is_not_retried_after_a_rate_limit() {
     );
 }
 
+/// A server that is down or timing out answers the same without <expand>.
+#[tokio::test]
+async fn an_expanded_query_is_not_retried_when_the_server_is_down() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("REPORT"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let calendars = client(&server).list_calendars().await.unwrap();
+    let (start, end) = window();
+    let _ = client(&server)
+        .list_events(&calendars[0], start, end, true, &Default::default())
+        .await;
+    let reports = server.received_requests().await.unwrap();
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|r| r.method.as_str() == "REPORT")
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn one_failing_calendar_does_not_sink_the_whole_range() {
     let server = MockServer::start().await;
@@ -1458,6 +1483,46 @@ async fn a_failed_move_is_not_retried_as_a_copy() {
     assert!(err.contains("500"), "{err}");
     let requests = server.received_requests().await.unwrap();
     assert!(!requests.iter().any(|r| r.method.as_str() == "PUT"));
+}
+
+/// What a MOVE status means for the fallback, as each kind of server answers.
+#[tokio::test]
+async fn move_statuses_fall_back_only_for_a_refusal() {
+    for (status, copies) in [
+        (403, true),
+        (405, true),
+        (409, true),
+        (404, false),
+        (502, false),
+    ] {
+        let server = MockServer::start().await;
+        mount_for_move(&server).await;
+        Mock::given(method("MOVE"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(STANDUP_ICS))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let moved = client(&server).move_event("evt-1", None, "Work").await;
+        let requests = server.received_requests().await.unwrap();
+        let put = requests.iter().any(|r| r.method.as_str() == "PUT");
+        assert_eq!(
+            (moved.is_ok(), put),
+            (copies, copies),
+            "MOVE answered {status}"
+        );
+    }
 }
 
 #[tokio::test]
