@@ -668,18 +668,8 @@ impl CalDavClient {
     #[instrument(skip(self))]
     pub async fn delete_calendar(&self, calendar: &str) -> Result<Calendar> {
         let existing = self.find_calendar(Some(calendar)).await?;
-        if existing.read_only {
-            return Err(Error::Server(format!(
-                "calendar '{}' is read-only",
-                existing.name
-            )));
-        }
-        if existing.is_default {
-            return Err(Error::Server(format!(
-                "calendar '{}' is the account's default calendar — point the default \
-                 at another calendar first",
-                existing.name
-            )));
+        if let Some(refusal) = deletion_refused(&existing) {
+            return Err(refusal);
         }
         debug!(url = %existing.url, "deleting calendar");
         let request = self
@@ -2297,6 +2287,27 @@ fn first_href_under(xml: &str, ns: &str, prop: &str) -> Option<String> {
 /// skipped — some servers keep pointing at a calendar the user has since lost
 /// write access to — as is a task-only collection, which would swallow the
 /// event somewhere no calendar app shows it.
+/// Why `calendar` cannot be deleted, if it cannot: a read-only calendar, or the
+/// account's default, which new events would otherwise have nowhere to go.
+/// Shared by the delete and its preview, so the preview never offers what the
+/// delete would refuse.
+pub fn deletion_refused(calendar: &Calendar) -> Option<Error> {
+    if calendar.read_only {
+        return Some(Error::Server(format!(
+            "calendar '{}' is read-only",
+            calendar.name
+        )));
+    }
+    if calendar.is_default {
+        return Some(Error::Server(format!(
+            "calendar '{}' is the account's default calendar — point the default \
+             at another calendar first",
+            calendar.name
+        )));
+    }
+    None
+}
+
 /// Match a calendar in an already-fetched listing, by id, display name, or
 /// href. Split out from [`CalDavClient::find_calendar`] so the GraphQL layer can
 /// resolve names against its own per-request listing rather than the client's

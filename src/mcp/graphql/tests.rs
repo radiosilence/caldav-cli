@@ -1252,6 +1252,47 @@ async fn an_unknown_calendar_fails_the_preview_instead_of_issuing_a_token() {
     assert_eq!(data["deleteCalendar"]["success"], false);
     assert!(data["deleteCalendar"]["confirmationToken"].is_null());
 }
+
+/// The preview refuses what the delete would, so the user is never asked to
+/// approve a deletion that then fails.
+#[tokio::test]
+async fn a_calendar_the_delete_would_refuse_fails_the_preview() {
+    let h = Harness::start().await;
+    let read_only = h
+        .run(r#"mutation { deleteCalendar(action: PREVIEW, id: "team") { success error confirmationToken } }"#)
+        .await;
+    assert_eq!(read_only["deleteCalendar"]["success"], false);
+    assert!(
+        read_only["deleteCalendar"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("read-only")
+    );
+    assert!(read_only["deleteCalendar"]["confirmationToken"].is_null());
+
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ok(CALENDARS_XML.replace(
+            "</multistatus>",
+            "<response><href>/1234/calendars/inbox/</href><propstat><prop>\
+             <resourcetype><collection/><c:schedule-inbox/></resourcetype>\
+             <c:schedule-default-calendar-URL><href>/1234/calendars/home/</href>\
+             </c:schedule-default-calendar-URL></prop></propstat></response></multistatus>",
+        )))
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    let default = h
+        .run(r#"mutation { deleteCalendar(action: PREVIEW, id: "home") { success error } }"#)
+        .await;
+    assert_eq!(default["deleteCalendar"]["success"], false);
+    assert!(
+        default["deleteCalendar"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("default")
+    );
+}
 /// `calendar` with no id is documented as "where a new event lands if you
 /// don't say otherwise" — so it has to apply the same fallback `createEvent`
 /// does. It didn't, and answered the account's default while a create with the

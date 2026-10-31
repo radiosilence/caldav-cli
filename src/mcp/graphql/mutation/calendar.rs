@@ -11,6 +11,7 @@ use async_graphql::{Context, Object, Result};
 use super::super::connection::WRITE_COST;
 use super::super::types::*;
 use super::super::{SharedClient, types};
+use crate::caldav::MAX_EVENTS;
 use crate::models::CalendarFields;
 
 #[derive(Default)]
@@ -166,11 +167,15 @@ impl CalendarMutation {
         let parts = [id.as_str()];
 
         if action == WriteAction::Preview {
-            let calendars = types::all_calendars(ctx).await?;
+            // With the default resolved: the delete refuses the default.
+            let calendars = types::calendars_with_default(ctx).await?;
             let existing = match crate::caldav::resolve_calendar(&calendars, Some(&id)) {
                 Ok(c) => c,
                 Err(e) => return Ok(GqlCalendarResult::failed(e.to_string())),
             };
+            if let Some(refusal) = crate::caldav::deletion_refused(&existing) {
+                return Ok(GqlCalendarResult::failed(refusal.to_string()));
+            }
             // Counting is a year-wide read, paid only on the preview. A bare
             // "this deletes the calendar" tells the user nothing about the
             // scale of what they are agreeing to.
@@ -180,11 +185,15 @@ impl CalendarMutation {
             }
             .resolve()?;
             let events = client
-                .events_in_range(Some(&existing.id), year.0, year.1, false, 500)
+                .events_in_range(Some(&existing.id), year.0, year.1, false, MAX_EVENTS)
                 .await
                 .map(|e| e.len());
             let scale = match events {
                 Ok(0) => "It holds no events in the coming year.".to_string(),
+                // The read stops at the cap, so a full one is a floor.
+                Ok(n) if n >= MAX_EVENTS => {
+                    format!("It holds {n} or more events in the coming year, and any older ones.")
+                }
                 Ok(n) => format!("It holds {n} event(s) in the coming year, and any older ones."),
                 // The count is a courtesy; failing it must not block the preview.
                 Err(_) => "Its contents could not be counted.".to_string(),

@@ -16,7 +16,9 @@ use super::connection::{
     load_windows, page_complexity, prepare_filter, read_targets, wants_events,
 };
 use super::filter::{EventFilter, EventSort};
-use super::loaders::{Calendars, EventResources, Resource, to_gql_error};
+use super::loaders::{
+    Calendars, EventResources, EventUids, EventWindows, Resource, Uid, Window, to_gql_error,
+};
 use crate::caldav::recur;
 use crate::commands::RangeArgs;
 use crate::models::{Attendee, BusyPeriod, Calendar, Event, EventTime};
@@ -47,6 +49,16 @@ pub(crate) async fn all_calendars(ctx: &Context<'_>) -> Result<std::sync::Arc<Ve
 /// the same tick as every other field and shares its one fetch.
 #[derive(Default)]
 pub struct DefaultListing(tokio::sync::Mutex<Option<std::sync::Arc<Vec<Calendar>>>>);
+
+/// Forget the request's cached event reads after an event write, so a later
+/// field in the same request (a window read under the written event, say)
+/// sees the write.
+pub(crate) fn events_changed(ctx: &Context<'_>) -> Result<()> {
+    ctx.data::<EventWindows>()?.clear::<Window>();
+    ctx.data::<EventResources>()?.clear::<Resource>();
+    ctx.data::<EventUids>()?.clear::<Uid>();
+    Ok(())
+}
 
 /// Forget the request's calendar listing, and the default resolved from it,
 /// after a write that may have changed either, so later fields in the same
