@@ -611,7 +611,7 @@ async fn a_stale_cursor_says_how_to_recover() {
     assert!(err.contains("Restart pagination"), "{err}");
 }
 
-/// Once a panic that left the caller waiting on a request that never answered.
+/// A window past year 9999 is a field error, not a panic.
 #[tokio::test]
 async fn a_window_past_the_calendar_is_an_error() {
     let h = Harness::start().await;
