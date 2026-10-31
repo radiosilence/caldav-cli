@@ -124,7 +124,11 @@ impl Loader<Window> for EventWindowLoader {
                 Ok(events) => {
                     out.insert(key, Ok(Arc::new(events)));
                 }
-                Err(e @ (Error::TooManyOccurrences(_) | Error::ExpansionTooCostly { .. })) => {
+                Err(
+                    e @ (Error::TooManyOccurrences(_)
+                    | Error::ExpansionTooCostly { .. }
+                    | Error::ResponseTooLarge { .. }),
+                ) => {
                     out.insert(key, Err(Arc::new(e)));
                 }
                 // One unreadable calendar (shared, or a server hiccup) shouldn't

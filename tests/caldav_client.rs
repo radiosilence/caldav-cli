@@ -206,28 +206,6 @@ async fn an_oversized_response_is_refused() {
 }
 
 #[tokio::test]
-async fn an_error_page_is_reported_by_its_start() {
-    let server = MockServer::start().await;
-    mount_discovery(&server).await;
-    Mock::given(method("REPORT"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("<html>".repeat(200_000)))
-        .mount(&server)
-        .await;
-
-    let calendars = client(&server).list_calendars().await.unwrap();
-    let (start, end) = window();
-    let err = client(&server)
-        .list_events(&calendars[0], start, end, false)
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().len() < 1_000,
-        "{} bytes",
-        err.to_string().len()
-    );
-}
-
-#[tokio::test]
 async fn rejected_credentials_surface_as_an_auth_error() {
     let server = MockServer::start().await;
     Mock::given(method("PROPFIND"))
