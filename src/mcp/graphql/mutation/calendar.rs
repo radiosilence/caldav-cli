@@ -121,19 +121,14 @@ impl CalendarMutation {
                 Ok(c) => c,
                 Err(e) => return Ok(GqlCalendarResult::failed(e.to_string())),
             };
-            let token = issue_nonce(nonce_store, &account(client), &parts).await;
+            let token = issue_nonce(nonce_store, client, &parts).await;
             return Ok(GqlCalendarResult::pending(
                 preview_update(&existing, &fields),
                 token,
             ));
         }
-        if let Err(msg) = consume_nonce(
-            nonce_store,
-            &account(client),
-            confirmation_token.as_deref(),
-            &parts,
-        )
-        .await
+        if let Err(msg) =
+            consume_nonce(nonce_store, client, confirmation_token.as_deref(), &parts).await
         {
             return Ok(GqlCalendarResult::failed(msg));
         }
@@ -187,7 +182,7 @@ impl CalendarMutation {
                 Err(_) => "Its contents could not be counted.".to_string(),
             };
 
-            let token = issue_nonce(nonce_store, &account(client), &parts).await;
+            let token = issue_nonce(nonce_store, client, &parts).await;
             return Ok(GqlCalendarResult::pending(
                 format!(
                     "Delete calendar: {} ({})\n{scale}\nEvery event in it is deleted too. \
@@ -197,13 +192,8 @@ impl CalendarMutation {
                 token,
             ));
         }
-        if let Err(msg) = consume_nonce(
-            nonce_store,
-            &account(client),
-            confirmation_token.as_deref(),
-            &parts,
-        )
-        .await
+        if let Err(msg) =
+            consume_nonce(nonce_store, client, confirmation_token.as_deref(), &parts).await
         {
             return Ok(GqlCalendarResult::failed(msg));
         }
