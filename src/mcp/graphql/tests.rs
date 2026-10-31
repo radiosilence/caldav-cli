@@ -711,6 +711,40 @@ async fn the_documented_queries_fit_the_limits() {
     }
 }
 
+/// What one request learns about the server, a later request for the same
+/// account keeps: a refused UID filter is not offered again.
+#[tokio::test]
+async fn a_refused_uid_filter_is_remembered_across_requests() {
+    let h = Harness::start().await;
+    Mock::given(method("REPORT"))
+        .and(wiremock::matchers::body_string_contains("prop-filter"))
+        .respond_with(ResponseTemplate::new(412))
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    let client = h.client();
+    let schema = build_schema();
+    let filters = || async {
+        h.server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("prop-filter"))
+            .count()
+    };
+    let lookup = r#"{ event(id: "absent", calendar: "Home") { id } }"#;
+    schema.execute(request(lookup, client.clone(), None)).await;
+    let after_first = filters().await;
+    schema.execute(request(lookup, client, None)).await;
+    assert_eq!(after_first, 1);
+    assert_eq!(
+        filters().await,
+        after_first,
+        "the second request scanned directly"
+    );
+}
+
 #[tokio::test]
 async fn first_and_last_together_are_rejected() {
     let h = Harness::start().await;
