@@ -188,7 +188,6 @@ impl CalDavClient {
 
         let response = req.send().await?;
         let status = response.status();
-        let text = response.text().await?;
         debug!(%method, %url, %status, "CalDAV response");
 
         match status.as_u16() {
@@ -196,14 +195,12 @@ impl CalDavClient {
                 "server rejected the username/app password",
             )),
             429 => Err(Error::RateLimited),
-            code if status.is_success() || code == 207 => Ok(text),
+            code if status.is_success() || code == 207 => read_body(response, url).await,
             code => Err(Error::Dav {
                 method: method.to_string(),
                 url: url.to_string(),
                 status: code,
-                // Bodies can be long HTML error pages; a prefix is enough to
-                // diagnose without flooding output.
-                body: truncate(&text, 400),
+                body: error_body(response).await,
             }),
         }
     }
@@ -1340,18 +1337,17 @@ impl CalDavClient {
             .send()
             .await?;
         let status = response.status();
-        let text = response.text().await?;
         match status.as_u16() {
             401 | 403 => Err(Error::InvalidCredentials(
                 "server rejected the username/app password",
             )),
             429 => Err(Error::RateLimited),
-            _ if status.is_success() => Ok(text),
+            _ if status.is_success() => read_body(response, url).await,
             code => Err(Error::Dav {
                 method: "GET".into(),
                 url: url.to_string(),
                 status: code,
-                body: truncate(&text, 400),
+                body: error_body(response).await,
             }),
         }
     }
@@ -1552,7 +1548,6 @@ impl CalDavClient {
         if status.is_success() {
             return Ok(());
         }
-        let text = response.text().await.unwrap_or_default();
         match status.as_u16() {
             401 | 403 => Err(Error::InvalidCredentials(
                 "server rejected the username/app password",
@@ -1565,10 +1560,67 @@ impl CalDavClient {
                 method: method.to_string(),
                 url: url.to_string(),
                 status: code,
-                body: truncate(&text, 400),
+                body: error_body(response).await,
             }),
         }
     }
+}
+
+/// The most of a successful response this client reads. Every body is held
+/// whole while it is parsed, and a peak read holds it several times over (the
+/// bytes, the text, the XML tree, the events), so this bounds what one server
+/// can make the process allocate. A multistatus runs to a few KB per event, so
+/// it still fits a collection of over ten thousand.
+const MAX_BODY: usize = 32 * 1024 * 1024;
+
+/// The most of an error response read, of which [`truncate`] keeps a prefix.
+const MAX_ERROR_BODY: usize = 4 * 1024;
+
+/// A successful response's body, refused rather than read past [`MAX_BODY`].
+async fn read_body(response: reqwest::Response, url: &str) -> Result<String> {
+    let too_large = || Error::ResponseTooLarge {
+        url: url.to_string(),
+        limit_mib: MAX_BODY / (1024 * 1024),
+    };
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_BODY as u64)
+    {
+        return Err(too_large());
+    }
+    match read_capped(response, MAX_BODY).await? {
+        (body, false) => Ok(body),
+        (_, true) => Err(too_large()),
+    }
+}
+
+/// The start of an error response, for the message. Bodies can be long HTML
+/// error pages, and a failure to read one is no reason to hide the status.
+async fn error_body(response: reqwest::Response) -> String {
+    match read_capped(response, MAX_ERROR_BODY).await {
+        Ok((body, _)) => truncate(&body, 400),
+        Err(_) => String::new(),
+    }
+}
+
+/// Up to `cap` bytes of the body as text, and whether more remained. Decoded the
+/// way `Response::text` decodes without a charset feature: lossy UTF-8.
+async fn read_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> reqwest::Result<(String, bool)> {
+    let mut body = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = response.chunk().await? {
+        let room = cap - body.len();
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((String::from_utf8_lossy(&body).into_owned(), truncated))
 }
 
 /// A user-supplied time resolved to an instant plus its all-day-ness.
@@ -2473,6 +2525,15 @@ END:VCALENDAR
     #[test]
     fn xml_escape_neutralises_markup() {
         assert_eq!(xml_escape("a<b>&c"), "a&lt;b&gt;&amp;c");
+    }
+
+    #[tokio::test]
+    async fn reading_stops_at_the_cap() {
+        let response = |len: usize| reqwest::Response::from(http::Response::new(vec![b'x'; len]));
+        let (body, truncated) = read_capped(response(10), 4).await.unwrap();
+        assert_eq!((body.as_str(), truncated), ("xxxx", true));
+        let (body, truncated) = read_capped(response(4), 4).await.unwrap();
+        assert_eq!((body.as_str(), truncated), ("xxxx", false));
     }
 
     #[test]

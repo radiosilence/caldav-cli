@@ -180,6 +180,53 @@ async fn sends_basic_auth_on_every_request() {
     assert!(client(&server).list_calendars().await.is_ok());
 }
 
+/// A server answering with more than the client will hold is refused before
+/// the body is parsed, rather than read into memory whole.
+#[tokio::test]
+async fn an_oversized_response_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ok(PRINCIPAL_XML))
+        .mount(&server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/principal/"))
+        .respond_with(ok(HOME_XML))
+        .mount(&server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string("x".repeat(33 * 1024 * 1024)))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).list_calendars().await.unwrap_err();
+    assert!(err.to_string().contains("32 MiB"), "{err}");
+}
+
+#[tokio::test]
+async fn an_error_page_is_reported_by_its_start() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("REPORT"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("<html>".repeat(200_000)))
+        .mount(&server)
+        .await;
+
+    let calendars = client(&server).list_calendars().await.unwrap();
+    let (start, end) = window();
+    let err = client(&server)
+        .list_events(&calendars[0], start, end, false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().len() < 1_000,
+        "{} bytes",
+        err.to_string().len()
+    );
+}
+
 #[tokio::test]
 async fn rejected_credentials_surface_as_an_auth_error() {
     let server = MockServer::start().await;

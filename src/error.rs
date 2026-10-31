@@ -50,6 +50,11 @@ pub enum Error {
     #[error("Rate limited. Try again later.")]
     RateLimited,
 
+    /// A response past the size this client will read. Not retried: asking
+    /// again gets the same answer.
+    #[error("{url} answered with more than {limit_mib} MiB, the most this client reads")]
+    ResponseTooLarge { url: String, limit_mib: usize },
+
     #[error("Server error: {0}")]
     Server(String),
 }
