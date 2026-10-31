@@ -1229,7 +1229,8 @@ impl CalDavClient {
             .get_event(uid, from)
             .await?
             .ok_or_else(|| Error::EventNotFound(uid.to_string()))?;
-        let target = self.find_calendar(Some(to)).await?;
+        let calendars = self.list_calendars().await?;
+        let target = resolve_calendar(&calendars, Some(to))?;
 
         if target.href == existing.calendar_href {
             return Err(Error::Server(format!(
@@ -1251,7 +1252,7 @@ impl CalDavClient {
         }
         // A move deletes from the source. Refused up front, since the copy
         // fallback would otherwise write the event and then fail to remove it.
-        let source = self.find_calendar(Some(&existing.calendar_href)).await?;
+        let source = resolve_calendar(&calendars, Some(&existing.calendar_href))?;
         if source.read_only {
             return Err(Error::Server(format!(
                 "calendar '{}' is read-only, so the event cannot be moved out of it",
