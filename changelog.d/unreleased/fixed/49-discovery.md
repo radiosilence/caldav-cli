@@ -1,0 +1,1 @@
+- **Discovery and UID lookups do less repeated work.** The calendar listing is parsed once rather than up to three times, the scheduling inbox is remembered once found, and a server that refuses UID filters is not asked again for every calendar on every lookup, which on iCloud saved a refused request per calendar per lookup.
