@@ -1013,7 +1013,11 @@ DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\
         }
         // Two documents, each one VCALENDAR around one VEVENT.
         for delimiter in ["BEGIN", "END"] {
-            assert_eq!(names.iter().filter(|n| **n == delimiter).count(), 4, "{ics}");
+            assert_eq!(
+                names.iter().filter(|n| **n == delimiter).count(),
+                4,
+                "{ics}"
+            );
         }
     }
 

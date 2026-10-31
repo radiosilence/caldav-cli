@@ -1631,7 +1631,8 @@ pub fn check_update(existing: &Event, fields: &EventFields<'_>) -> Result<()> {
     ) else {
         return Ok(());
     };
-    let moved = fields.start.is_some() || fields.all_day.is_some();
+    // A new zone rewrites DTSTART as surely as a new start does.
+    let moved = fields.start.is_some() || fields.all_day.is_some() || fields.tzid.is_some();
     let old_start = source.lines().find(|line| line.starts_with("DTSTART"));
     let worked = old_start.is_some_and(|dtstart| recur::check_rule(dtstart, rule).is_ok());
     match moved && worked {
@@ -2578,6 +2579,17 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             ..Default::default()
         };
         assert!(check_update(&bins, &retitle).is_ok());
+
+        // A floating series takes a floating UNTIL; given a zone, it needs a UTC one.
+        let floating = stored(
+            "DTSTART:20260706T090000",
+            "FREQ=WEEKLY;UNTIL=20261231T090000",
+        );
+        let zoned = EventFields {
+            tzid: Some("Europe/London"),
+            ..Default::default()
+        };
+        assert!(check_update(&floating, &zoned).is_err());
 
         let odd = stored("DTSTART:20260706T090000Z", "FREQ=WEEKLY;X-ODD=1");
         let moved = EventFields {
