@@ -321,13 +321,20 @@ impl EventMutation {
             let Some(existing) = client.get_event(&id, input.calendar.as_deref()).await? else {
                 return Ok(GqlEventResult::failed(format!("Event not found: {id}")));
             };
-            let token = issue_nonce(nonce_store, &refs).await;
+            let token = issue_nonce(nonce_store, &account(client), &refs).await;
             return Ok(GqlEventResult::pending(
                 preview_update(&existing, &input),
                 token,
             ));
         }
-        if let Err(msg) = consume_nonce(nonce_store, confirmation_token.as_deref(), &refs).await {
+        if let Err(msg) = consume_nonce(
+            nonce_store,
+            &account(client),
+            confirmation_token.as_deref(),
+            &refs,
+        )
+        .await
+        {
             return Ok(GqlEventResult::failed(msg));
         }
 
@@ -362,7 +369,7 @@ impl EventMutation {
             let Some(existing) = client.get_event(&id, calendar.as_deref()).await? else {
                 return Ok(GqlEventResult::failed(format!("Event not found: {id}")));
             };
-            let token = issue_nonce(nonce_store, &parts).await;
+            let token = issue_nonce(nonce_store, &account(client), &parts).await;
             let text = format!(
                 "Delete event: {}\nCalendar: {}\nStarts: {}\nThis cannot be undone.",
                 existing.summary.as_deref().unwrap_or("(no title)"),
@@ -371,7 +378,14 @@ impl EventMutation {
             );
             return Ok(GqlEventResult::pending(text, token));
         }
-        if let Err(msg) = consume_nonce(nonce_store, confirmation_token.as_deref(), &parts).await {
+        if let Err(msg) = consume_nonce(
+            nonce_store,
+            &account(client),
+            confirmation_token.as_deref(),
+            &parts,
+        )
+        .await
+        {
             return Ok(GqlEventResult::failed(msg));
         }
 
@@ -409,7 +423,7 @@ impl EventMutation {
             let Some(existing) = client.get_event(&id, calendar.as_deref()).await? else {
                 return Ok(GqlEventResult::failed(format!("Event not found: {id}")));
             };
-            let token = issue_nonce(nonce_store, &parts).await;
+            let token = issue_nonce(nonce_store, &account(client), &parts).await;
             let text = format!(
                 "Move event: {}\nStarts: {}\nFrom calendar: {}\nTo calendar: {to_calendar}",
                 existing.summary.as_deref().unwrap_or("(no title)"),
@@ -418,7 +432,14 @@ impl EventMutation {
             );
             return Ok(GqlEventResult::pending(text, token));
         }
-        if let Err(msg) = consume_nonce(nonce_store, confirmation_token.as_deref(), &parts).await {
+        if let Err(msg) = consume_nonce(
+            nonce_store,
+            &account(client),
+            confirmation_token.as_deref(),
+            &parts,
+        )
+        .await
+        {
             return Ok(GqlEventResult::failed(msg));
         }
 
@@ -480,7 +501,7 @@ impl EventMutation {
                 Ok(when) => when,
                 Err(e) => return Ok(GqlEventResult::failed(e.to_string())),
             };
-            let token = issue_nonce(nonce_store, &parts).await;
+            let token = issue_nonce(nonce_store, &account(client), &parts).await;
             let text = format!(
                 "Cancel one occurrence of: {} ({})\nOccurrence: {resolved}\nRepeats: {}\n\
                  The rest of the series is untouched. This cannot be undone.",
@@ -490,7 +511,14 @@ impl EventMutation {
             );
             return Ok(GqlEventResult::pending(text, token));
         }
-        if let Err(msg) = consume_nonce(nonce_store, confirmation_token.as_deref(), &parts).await {
+        if let Err(msg) = consume_nonce(
+            nonce_store,
+            &account(client),
+            confirmation_token.as_deref(),
+            &parts,
+        )
+        .await
+        {
             return Ok(GqlEventResult::failed(msg));
         }
 
@@ -546,7 +574,7 @@ impl EventMutation {
                 .find(|a| a.email.eq_ignore_ascii_case(me))
                 .and_then(|a| a.status.as_deref())
                 .unwrap_or("NEEDS-ACTION");
-            let token = issue_nonce(nonce_store, &parts).await;
+            let token = issue_nonce(nonce_store, &account(client), &parts).await;
             let text = format!(
                 "Reply to: {}\nStarts: {}\nOrganiser: {}\nAs: {me}\nYour status: {current} → \
                  {partstat}\nThe organiser is notified.",
@@ -560,7 +588,14 @@ impl EventMutation {
             );
             return Ok(GqlEventResult::pending(text, token));
         }
-        if let Err(msg) = consume_nonce(nonce_store, confirmation_token.as_deref(), &parts).await {
+        if let Err(msg) = consume_nonce(
+            nonce_store,
+            &account(client),
+            confirmation_token.as_deref(),
+            &parts,
+        )
+        .await
+        {
             return Ok(GqlEventResult::failed(msg));
         }
 

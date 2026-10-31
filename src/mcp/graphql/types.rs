@@ -698,6 +698,9 @@ impl GqlCalendarResult {
 // ============ Confirmation nonces ============
 
 pub struct Nonce {
+    /// Who previewed it. A token answers only for the account that asked, so
+    /// two accounts previewing the same change cannot confirm each other's.
+    account: String,
     fingerprint: String,
     issued_at: std::time::Instant,
 }
@@ -706,29 +709,44 @@ pub struct Nonce {
 /// than request-level because a preview and its confirm are separate requests.
 pub type NonceStore = tokio::sync::Mutex<std::collections::HashMap<String, Nonce>>;
 
-/// Hard cap on outstanding nonces. A preview without a confirm is user intent —
+/// Outstanding tokens per account. A preview without a confirm is user intent —
 /// capacity for hundreds of pending edits is plenty for a single session.
 const NONCE_CAP: usize = 256;
+
+/// Outstanding tokens across every account, so the store stays bounded however
+/// many accounts use the server.
+const NONCE_TOTAL_CAP: usize = 4096;
 
 /// How long a PREVIEW'd nonce stays valid. Long enough for a human to read and
 /// approve, short enough to expire well before the process restarts.
 const NONCE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Drop entries older than TTL, then if still over cap drop the oldest.
-fn evict(map: &mut std::collections::HashMap<String, Nonce>) {
+/// The account a client acts as, for scoping its tokens.
+pub fn account(client: &crate::caldav::CalDavClient) -> String {
+    format!("{}\u{1f}{}", client.server_url(), client.username())
+}
+
+/// Make room for one more token for `account`: drop expired ones, then the
+/// account's oldest if it is at its cap, then the oldest overall if the store is.
+/// One account filling its share cannot push out another's.
+fn evict(map: &mut std::collections::HashMap<String, Nonce>, account: &str) {
     let now = std::time::Instant::now();
     map.retain(|_, n| now.duration_since(n.issued_at) < NONCE_TTL);
-    while map.len() >= NONCE_CAP {
-        let oldest = map
-            .iter()
+    let oldest = |map: &std::collections::HashMap<String, Nonce>, of: Option<&str>| {
+        map.iter()
+            .filter(|(_, n)| of.is_none_or(|a| n.account == a))
             .min_by_key(|(_, n)| n.issued_at)
-            .map(|(k, _)| k.clone());
-        match oldest {
-            Some(k) => {
-                map.remove(&k);
-            }
-            None => break,
-        }
+            .map(|(k, _)| k.clone())
+    };
+    if map.values().filter(|n| n.account == account).count() >= NONCE_CAP
+        && let Some(k) = oldest(map, Some(account))
+    {
+        map.remove(&k);
+    }
+    if map.len() >= NONCE_TOTAL_CAP
+        && let Some(k) = oldest(map, None)
+    {
+        map.remove(&k);
     }
 }
 
@@ -745,33 +763,39 @@ pub fn params_fingerprint(parts: &[&str]) -> String {
 }
 
 /// Issue a new one-shot confirmation nonce for the given params.
-pub async fn issue_nonce(store: &NonceStore, parts: &[&str]) -> String {
+pub async fn issue_nonce(store: &NonceStore, account: &str, parts: &[&str]) -> String {
     let nonce = uuid::Uuid::new_v4().to_string();
     let entry = Nonce {
+        account: account.to_string(),
         fingerprint: params_fingerprint(parts),
         issued_at: std::time::Instant::now(),
     };
     let mut map = store.lock().await;
-    evict(&mut map);
+    evict(&mut map, account);
     map.insert(nonce.clone(), entry);
     nonce
 }
 
-/// Consume a nonce, returning Ok(()) if it was issued for the given params.
-/// The nonce is always removed on consumption, even on mismatch or expiry, so
-/// a bad CONFIRM forces the caller back to PREVIEW.
+/// Consume a nonce, returning Ok(()) if it was issued to `account` for the
+/// given params. The nonce is removed on consumption, even on mismatch or
+/// expiry, so a bad CONFIRM forces the caller back to PREVIEW. One presented by
+/// another account is left for its owner.
 pub async fn consume_nonce(
     store: &NonceStore,
+    account: &str,
     nonce: Option<&str>,
     parts: &[&str],
 ) -> std::result::Result<(), &'static str> {
+    const INVALID: &str = "Invalid or already-used confirmationToken. Re-run PREVIEW.";
     let nonce =
         nonce.ok_or("Missing confirmationToken. Use action=PREVIEW first to obtain one.")?;
-    let entry = store
-        .lock()
-        .await
-        .remove(nonce)
-        .ok_or("Invalid or already-used confirmationToken. Re-run PREVIEW.")?;
+    let entry = {
+        let mut map = store.lock().await;
+        match map.get(nonce) {
+            Some(entry) if entry.account == account => map.remove(nonce).ok_or(INVALID)?,
+            _ => return Err(INVALID),
+        }
+    };
     if std::time::Instant::now().duration_since(entry.issued_at) >= NONCE_TTL {
         return Err("confirmationToken expired. Re-run PREVIEW.");
     }
@@ -859,24 +883,36 @@ mod tests {
     async fn nonce_round_trips_for_matching_params() {
         let store = NonceStore::default();
         let params = ["Standup", "2026-07-24T09:00:00Z"];
-        let nonce = issue_nonce(&store, &params).await;
-        assert!(consume_nonce(&store, Some(&nonce), &params).await.is_ok());
+        let nonce = issue_nonce(&store, "me", &params).await;
+        assert!(
+            consume_nonce(&store, "me", Some(&nonce), &params)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn nonce_is_single_use() {
         let store = NonceStore::default();
         let params = ["Standup"];
-        let nonce = issue_nonce(&store, &params).await;
-        assert!(consume_nonce(&store, Some(&nonce), &params).await.is_ok());
-        assert!(consume_nonce(&store, Some(&nonce), &params).await.is_err());
+        let nonce = issue_nonce(&store, "me", &params).await;
+        assert!(
+            consume_nonce(&store, "me", Some(&nonce), &params)
+                .await
+                .is_ok()
+        );
+        assert!(
+            consume_nonce(&store, "me", Some(&nonce), &params)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn changed_params_are_rejected() {
         let store = NonceStore::default();
-        let nonce = issue_nonce(&store, &["Standup", "09:00"]).await;
-        let err = consume_nonce(&store, Some(&nonce), &["Standup", "17:00"])
+        let nonce = issue_nonce(&store, "me", &["Standup", "09:00"]).await;
+        let err = consume_nonce(&store, "me", Some(&nonce), &["Standup", "17:00"])
             .await
             .unwrap_err();
         assert!(err.contains("Params changed"));
@@ -885,9 +921,9 @@ mod tests {
     #[tokio::test]
     async fn missing_and_unknown_tokens_are_rejected() {
         let store = NonceStore::default();
-        assert!(consume_nonce(&store, None, &["x"]).await.is_err());
+        assert!(consume_nonce(&store, "me", None, &["x"]).await.is_err());
         assert!(
-            consume_nonce(&store, Some("made-up"), &["x"])
+            consume_nonce(&store, "me", Some("made-up"), &["x"])
                 .await
                 .is_err()
         );
@@ -897,9 +933,50 @@ mod tests {
     async fn store_stays_bounded() {
         let store = NonceStore::default();
         for i in 0..(NONCE_CAP + 50) {
-            issue_nonce(&store, &[&i.to_string()]).await;
+            issue_nonce(&store, "me", &[&i.to_string()]).await;
         }
         assert!(store.lock().await.len() <= NONCE_CAP);
+    }
+
+    #[tokio::test]
+    async fn a_token_answers_only_for_the_account_that_previewed() {
+        let store = NonceStore::default();
+        let params = ["delete", "standup"];
+        let nonce = issue_nonce(&store, "alice", &params).await;
+        assert!(
+            consume_nonce(&store, "bob", Some(&nonce), &params)
+                .await
+                .is_err()
+        );
+        // Bob's attempt leaves it for Alice.
+        assert!(
+            consume_nonce(&store, "alice", Some(&nonce), &params)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_account_filling_its_share_keeps_another_s_tokens() {
+        let store = NonceStore::default();
+        let kept = issue_nonce(&store, "bob", &["x"]).await;
+        for i in 0..(NONCE_CAP + 50) {
+            issue_nonce(&store, "alice", &[&i.to_string()]).await;
+        }
+        assert!(
+            consume_nonce(&store, "bob", Some(&kept), &["x"])
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_store_is_bounded_across_accounts() {
+        let store = NonceStore::default();
+        for i in 0..(NONCE_TOTAL_CAP + 50) {
+            issue_nonce(&store, &format!("account-{}", i % 64), &[&i.to_string()]).await;
+        }
+        assert!(store.lock().await.len() <= NONCE_TOTAL_CAP);
     }
 
     #[test]
