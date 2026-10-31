@@ -139,7 +139,9 @@ pub(crate) async fn fan_out<F: std::future::Future>(tasks: Vec<F>) -> Vec<F::Out
 /// One HTTP client for the process. Authentication is per request and there is
 /// no cookie store, so accounts can share it, and with it one connection pool
 /// and one TLS configuration rather than a copy of each per account.
-static HTTP: LazyLock<Client> = LazyLock::new(|| {
+static HTTP: LazyLock<Client> = LazyLock::new(http_client);
+
+fn http_client() -> Client {
     Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         // iCloud rejects requests with no User-Agent outright (403), and
@@ -148,7 +150,7 @@ static HTTP: LazyLock<Client> = LazyLock::new(|| {
         .user_agent(concat!("caldav/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("the HTTP client is built from fixed settings")
-});
+}
 
 pub struct CalDavClient {
     client: Client,
@@ -172,9 +174,22 @@ pub struct CalDavClient {
 }
 
 impl CalDavClient {
+    /// As [`Self::new`], with a connection pool of its own rather than the
+    /// process's. A pooled connection dies with the Tokio runtime that opened
+    /// it, so a caller that runs more than one runtime, as `#[tokio::test]`
+    /// cases each do, needs a pool per runtime or may be handed a dead one.
+    #[doc(hidden)]
+    pub fn with_own_pool(base: String, username: String, password: String) -> Self {
+        Self::with_http(http_client(), base, username, password)
+    }
+
     pub fn new(base: String, username: String, password: String) -> Self {
+        Self::with_http(HTTP.clone(), base, username, password)
+    }
+
+    fn with_http(client: Client, base: String, username: String, password: String) -> Self {
         Self {
-            client: HTTP.clone(),
+            client,
             base: base.trim_end_matches('/').to_string(),
             username,
             password,
