@@ -70,7 +70,7 @@ impl RangeArgs {
 
         let start = match &self.start {
             Some(raw) => util::parse_datetime_at(raw, tzid, now)?.instant,
-            None => util::day_range(1, tz, now)?.0,
+            None => util::start_of_today(tz, now)?,
         };
 
         let end = match (&self.end, self.days) {

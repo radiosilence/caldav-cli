@@ -331,12 +331,9 @@ pub fn split_list(input: &str) -> Vec<String> {
         .collect()
 }
 
-/// The UTC day range `[start_of_today, start_of_today + days)` in `tz`.
-pub fn day_range(days: i64, tz: Tz, now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let today = now.with_timezone(&tz).date_naive();
-    let start = start_of_day(today, tz)?;
-    let end = start_of_day(today + Duration::days(days.max(1)), tz)?;
-    Ok((start, end))
+/// Midnight today in `tz`, as a UTC instant.
+pub fn start_of_today(tz: Tz, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    start_of_day(now.with_timezone(&tz).date_naive(), tz)
 }
 
 /// The UTC range covering the calendar month containing `now` in `tz`.
@@ -514,17 +511,10 @@ mod tests {
     }
 
     #[test]
-    fn day_range_covers_requested_days() {
-        let (start, end) = day_range(3, Tz::UTC, now()).unwrap();
-        assert_eq!(format_iso_date(start), "2026-07-24");
-        assert_eq!(format_iso_date(end), "2026-07-27");
-    }
-
-    #[test]
-    fn day_range_treats_zero_as_one_day() {
-        let (start, end) = day_range(0, Tz::UTC, now()).unwrap();
-        assert_eq!(format_iso_date(start), "2026-07-24");
-        assert_eq!(format_iso_date(end), "2026-07-25");
+    fn today_starts_at_local_midnight() {
+        let start = start_of_today(Tz::Asia__Tokyo, now()).unwrap();
+        // Midnight Tokyo on the 24th is 15:00Z on the 23rd.
+        assert_eq!(format_rfc3339(start), "2026-07-23T15:00:00Z");
     }
 
     #[test]
