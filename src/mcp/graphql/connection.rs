@@ -186,6 +186,7 @@ pub fn events_connection_of<E: Borrow<Event>>(
     calendars_queried: u64,
 ) -> Result<EventConnection> {
     if let Some(filter) = filter {
+        let filter = filter.prepare()?;
         events.retain(|e| filter.matches(e.borrow()));
     }
     sort_events(&mut events, sort);
