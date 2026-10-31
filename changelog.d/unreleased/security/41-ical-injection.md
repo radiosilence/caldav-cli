@@ -1,0 +1,1 @@
+- **Event fields can no longer write extra properties into the stored event.** A line break in a URL, status, recurrence rule or attendee field ended its property, and the rest of the value was written as properties or components of its own. Such values are now refused, and a recurrence rule that would not expand is refused with the fix, in the preview as well as the write.
