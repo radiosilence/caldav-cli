@@ -205,6 +205,31 @@ async fn an_oversized_response_is_refused() {
     assert!(err.to_string().contains("32 MiB"), "{err}");
 }
 
+/// A limited view holds its requests to six in flight, so twelve slow ones
+/// take at least two rounds.
+#[tokio::test]
+async fn a_limited_client_holds_six_requests_in_flight() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    let delay = std::time::Duration::from_millis(300);
+    Mock::given(method("REPORT"))
+        .respond_with(ok(EMPTY_MULTISTATUS).set_delay(delay))
+        .mount(&server)
+        .await;
+    let client = client(&server).limited();
+    let calendars = client.list_calendars().await.unwrap();
+    let (start, end) = window();
+    let budget = Default::default();
+    let started = std::time::Instant::now();
+    let reads: Vec<_> = (0..12)
+        .map(|_| client.list_events(&calendars[0], start, end, false, &budget))
+        .collect();
+    for read in futures_util::future::join_all(reads).await {
+        read.unwrap();
+    }
+    assert!(started.elapsed() >= delay * 2, "{:?}", started.elapsed());
+}
+
 #[tokio::test]
 async fn rejected_credentials_surface_as_an_auth_error() {
     let server = MockServer::start().await;

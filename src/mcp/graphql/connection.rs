@@ -301,6 +301,16 @@ pub async fn events_connection(
     )
 }
 
+/// Fixed costs of fields that do network work without paging, so aliasing one
+/// is priced like the work it starts: a UID lookup sweeps the calendars, a
+/// free-busy read may read every calendar's events, a probe and a write each
+/// go to the server. Against the schema's ceiling they allow hundreds of
+/// lookups or dozens of the rest in one request, far more than any real one.
+pub const LOOKUP_COST: usize = 500;
+pub const PROBE_COST: usize = 5_000;
+pub const FREE_BUSY_COST: usize = 5_000;
+pub const WRITE_COST: usize = 5_000;
+
 /// Cost of a connection field: the page size asked for, times the cost of a node.
 pub fn page_complexity(first: Option<i32>, last: Option<i32>, child_complexity: usize) -> usize {
     let requested = first.or(last).map(|n| n.max(0) as u32);

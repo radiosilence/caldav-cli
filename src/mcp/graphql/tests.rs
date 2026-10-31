@@ -664,12 +664,51 @@ async fn a_multiplied_query_is_refused_and_a_plausible_one_is_not() {
     assert!(err.to_lowercase().contains("complex"), "{err}");
     assert_eq!(h.reports().await, 0, "refused before any REPORT");
 
-    h.run(&format!(
-        r#"{{ events(start: "{DAY}", days: 1, first: 100) {{ nodes {{
-            id summary conflicts(first: 100) {{ nodes {{ id summary }} }}
-        }} }} }}"#
-    ))
-    .await;
+    let data = h
+        .run(&format!(
+            r#"{{ events(start: "{DAY}", days: 1, first: 100) {{ nodes {{
+                id summary conflicts(first: 100) {{ nodes {{ id summary }} }}
+            }} }} }}"#
+        ))
+        .await;
+    assert!(!data["events"]["nodes"].as_array().unwrap().is_empty());
+}
+
+/// Aliasing a field that goes to the server is priced like the work it starts.
+#[tokio::test]
+async fn aliases_of_lookups_are_priced() {
+    let h = Harness::start().await;
+    let aliases: String = (0..600)
+        .map(|i| format!(r#"a{i}: event(id: "x{i}") {{ id }} "#))
+        .collect();
+    let err = h.run_expecting_error(&format!("{{ {aliases} }}")).await;
+    assert!(err.to_lowercase().contains("complex"), "{err}");
+    assert_eq!(h.reports().await, 0, "refused before any REPORT");
+}
+
+/// Every query the README shows stays within the cost and depth limits.
+#[tokio::test]
+async fn the_documented_queries_fit_the_limits() {
+    let readme = include_str!("../../../README.md");
+    let queries: Vec<&str> = readme
+        .split("```graphql")
+        .skip(1)
+        .filter_map(|block| block.split("```").next())
+        .collect();
+    assert!(queries.len() > 5, "found {} examples", queries.len());
+    let schema = build_schema();
+    let h = Harness::start().await;
+    for query in queries {
+        let response = schema.execute(request(query, h.client(), None)).await;
+        for error in &response.errors {
+            let message = error.message.to_lowercase();
+            assert!(
+                !message.contains("complex") && !message.contains("too deep"),
+                "{query}: {}",
+                error.message
+            );
+        }
+    }
 }
 
 #[tokio::test]

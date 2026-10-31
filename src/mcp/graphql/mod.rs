@@ -51,7 +51,10 @@ pub fn build_schema() -> CalDavSchema {
     // descriptions surface it so a caller can pick a sensible page size. The
     // ceiling sits far above any query worth asking, and refuses only the
     // multiplied ones: a page of 100 events each asking for 100 conflicts is
-    // 100,000, and a third level of nesting is a hundred times that again.
+    // about 30,000, and a third level of nesting is a hundred times that.
+    // Fields that do network work without paging (a UID lookup, a free-busy
+    // read, a probe, every write) carry a fixed cost, so aliases of them are
+    // priced too.
     //
     // Depth is capped as well: the graph has cycles, and nothing else bounds
     // them.
@@ -77,6 +80,8 @@ pub fn request(
     client: SharedClient,
     default_calendar: Option<String>,
 ) -> async_graphql::Request {
+    // Every request this query makes, by whatever path, shares one limit.
+    let client: SharedClient = std::sync::Arc::new(client.limited());
     let loaders = loaders::Loaders::new(client.clone());
     async_graphql::Request::new(query)
         .data(client)

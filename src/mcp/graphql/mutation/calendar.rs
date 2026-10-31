@@ -8,6 +8,7 @@
 
 use async_graphql::{Context, Object, Result};
 
+use super::super::connection::WRITE_COST;
 use super::super::types::*;
 use super::super::{SharedClient, types};
 use crate::models::CalendarFields;
@@ -60,6 +61,7 @@ impl CalendarMutation {
     /// The id is derived from the name, so "Work Trips" becomes `work-trips`. A
     /// name whose id collides with an existing collection is refused rather than
     /// silently suffixed.
+    #[graphql(complexity = "WRITE_COST + child_complexity")]
     async fn create_calendar(
         &self,
         ctx: &Context<'_>,
@@ -86,6 +88,7 @@ impl CalendarMutation {
     ///
     /// The change is visible in every calendar app on the account, so ALWAYS call
     /// with action=PREVIEW first and read the diff back to the user.
+    #[graphql(complexity = "WRITE_COST + child_complexity")]
     async fn update_calendar(
         &self,
         ctx: &Context<'_>,
@@ -145,6 +148,7 @@ impl CalendarMutation {
     /// action=PREVIEW first — the preview counts what would be lost — and get the
     /// user's explicit approval. The account's own default calendar is refused
     /// outright; point the default elsewhere first.
+    #[graphql(complexity = "WRITE_COST + child_complexity")]
     async fn delete_calendar(
         &self,
         ctx: &Context<'_>,
@@ -215,6 +219,7 @@ impl CalendarMutation {
     /// Not every server lets this be set: it lives on the scheduling inbox, and
     /// an account without scheduling support has nowhere to keep it. A refusal
     /// comes back in `error`.
+    #[graphql(complexity = "WRITE_COST + child_complexity")]
     async fn set_default_calendar(
         &self,
         ctx: &Context<'_>,
