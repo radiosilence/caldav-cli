@@ -13,7 +13,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use super::connection::{
     EventConnection, EventQuery, PageArgs, event_cursor, events_connection, events_connection_of,
-    load_windows, page_complexity, read_targets, wants_events,
+    load_windows, page_complexity, prepare_filter, read_targets, wants_events,
 };
 use super::filter::{EventFilter, EventSort};
 use super::loaders::{Calendars, EventResources, Resource, to_gql_error};
@@ -437,6 +437,7 @@ impl GqlEvent {
             tz,
         }
         .resolve()?;
+        let filter = prepare_filter(ctx, filter.as_ref())?;
         let events = match self.0.recurrence {
             Some(_) => recur::expand_all(
                 vec![self.0.clone()],
@@ -487,6 +488,7 @@ impl GqlEvent {
             first,
             last,
         };
+        let filter = prepare_filter(ctx, filter.as_ref())?;
         // An event we couldn't anchor to an instant has no window to search.
         let Some((from, to)) = conflict_window(&self.0) else {
             return events_connection_of(Vec::<Event>::new(), args, None, None, 0);

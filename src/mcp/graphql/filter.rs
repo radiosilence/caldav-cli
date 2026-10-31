@@ -12,6 +12,8 @@
 //! everything else is decided here, where `and`/`or`/`not` can nest freely.
 
 use std::borrow::Borrow;
+use std::cell::OnceCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_graphql::{Enum, InputObject};
 
@@ -40,7 +42,8 @@ impl GqlEventStatus {
 ///
 /// Scalar fields on one filter object are AND-ed together; `and` / `or` / `not`
 /// take further filters and nest arbitrarily, so "anything with Alice on it that
-/// isn't a declined standup" is one filter rather than three queries.
+/// isn't a declined standup" is one filter rather than three queries. One filter
+/// holds at most 1,000 nested filters, itself included, and one request 10,000.
 ///
 /// All text matching is case-insensitive substring matching.
 #[derive(InputObject, Default, Clone, Debug)]
@@ -76,71 +79,248 @@ pub struct EventFilter {
     pub not: Option<Vec<EventFilter>>,
 }
 
-/// Case-insensitive substring test that treats an absent haystack as no match.
-fn contains(haystack: Option<&str>, needle: &str) -> bool {
-    haystack.is_some_and(|h| h.to_lowercase().contains(needle))
-}
+/// Most nested filters one filter may hold, counting itself and every
+/// `and`/`or`/`not` entry at any depth. Matching costs a pass over every event
+/// per filter, so this bounds the work one filter can ask for; real filters
+/// have a handful.
+pub const MAX_FILTER_NODES: usize = 1000;
 
-fn person_matches(person: &crate::models::Attendee, needle: &str) -> bool {
-    person.email.to_lowercase().contains(needle) || contains(person.name.as_deref(), needle)
+/// Most nested filters one request may prepare in all, so a filter repeated
+/// under every event of a page (`conflicts`, `occurrences`) or across aliases
+/// cannot multiply past the single-filter cap.
+const MAX_REQUEST_FILTER_NODES: usize = 10 * MAX_FILTER_NODES;
+
+/// What a request has left of [`MAX_REQUEST_FILTER_NODES`].
+#[derive(Default)]
+pub struct FilterBudget(AtomicUsize);
+
+/// An [`EventFilter`] ready to run: needles lowercased once, and its size
+/// checked against [`MAX_FILTER_NODES`].
+pub struct PreparedFilter {
+    text: Option<String>,
+    summary: Option<String>,
+    description: Option<String>,
+    location: Option<String>,
+    category: Option<String>,
+    attendee: Option<String>,
+    organizer: Option<String>,
+    status: Option<GqlEventStatus>,
+    all_day: Option<bool>,
+    recurring: Option<bool>,
+    has_attendees: Option<bool>,
+    and: Vec<PreparedFilter>,
+    or: Vec<PreparedFilter>,
+    not: Vec<PreparedFilter>,
 }
 
 impl EventFilter {
-    /// Does `event` satisfy this filter?
-    pub fn matches(&self, event: &Event) -> bool {
-        self.scalars_match(event)
-            && self.and.iter().flatten().all(|f| f.matches(event))
-            // An empty `or` list constrains nothing — it names no alternative to
-            // fail, so treating it as "nothing matches" would be a trap.
-            && self
-                .or
-                .as_ref()
-                .is_none_or(|fs| fs.is_empty() || fs.iter().any(|f| f.matches(event)))
-            && !self.not.iter().flatten().any(|f| f.matches(event))
+    /// Count this filter's nodes against [`MAX_FILTER_NODES`] and the request's
+    /// `budget`, then lower every needle once. Nothing is lowered or copied for
+    /// a filter that is refused.
+    pub fn prepare(&self, budget: Option<&FilterBudget>) -> async_graphql::Result<PreparedFilter> {
+        let mut left = MAX_FILTER_NODES;
+        if !self.count_within(&mut left) {
+            return Err(async_graphql::Error::new(format!(
+                "filter has more than {MAX_FILTER_NODES} nested filters; combine conditions or \
+                 split the query"
+            )));
+        }
+        let nodes = MAX_FILTER_NODES - left;
+        if let Some(budget) = budget {
+            budget
+                .0
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    used.checked_add(nodes)
+                        .filter(|total| *total <= MAX_REQUEST_FILTER_NODES)
+                })
+                .map_err(|_| {
+                    async_graphql::Error::new(format!(
+                        "filters in this request hold more than {MAX_REQUEST_FILTER_NODES} nested \
+                         filters in all; filter fewer fields or page smaller"
+                    ))
+                })?;
+        }
+        Ok(self.lowered())
     }
 
-    fn scalars_match(&self, event: &Event) -> bool {
+    fn count_within(&self, left: &mut usize) -> bool {
+        let Some(rest) = left.checked_sub(1) else {
+            return false;
+        };
+        *left = rest;
+        [&self.and, &self.or, &self.not]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .all(|f| f.count_within(left))
+    }
+
+    fn lowered(&self) -> PreparedFilter {
+        let lower = |s: &Option<String>| s.as_deref().map(str::to_lowercase);
+        let nested = |list: &Option<Vec<EventFilter>>| {
+            list.iter().flatten().map(EventFilter::lowered).collect()
+        };
+        PreparedFilter {
+            text: lower(&self.text),
+            summary: lower(&self.summary),
+            description: lower(&self.description),
+            location: lower(&self.location),
+            category: lower(&self.category),
+            attendee: lower(&self.attendee),
+            organizer: lower(&self.organizer),
+            status: self.status,
+            all_day: self.all_day,
+            recurring: self.recurring,
+            has_attendees: self.has_attendees,
+            and: nested(&self.and),
+            or: nested(&self.or),
+            not: nested(&self.not),
+        }
+    }
+
+    #[cfg(test)]
+    fn matches(&self, event: &Event) -> bool {
+        self.prepare(None).unwrap().matches(event)
+    }
+}
+
+/// An event's text fields, lowercased the first time a filter node asks for
+/// each, so a filter with many nodes lowers every field at most once.
+struct Lowered<'a> {
+    event: &'a Event,
+    summary: OnceCell<Option<String>>,
+    description: OnceCell<Option<String>>,
+    location: OnceCell<Option<String>>,
+    categories: OnceCell<Vec<String>>,
+    attendees: OnceCell<Vec<(String, Option<String>)>>,
+    organizer: OnceCell<Option<(String, Option<String>)>>,
+}
+
+fn lower_person(person: &crate::models::Attendee) -> (String, Option<String>) {
+    (
+        person.email.to_lowercase(),
+        person.name.as_deref().map(str::to_lowercase),
+    )
+}
+
+fn person_matches((email, name): &(String, Option<String>), needle: &str) -> bool {
+    email.contains(needle) || name.as_deref().is_some_and(|n| n.contains(needle))
+}
+
+impl<'a> Lowered<'a> {
+    fn new(event: &'a Event) -> Self {
+        Self {
+            event,
+            summary: OnceCell::new(),
+            description: OnceCell::new(),
+            location: OnceCell::new(),
+            categories: OnceCell::new(),
+            attendees: OnceCell::new(),
+            organizer: OnceCell::new(),
+        }
+    }
+
+    fn summary(&self) -> Option<&str> {
+        self.summary
+            .get_or_init(|| self.event.summary.as_deref().map(str::to_lowercase))
+            .as_deref()
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description
+            .get_or_init(|| self.event.description.as_deref().map(str::to_lowercase))
+            .as_deref()
+    }
+
+    fn location(&self) -> Option<&str> {
+        self.location
+            .get_or_init(|| self.event.location.as_deref().map(str::to_lowercase))
+            .as_deref()
+    }
+
+    fn categories(&self) -> &[String] {
+        self.categories.get_or_init(|| {
+            self.event
+                .categories
+                .iter()
+                .map(|c| c.to_lowercase())
+                .collect()
+        })
+    }
+
+    fn attendees(&self) -> &[(String, Option<String>)] {
+        self.attendees
+            .get_or_init(|| self.event.attendees.iter().map(lower_person).collect())
+    }
+
+    fn organizer(&self) -> Option<&(String, Option<String>)> {
+        self.organizer
+            .get_or_init(|| self.event.organizer.as_ref().map(lower_person))
+            .as_ref()
+    }
+}
+
+/// Substring test that treats an absent haystack as no match.
+fn contains(haystack: Option<&str>, needle: &str) -> bool {
+    haystack.is_some_and(|h| h.contains(needle))
+}
+
+impl PreparedFilter {
+    /// Does `event` satisfy this filter?
+    pub fn matches(&self, event: &Event) -> bool {
+        self.matches_lowered(&Lowered::new(event))
+    }
+
+    fn matches_lowered(&self, event: &Lowered<'_>) -> bool {
+        self.scalars_match(event)
+            && self.and.iter().all(|f| f.matches_lowered(event))
+            // An empty `or` list constrains nothing — it names no alternative to
+            // fail, so treating it as "nothing matches" would be a trap.
+            && (self.or.is_empty() || self.or.iter().any(|f| f.matches_lowered(event)))
+            && !self.not.iter().any(|f| f.matches_lowered(event))
+    }
+
+    fn scalars_match(&self, lowered: &Lowered<'_>) -> bool {
+        let event = lowered.event;
         if let Some(needle) = &self.text
-            && !self.text_matches(event, &needle.to_lowercase())
+            && !text_matches(lowered, needle)
         {
             return false;
         }
         if let Some(needle) = &self.summary
-            && !contains(event.summary.as_deref(), &needle.to_lowercase())
+            && !contains(lowered.summary(), needle)
         {
             return false;
         }
         if let Some(needle) = &self.description
-            && !contains(event.description.as_deref(), &needle.to_lowercase())
+            && !contains(lowered.description(), needle)
         {
             return false;
         }
         if let Some(needle) = &self.location
-            && !contains(event.location.as_deref(), &needle.to_lowercase())
+            && !contains(lowered.location(), needle)
         {
             return false;
         }
-        if let Some(needle) = &self.category {
-            let needle = needle.to_lowercase();
-            if !event.categories.iter().any(|c| c.to_lowercase() == needle) {
-                return false;
-            }
+        if let Some(needle) = &self.category
+            && !lowered.categories().iter().any(|c| c == needle)
+        {
+            return false;
         }
-        if let Some(needle) = &self.attendee {
-            let needle = needle.to_lowercase();
-            if !event.attendees.iter().any(|a| person_matches(a, &needle)) {
-                return false;
-            }
+        if let Some(needle) = &self.attendee
+            && !lowered
+                .attendees()
+                .iter()
+                .any(|a| person_matches(a, needle))
+        {
+            return false;
         }
-        if let Some(needle) = &self.organizer {
-            let needle = needle.to_lowercase();
-            if !event
-                .organizer
-                .as_ref()
-                .is_some_and(|o| person_matches(o, &needle))
-            {
-                return false;
-            }
+        if let Some(needle) = &self.organizer
+            && !lowered
+                .organizer()
+                .is_some_and(|o| person_matches(o, needle))
+        {
+            return false;
         }
         if let Some(status) = self.status
             && event.status.as_deref() != Some(status.as_ical())
@@ -164,22 +344,16 @@ impl EventFilter {
         }
         true
     }
+}
 
-    /// The broad sweep behind `text` and `searchEvents`.
-    fn text_matches(&self, event: &Event, needle: &str) -> bool {
-        contains(event.summary.as_deref(), needle)
-            || contains(event.description.as_deref(), needle)
-            || contains(event.location.as_deref(), needle)
-            || event
-                .categories
-                .iter()
-                .any(|c| c.to_lowercase().contains(needle))
-            || event.attendees.iter().any(|a| person_matches(a, needle))
-            || event
-                .organizer
-                .as_ref()
-                .is_some_and(|o| person_matches(o, needle))
-    }
+/// The broad sweep behind `text` and `searchEvents`.
+fn text_matches(event: &Lowered<'_>, needle: &str) -> bool {
+    contains(event.summary(), needle)
+        || contains(event.description(), needle)
+        || contains(event.location(), needle)
+        || event.categories().iter().any(|c| c.contains(needle))
+        || event.attendees().iter().any(|a| person_matches(a, needle))
+        || event.organizer().is_some_and(|o| person_matches(o, needle))
 }
 
 /// What to order events by.
@@ -210,38 +384,97 @@ pub fn sort_events<E: Borrow<Event>>(events: &mut [E], sort: Option<&[EventSort]
         return;
     };
 
-    events.sort_by(|a, b| {
-        let (a, b) = (a.borrow(), b.borrow());
-        for level in sort {
-            let ordering = match level.property {
-                SortProperty::Start => a.start.sort_key().cmp(&b.start.sort_key()),
-                SortProperty::End => a.end.sort_key().cmp(&b.end.sort_key()),
-                SortProperty::Summary => a
-                    .summary
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .cmp(&b.summary.as_deref().unwrap_or_default().to_lowercase()),
-                SortProperty::Created => a.created.cmp(&b.created),
-                SortProperty::LastModified => a.last_modified.cmp(&b.last_modified),
-            };
-            let ordering = if level.ascending.unwrap_or(true) {
-                ordering
-            } else {
-                ordering.reverse()
-            };
-            if ordering != std::cmp::Ordering::Equal {
-                return ordering;
-            }
-        }
-        std::cmp::Ordering::Equal
+    // A text sort builds each event's key once, so each title is lowered once
+    // rather than twice per comparison. Other sorts compare in place.
+    // The two paths order every property the same way and must keep doing so.
+    if !sort
+        .iter()
+        .any(|level| level.property == SortProperty::Summary)
+    {
+        events.sort_by(|a, b| {
+            let (a, b) = (a.borrow(), b.borrow());
+            sort.iter()
+                .map(|level| {
+                    let ordering = match level.property {
+                        SortProperty::Start => a.start.sort_key().cmp(&b.start.sort_key()),
+                        SortProperty::End => a.end.sort_key().cmp(&b.end.sort_key()),
+                        SortProperty::Created => a.created.cmp(&b.created),
+                        SortProperty::LastModified => a.last_modified.cmp(&b.last_modified),
+                        SortProperty::Summary => std::cmp::Ordering::Equal,
+                    };
+                    match level.ascending.unwrap_or(true) {
+                        true => ordering,
+                        false => ordering.reverse(),
+                    }
+                })
+                .find(|ordering| ordering.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        return;
+    }
+    events.sort_by_cached_key(|e| {
+        let e = e.borrow();
+        sort.iter()
+            .map(|level| {
+                let key = match level.property {
+                    SortProperty::Start => SortKey::Time(e.start.sort_key()),
+                    SortProperty::End => SortKey::Time(e.end.sort_key()),
+                    SortProperty::Summary => {
+                        SortKey::Text(e.summary.as_deref().unwrap_or_default().to_lowercase())
+                    }
+                    SortProperty::Created => SortKey::Stamp(e.created.clone()),
+                    SortProperty::LastModified => SortKey::Stamp(e.last_modified.clone()),
+                };
+                match level.ascending.unwrap_or(true) {
+                    true => Directed::Ascending(key),
+                    false => Directed::Descending(std::cmp::Reverse(key)),
+                }
+            })
+            .collect::<Vec<_>>()
     });
+}
+
+/// One level of a sort key. Levels line up across events, so the order between
+/// variants never decides anything.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SortKey {
+    Time(chrono::DateTime<chrono::Utc>),
+    Text(String),
+    Stamp(Option<String>),
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Directed {
+    Ascending(SortKey),
+    Descending(std::cmp::Reverse<SortKey>),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{Attendee, EventTime};
+
+    #[test]
+    fn a_filter_past_the_node_cap_is_refused() {
+        let leaf = || EventFilter {
+            summary: Some("x".into()),
+            ..Default::default()
+        };
+        let wide = |n: usize| EventFilter {
+            or: Some((0..n).map(|_| leaf()).collect()),
+            ..Default::default()
+        };
+        // The root counts as one node. Depth is bounded by the parser's
+        // recursion limit, so breadth is what the cap is for.
+        assert!(wide(MAX_FILTER_NODES - 1).prepare(None).is_ok());
+        assert!(wide(MAX_FILTER_NODES).prepare(None).is_err());
+        // Nested lists draw on the same count as their parent's.
+        let nested = EventFilter {
+            and: Some(vec![wide(MAX_FILTER_NODES / 2), wide(MAX_FILTER_NODES / 2)]),
+            ..Default::default()
+        };
+        assert!(nested.prepare(None).is_err());
+    }
 
     fn event(summary: &str) -> Event {
         Event {

@@ -207,6 +207,10 @@ together; `and`/`or`/`not` nest arbitrarily:
 }
 ```
 
+Every nested filter is another pass over the fetched events, so one filter
+holds at most 1,000 of them, itself included, and the filters in one request
+10,000 in all. A filter over either limit is refused before anything is fetched.
+
 Pagination is by event id, so `after:` is an id you have already seen:
 
 ```graphql

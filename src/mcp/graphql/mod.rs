@@ -86,6 +86,7 @@ pub fn request(
     async_graphql::Request::new(query)
         .data(client)
         .data(loaders.budget)
+        .data(filter::FilterBudget::default())
         .data(DefaultCalendar(default_calendar))
         .data(loaders.calendar)
         .data(loaders.window)
