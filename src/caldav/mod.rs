@@ -169,16 +169,18 @@ impl CalDavClient {
     /// process's. A pooled connection dies with the Tokio runtime that opened
     /// it, so a caller that runs more than one runtime, as `#[tokio::test]`
     /// cases each do, needs a pool per runtime or may be handed a dead one.
+    #[doc(hidden)]
     pub fn with_own_pool(base: String, username: String, password: String) -> Self {
-        Self {
-            client: http_client(),
-            ..Self::new(base, username, password)
-        }
+        Self::with_http(http_client(), base, username, password)
     }
 
     pub fn new(base: String, username: String, password: String) -> Self {
+        Self::with_http(HTTP.clone(), base, username, password)
+    }
+
+    fn with_http(client: Client, base: String, username: String, password: String) -> Self {
         Self {
-            client: HTTP.clone(),
+            client,
             base: base.trim_end_matches('/').to_string(),
             username,
             password,
