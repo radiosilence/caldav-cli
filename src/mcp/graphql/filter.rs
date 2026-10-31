@@ -386,6 +386,7 @@ pub fn sort_events<E: Borrow<Event>>(events: &mut [E], sort: Option<&[EventSort]
 
     // A text sort builds each event's key once, so each title is lowered once
     // rather than twice per comparison. Other sorts compare in place.
+    // The two paths order every property the same way and must keep doing so.
     if !sort
         .iter()
         .any(|level| level.property == SortProperty::Summary)
