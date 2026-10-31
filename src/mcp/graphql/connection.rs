@@ -316,9 +316,9 @@ pub async fn events_connection(
 /// Fixed costs of fields that do network work without paging, so aliasing one
 /// is priced like the work it starts: a UID lookup sweeps the calendars, a
 /// free-busy read may read every calendar's events, a probe and a write each
-/// go to the server. Against the schema's ceiling they allow hundreds of
-/// lookups or dozens of the rest in one request, far more than any real one.
-pub const LOOKUP_COST: usize = 500;
+/// go to the server. Against the schema's ceiling they allow 100 lookups and 50
+/// of each of the rest in one request, more than any real one asks for.
+pub const LOOKUP_COST: usize = 2_500;
 pub const PROBE_COST: usize = 5_000;
 pub const FREE_BUSY_COST: usize = 5_000;
 pub const WRITE_COST: usize = 5_000;
