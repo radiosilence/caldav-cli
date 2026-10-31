@@ -180,6 +180,31 @@ async fn sends_basic_auth_on_every_request() {
     assert!(client(&server).list_calendars().await.is_ok());
 }
 
+/// A server answering with more than the client will hold is refused before
+/// the body is parsed, rather than read into memory whole.
+#[tokio::test]
+async fn an_oversized_response_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ok(PRINCIPAL_XML))
+        .mount(&server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/principal/"))
+        .respond_with(ok(HOME_XML))
+        .mount(&server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string("x".repeat(33 * 1024 * 1024)))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).list_calendars().await.unwrap_err();
+    assert!(err.to_string().contains("32 MiB"), "{err}");
+}
+
 #[tokio::test]
 async fn rejected_credentials_surface_as_an_auth_error() {
     let server = MockServer::start().await;

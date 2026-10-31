@@ -196,22 +196,25 @@ impl CalDavClient {
 
         let response = req.send().await?;
         let status = response.status();
-        let text = response.text().await?;
         debug!(%method, %url, %status, "CalDAV response");
 
         match status.as_u16() {
-            401 | 403 => Err(Error::InvalidCredentials(
-                "server rejected the username/app password",
-            )),
-            429 => Err(Error::RateLimited),
-            code if status.is_success() || code == 207 => Ok(text),
+            401 | 403 => {
+                error_body(response).await;
+                Err(Error::InvalidCredentials(
+                    "server rejected the username/app password",
+                ))
+            }
+            429 => {
+                error_body(response).await;
+                Err(Error::RateLimited)
+            }
+            code if status.is_success() || code == 207 => read_body(response, url).await,
             code => Err(Error::Dav {
                 method: method.to_string(),
                 url: url.to_string(),
                 status: code,
-                // Bodies can be long HTML error pages; a prefix is enough to
-                // diagnose without flooding output.
-                body: truncate(&text, 400),
+                body: error_body(response).await,
             }),
         }
     }
@@ -819,7 +822,11 @@ impl CalDavClient {
         for (events, cal) in results.into_iter().zip(&targets) {
             match events {
                 Ok(events) => all.extend(events),
-                Err(e @ (Error::TooManyOccurrences(_) | Error::ExpansionTooCostly { .. })) => {
+                Err(
+                    e @ (Error::TooManyOccurrences(_)
+                    | Error::ExpansionTooCostly { .. }
+                    | Error::ResponseTooLarge { .. }),
+                ) => {
                     return Err(e);
                 }
                 // One unreadable calendar (shared, or a server hiccup) should
@@ -1354,18 +1361,23 @@ impl CalDavClient {
             .send()
             .await?;
         let status = response.status();
-        let text = response.text().await?;
         match status.as_u16() {
-            401 | 403 => Err(Error::InvalidCredentials(
-                "server rejected the username/app password",
-            )),
-            429 => Err(Error::RateLimited),
-            _ if status.is_success() => Ok(text),
+            401 | 403 => {
+                error_body(response).await;
+                Err(Error::InvalidCredentials(
+                    "server rejected the username/app password",
+                ))
+            }
+            429 => {
+                error_body(response).await;
+                Err(Error::RateLimited)
+            }
+            _ if status.is_success() => read_body(response, url).await,
             code => Err(Error::Dav {
                 method: "GET".into(),
                 url: url.to_string(),
                 status: code,
-                body: truncate(&text, 400),
+                body: error_body(response).await,
             }),
         }
     }
@@ -1566,7 +1578,6 @@ impl CalDavClient {
         if status.is_success() {
             return Ok(());
         }
-        let text = response.text().await.unwrap_or_default();
         match status.as_u16() {
             401 | 403 => Err(Error::InvalidCredentials(
                 "server rejected the username/app password",
@@ -1579,10 +1590,78 @@ impl CalDavClient {
                 method: method.to_string(),
                 url: url.to_string(),
                 status: code,
-                body: truncate(&text, 400),
+                body: error_body(response).await,
             }),
         }
     }
+}
+
+/// The most of a successful response this client reads. Every body is held
+/// whole while it is parsed, and a peak read holds it several times over (the
+/// bytes, the text, the XML tree, the events), so this bounds what one server
+/// can make the process allocate. A multistatus runs to a few KB per event, so
+/// it still fits a collection of over ten thousand.
+const MAX_BODY: usize = MAX_BODY_MIB * 1024 * 1024;
+pub(crate) const MAX_BODY_MIB: usize = 32;
+
+/// The most of an error response read, of which [`truncate`] keeps a prefix.
+const MAX_ERROR_BODY: usize = 4 * 1024;
+
+/// A successful response's body, refused rather than read past [`MAX_BODY`].
+async fn read_body(response: reqwest::Response, url: &str) -> Result<String> {
+    read_limited(response, url, MAX_BODY).await
+}
+
+async fn read_limited(response: reqwest::Response, url: &str, cap: usize) -> Result<String> {
+    let too_large = || Error::ResponseTooLarge {
+        url: url.to_string(),
+    };
+    let length = response.content_length();
+    if length.is_some_and(|n| n > cap as u64) {
+        return Err(too_large());
+    }
+    // A declared length is a promise, not bytes, so it sizes the buffer only up
+    // to a megabyte; a server that stalls cannot pin the whole cap.
+    let expected = length.map_or(0, |n| usize::try_from(n).unwrap_or(cap).min(1 << 20));
+    match read_capped(response, cap, expected).await? {
+        (body, false) => Ok(body),
+        (_, true) => Err(too_large()),
+    }
+}
+
+/// The start of an error response, for the message. Bodies can be long HTML
+/// error pages, and a failure to read one is no reason to hide the status.
+/// Reading a short body to its end also lets the connection go back to the pool.
+async fn error_body(response: reqwest::Response) -> String {
+    match read_capped(response, MAX_ERROR_BODY, 0).await {
+        Ok((body, _)) => truncate(&body, 400),
+        Err(_) => String::new(),
+    }
+}
+
+/// Up to `cap` bytes of the body as text, and whether more remained. Decoded the
+/// way `Response::text` decodes without a charset feature, lossy UTF-8, but
+/// without copying a body that is already valid. `expected` sizes the buffer,
+/// so it does not double past the cap on its way there.
+async fn read_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+    expected: usize,
+) -> reqwest::Result<(String, bool)> {
+    let mut body = Vec::with_capacity(expected.min(cap));
+    let mut truncated = false;
+    while let Some(chunk) = response.chunk().await? {
+        let room = cap - body.len();
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8(body)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    Ok((text, truncated))
 }
 
 /// A user-supplied time resolved to an instant plus its all-day-ness.
@@ -2522,6 +2601,88 @@ END:VCALENDAR
     #[test]
     fn xml_escape_neutralises_markup() {
         assert_eq!(xml_escape("a<b>&c"), "a&lt;b&gt;&amp;c");
+    }
+
+    /// Serve `chunks` once as a chunked response with no `Content-Length`, the
+    /// shape that only the chunk loop can bound.
+    async fn chunked(chunks: &'static [&'static str]) -> reqwest::Response {
+        serve(chunks, true).await
+    }
+
+    /// As [`chunked`], but the body never ends: only a reader that stops at its
+    /// cap returns.
+    async fn stalled(chunks: &'static [&'static str]) -> reqwest::Response {
+        serve(chunks, false).await
+    }
+
+    async fn serve(chunks: &'static [&'static str], finish: bool) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 1024]).await;
+            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.unwrap();
+            // Written apart so the client sees separate frames.
+            for chunk in chunks {
+                let frame = format!("{:x}\r\n{chunk}\r\n", chunk.len());
+                // The reader may stop at its cap and hang up first.
+                if socket.write_all(frame.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            match finish {
+                true => drop(socket.write_all(b"0\r\n\r\n").await),
+                false => tokio::time::sleep(std::time::Duration::from_secs(3600)).await,
+            }
+        });
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// An error page is read only as far as its message needs, so one that
+    /// never ends does not hold the read open.
+    #[tokio::test]
+    async fn an_endless_error_page_is_read_only_to_its_cap() {
+        let kib: &'static str = "x".repeat(1024).leak();
+        let chunks: &'static [&'static str] = vec![kib; 5].leak();
+        let response = stalled(chunks).await;
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), error_body(response));
+        assert!(!read.await.expect("stopped at the cap").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_cap_without_a_length_is_refused() {
+        let response = chunked(&["abc", "def", "ghi"]).await;
+        let err = read_limited(response, "http://x.test/", 7)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ResponseTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn reading_stops_at_the_cap_across_chunks() {
+        let response = chunked(&["abc", "def", "ghi"]).await;
+        assert_eq!(response.content_length(), None);
+        let (body, truncated) = read_capped(response, 7, 0).await.unwrap();
+        assert_eq!((body.as_str(), truncated), ("abcdefg", true));
+
+        let response = chunked(&["abc", "def"]).await;
+        let (body, truncated) = read_capped(response, 6, 0).await.unwrap();
+        assert_eq!((body.as_str(), truncated), ("abcdef", false));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_still_reads_lossily() {
+        let response = reqwest::Response::from(http::Response::new(vec![b'a', 0xff, b'b']));
+        let (body, _) = read_capped(response, 10, 0).await.unwrap();
+        assert_eq!(body, "a\u{fffd}b");
     }
 
     #[test]
