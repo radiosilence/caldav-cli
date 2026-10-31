@@ -124,7 +124,11 @@ impl Loader<Window> for EventWindowLoader {
                 Ok(events) => {
                     out.insert(key, Ok(Arc::new(events)));
                 }
-                Err(e @ (Error::TooManyOccurrences(_) | Error::ExpansionTooCostly { .. })) => {
+                Err(
+                    e @ (Error::TooManyOccurrences(_)
+                    | Error::ExpansionTooCostly { .. }
+                    | Error::ResponseTooLarge { .. }),
+                ) => {
                     out.insert(key, Err(Arc::new(e)));
                 }
                 // One unreadable calendar (shared, or a server hiccup) shouldn't
@@ -230,11 +234,15 @@ pub struct EventUidLoader {
     calendars: Arc<Calendars>,
 }
 
+/// One UID's outcome: the event, or why a calendar could not be searched for it.
+/// A miss is an absent key.
+pub type UidEvent = Result<Event, LoadError>;
+
 impl Loader<Uid> for EventUidLoader {
-    type Value = Event;
+    type Value = UidEvent;
     type Error = LoadError;
 
-    async fn load(&self, keys: &[Uid]) -> Result<HashMap<Uid, Event>, Self::Error> {
+    async fn load(&self, keys: &[Uid]) -> Result<HashMap<Uid, UidEvent>, Self::Error> {
         let calendars = load_calendars(&self.calendars).await?;
 
         let calls: Vec<_> = keys
@@ -255,13 +263,23 @@ impl Loader<Uid> for EventUidLoader {
             })
             .collect();
 
-        let mut out: HashMap<Uid, Event> = HashMap::with_capacity(keys.len());
+        let mut out: HashMap<Uid, UidEvent> = HashMap::with_capacity(keys.len());
         for (key, found) in fan_out(calls).await {
             // Calendars are searched in listing order and `fan_out` preserves
             // it, so the first hit wins deterministically — the same calendar
-            // the CLI's short-circuiting scan would have stopped at.
-            if let Ok(Some(event)) = found {
-                out.entry(key).or_insert(event);
+            // the CLI's short-circuiting scan would have stopped at. A calendar
+            // too large to search is reported unless another one has the
+            // event, since "no such event" would not be true.
+            match found {
+                Ok(Some(event)) => {
+                    if !matches!(out.get(&key), Some(Ok(_))) {
+                        out.insert(key, Ok(event));
+                    }
+                }
+                Err(e @ Error::ResponseTooLarge { .. }) => {
+                    out.entry(key).or_insert(Err(Arc::new(e)));
+                }
+                Ok(None) | Err(_) => {}
             }
         }
         Ok(out)

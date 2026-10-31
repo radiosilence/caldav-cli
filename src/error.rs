@@ -50,6 +50,14 @@ pub enum Error {
     #[error("Rate limited. Try again later.")]
     RateLimited,
 
+    /// A response past the size this client will read. The body is not read
+    /// beyond the limit.
+    #[error(
+        "{url} answered with more than {} MiB, the most this client reads",
+        crate::caldav::MAX_BODY_MIB
+    )]
+    ResponseTooLarge { url: String },
+
     /// Raised instead of truncating, so a partial expansion is never mistaken
     /// for the whole window.
     #[error(
