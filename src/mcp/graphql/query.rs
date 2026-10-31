@@ -4,8 +4,8 @@ use async_graphql::{Context, Object, Result};
 
 use super::DefaultCalendar;
 use super::connection::{
-    EventConnection, EventQuery, ListConnection, PageArgs, events_connection, page_complexity,
-    paginate,
+    EventConnection, EventQuery, FREE_BUSY_COST, LOOKUP_COST, ListConnection, PROBE_COST, PageArgs,
+    events_connection, page_complexity, paginate,
 };
 use super::filter::{EventFilter, EventSort};
 use super::loaders::{EventUids, Uid, to_gql_error};
@@ -25,6 +25,7 @@ impl QueryRoot {
     /// an error: "not connected" is the answer to this question, not a failure
     /// to answer it. So a caller polling for connection state branches on an
     /// enum rather than parsing an error message.
+    #[graphql(complexity = "PROBE_COST + child_complexity")]
     async fn viewer(&self, ctx: &Context<'_>) -> Result<GqlViewer> {
         Ok(GqlViewer::probe(ctx.data::<super::SharedClient>()?).await)
     }
@@ -183,6 +184,7 @@ impl QueryRoot {
     /// the UID directly. CalDAV filters have no OR, so without `calendar` this
     /// is one request per calendar until it hits; naming the calendar makes it
     /// exactly one.
+    #[graphql(complexity = "LOOKUP_COST + child_complexity")]
     async fn event(
         &self,
         ctx: &Context<'_>,
@@ -265,7 +267,7 @@ impl QueryRoot {
     ///
     /// Tries the server's free-busy REPORT and falls back to deriving the
     /// windows from the events themselves, which is what iCloud needs.
-    #[graphql(complexity = "page_complexity(first, last, child_complexity)")]
+    #[graphql(complexity = "FREE_BUSY_COST + page_complexity(first, last, child_complexity)")]
     async fn free_busy(
         &self,
         ctx: &Context<'_>,

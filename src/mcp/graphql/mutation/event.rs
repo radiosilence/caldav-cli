@@ -9,6 +9,7 @@ use crate::commands::parse_attendee_spec;
 use crate::models::{Attendee, Event, EventFields};
 use crate::util;
 
+use super::super::connection::WRITE_COST;
 use super::super::types::*;
 use super::super::{DefaultCalendar, SharedClient};
 
@@ -209,6 +210,7 @@ fn preview_update(existing: &Event, input: &EventInput) -> String {
 impl EventMutation {
     /// Create an event. Writes immediately — no preview step. Tell the user
     /// what was created afterwards, including the calendar it landed in.
+    #[graphql(complexity = "WRITE_COST + child_complexity")]
     async fn create_event(
         &self,
         ctx: &Context<'_>,
@@ -267,6 +269,7 @@ impl EventMutation {
     /// Update an event. Only the arguments you pass are changed. ALWAYS call
     /// with action=PREVIEW first — the preview shows a before → after diff.
     /// Read it back to the user and get their approval before CONFIRM.
+    #[graphql(complexity = "WRITE_COST + child_complexity")]
     async fn update_event(
         &self,
         ctx: &Context<'_>,
@@ -353,6 +356,7 @@ impl EventMutation {
     /// Delete an event. ALWAYS call with action=PREVIEW first — the preview
     /// names the event and its time so the user can confirm it's the right one.
     /// Get their approval before CONFIRM; a deletion cannot be undone.
+    #[graphql(complexity = "WRITE_COST + child_complexity")]
     async fn delete_event(
         &self,
         ctx: &Context<'_>,
@@ -396,6 +400,7 @@ impl EventMutation {
     /// Lossless where `deleteEvent` + `createEvent` is not: the stored iCalendar
     /// object is relocated rather than rebuilt, so alarms, attachments and
     /// per-occurrence overrides survive. ALWAYS call with action=PREVIEW first.
+    #[graphql(complexity = "WRITE_COST + child_complexity")]
     async fn move_event(
         &self,
         ctx: &Context<'_>,
@@ -453,6 +458,7 @@ impl EventMutation {
     /// otherwise give the exact start time. The PREVIEW names the instant it
     /// resolved to — read that back before confirming. ALWAYS call with
     /// action=PREVIEW first.
+    #[graphql(complexity = "WRITE_COST + child_complexity")]
     async fn delete_occurrence(
         &self,
         ctx: &Context<'_>,
@@ -525,6 +531,7 @@ impl EventMutation {
     ///
     /// Only your own row changes. Use `updateEvent(attendees: [...])` to change
     /// who is invited.
+    #[graphql(complexity = "WRITE_COST + child_complexity")]
     async fn respond_to_invite(
         &self,
         ctx: &Context<'_>,
