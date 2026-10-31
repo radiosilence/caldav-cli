@@ -659,13 +659,28 @@ END:VCALENDAR</c:calendar-data>
         .mount(&server)
         .await;
 
-    let event = client(&server)
+    let client = client(&server);
+    let event = client
         .get_event("not-the-filename", Some("Home"))
         .await
         .unwrap()
         .expect("found by scan");
     assert_eq!(event.summary.as_deref(), Some("Renamed resource"));
     assert_eq!(event.href, "/1234/calendars/home/1A2B3C.ics");
+
+    // Once refused, the filter is not offered again for later lookups.
+    client
+        .get_event("not-the-filename", Some("Home"))
+        .await
+        .unwrap();
+    let filters = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| String::from_utf8_lossy(&r.body).contains("prop-filter"))
+        .count();
+    assert_eq!(filters, 1);
 }
 
 /// A lookup that broke used to surface as "event not found", so every write
