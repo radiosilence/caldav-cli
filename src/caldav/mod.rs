@@ -9,12 +9,12 @@
 pub mod ical;
 pub mod recur;
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use chrono::{DateTime, Duration, Utc};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore, SemaphorePermit};
 use tracing::{debug, instrument};
 
 use crate::error::{Error, Result};
@@ -157,8 +157,11 @@ pub struct CalDavClient {
     username: String,
     password: String,
     /// Discovery is three round trips; the principal and home don't change, so
-    /// cache them for the client's life.
-    home: OnceCell<String>,
+    /// cache them for the client's life. Shared with every [`Self::limited`]
+    /// view of the client.
+    home: Arc<OnceCell<String>>,
+    /// The permits this view's requests draw on, when it has a limit.
+    in_flight: Option<Arc<Semaphore>>,
 }
 
 impl CalDavClient {
@@ -179,7 +182,38 @@ impl CalDavClient {
             base: base.trim_end_matches('/').to_string(),
             username,
             password,
-            home: OnceCell::new(),
+            home: Arc::new(OnceCell::new()),
+            in_flight: None,
+        }
+    }
+
+    /// The same account, with at most [`MAX_CONCURRENT_REQUESTS`] of its
+    /// requests in flight at once. One view serves one GraphQL request, so every
+    /// path that request takes to the server, through a loader or not, shares
+    /// the one bound; discovery stays shared with the client it came from.
+    pub fn limited(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            base: self.base.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            home: self.home.clone(),
+            in_flight: Some(Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS))),
+        }
+    }
+
+    /// A permit for one request, held until its response has been read. Taken
+    /// only around a single request, never across another await, so no caller
+    /// holds one while waiting for a second.
+    async fn permit(&self) -> Option<SemaphorePermit<'_>> {
+        match &self.in_flight {
+            Some(limit) => Some(
+                limit
+                    .acquire()
+                    .await
+                    .expect("the semaphore is never closed"),
+            ),
+            None => None,
         }
     }
 
@@ -207,6 +241,7 @@ impl CalDavClient {
             req = req.header("Content-Type", content_type).body(body);
         }
 
+        let _permit = self.permit().await;
         let response = req.send().await?;
         let status = response.status();
         debug!(%method, %url, %status, "CalDAV response");
@@ -1290,6 +1325,7 @@ impl CalDavClient {
         let source_url = existing.resource_url.clone();
         debug!(%source_url, %dest_url, "moving event");
 
+        let permit = self.permit().await;
         let moved = self
             .client
             .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &source_url)
@@ -1311,6 +1347,8 @@ impl CalDavClient {
             Ok(response) if refuses_move(response.status().as_u16()) => {
                 let status = response.status().as_u16();
                 debug!(status, "MOVE refused, falling back to copy and delete");
+                // The copy takes permits of its own.
+                drop(permit);
                 self.copy_then_delete(&source_url, &dest_url, existing.etag.as_deref())
                     .await?;
             }
@@ -1384,6 +1422,7 @@ impl CalDavClient {
 
     /// GET a resource's body unchanged.
     async fn get_raw(&self, url: &str) -> Result<String> {
+        let _permit = self.permit().await;
         let response = self
             .client
             .get(url)
@@ -1601,6 +1640,7 @@ impl CalDavClient {
         method: &str,
         url: &str,
     ) -> Result<()> {
+        let _permit = self.permit().await;
         let response = request.send().await?;
         let status = response.status();
         if status.is_success() {
