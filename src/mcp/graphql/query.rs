@@ -202,6 +202,8 @@ impl QueryRoot {
             })
             .await
             .map_err(to_gql_error)?
+            .transpose()
+            .map_err(to_gql_error)?
             .map(GqlEvent::from))
     }
 
