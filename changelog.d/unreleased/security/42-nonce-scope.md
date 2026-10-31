@@ -1,0 +1,1 @@
+- **Preview tokens answer only for the account that asked.** The HTTP server shares one token store across accounts, so a token issued to one account could confirm the same change for another, and one account issuing many previews evicted everyone else's. Tokens are now bound to their account and capped per account.

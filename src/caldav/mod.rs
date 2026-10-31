@@ -395,6 +395,15 @@ impl CalDavClient {
         self.home.initialized()
     }
 
+    /// A digest of the password, for telling credential sets apart without
+    /// holding the password a second time.
+    pub fn password_digest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.password.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// The CalDAV base URL this client authenticates against.
     pub fn server_url(&self) -> &str {
         &self.base
