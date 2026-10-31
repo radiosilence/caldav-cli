@@ -58,11 +58,14 @@ pub enum Error {
     )]
     TooManyOccurrences(usize),
 
+    /// Names the series that cost the most, since that is the one to delete or
+    /// read unexpanded.
     #[error(
-        "the recurring events in this read take too many steps to expand; narrow the \
-         window, name a calendar, or read without expanding recurrences"
+        "recurring events in this read take too many steps to expand, most of all \
+         {summary:?} ({uid}); read without expanding recurrences, narrow the window, \
+         or delete that series"
     )]
-    ExpansionTooCostly,
+    ExpansionTooCostly { uid: String, summary: String },
 
     #[error("Server error: {0}")]
     Server(String),

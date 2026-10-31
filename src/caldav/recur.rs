@@ -13,11 +13,12 @@
 //! it subtly wrong means silently showing someone the wrong day.
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, Months, NaiveDateTime, TimeZone, Utc};
 use rrule::{Frequency, RRuleSet};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 use crate::models::{Event, EventTime};
@@ -66,6 +67,16 @@ pub struct ExpansionBudget {
     occurrences: AtomicUsize,
     steps: AtomicI64,
     work: AtomicI64,
+    /// The series that has spent the largest share of its own caps, so that a
+    /// scope that runs out can name what to delete or read unexpanded.
+    costliest: Mutex<Option<Costliest>>,
+}
+
+#[derive(Debug, Clone)]
+struct Costliest {
+    share: f64,
+    uid: String,
+    summary: Option<String>,
 }
 
 impl ExpansionBudget {
@@ -77,6 +88,34 @@ impl ExpansionBudget {
             })
             .map(drop)
             .map_err(|_| Error::TooManyOccurrences(MAX_EXPANDED))
+    }
+
+    fn record(&self, event: &Event, steps: i64, work: i64) {
+        let share = (steps as f64 / MAX_STEPS as f64).max(work as f64 / MAX_WORK as f64);
+        let mut costliest = self.costliest.lock().unwrap_or_else(|e| e.into_inner());
+        if costliest.as_ref().is_none_or(|c| share > c.share) {
+            *costliest = Some(Costliest {
+                share,
+                uid: event.id.clone(),
+                summary: event.summary.clone(),
+            });
+        }
+    }
+
+    fn exhausted(&self, event: &Event) -> Error {
+        let costliest = self
+            .costliest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (uid, summary) = match costliest {
+            Some(c) => (c.uid, c.summary),
+            None => (event.id.clone(), event.summary.clone()),
+        };
+        Error::ExpansionTooCostly {
+            uid,
+            summary: summary.unwrap_or_else(|| "(no title)".into()),
+        }
     }
 }
 
@@ -156,7 +195,7 @@ pub fn expand_all(
             continue;
         }
 
-        match occurrences(&source, start, end, budget)? {
+        match occurrences(&event, &source, start, end, budget)? {
             Ok(instants) if !instants.is_empty() => series.push((event, instants)),
             Ok(_) => {
                 // The rule is valid but yields nothing in this window. The
@@ -164,9 +203,10 @@ pub fn expand_all(
                 debug!(uid = %event.id, "series has no occurrences in range");
             }
             Err(e) => {
-                // An unparseable rule shouldn't hide the event entirely —
-                // fall back to showing the master as-is.
-                debug!(uid = %event.id, error = %e, "could not expand series");
+                // An unexpandable rule shouldn't hide the event entirely —
+                // fall back to showing the master as-is. Outside the window the
+                // master is dropped like any other event, so say which.
+                warn!(uid = %event.id, error = %e, "could not expand series");
                 out.push(event);
             }
         }
@@ -255,6 +295,7 @@ fn pin_dates_to_utc(source: &str) -> String {
 /// expanded, and the caller shows the master instead. The outer one is the
 /// scope running out of steps, which fails the read.
 fn occurrences(
+    event: &Event,
     source: &str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
@@ -295,7 +336,7 @@ fn occurrences(
         steps += 1;
         if steps > step_cap {
             exhausted = step_cap < MAX_STEPS;
-            debug!(limit = step_cap, "series hit the step cap");
+            warn!(uid = %event.id, limit = step_cap, "series hit the step cap");
             break;
         }
         let date = date.with_timezone(&Utc);
@@ -303,7 +344,7 @@ fn occurrences(
             work = (date - anchor).num_seconds() / secs;
             if work > work_cap {
                 exhausted = work_cap < MAX_WORK;
-                debug!(limit = work_cap, "series hit the work cap");
+                warn!(uid = %event.id, limit = work_cap, "series hit the work cap");
                 break;
             }
         }
@@ -322,8 +363,9 @@ fn occurrences(
     // charged at most what it was granted.
     refund(&budget.steps, step_cap, steps);
     refund(&budget.work, work_cap, work);
+    budget.record(event, steps.min(step_cap), work.min(work_cap));
     if exhausted {
-        return Err(Error::ExpansionTooCostly);
+        return Err(budget.exhausted(event));
     }
     Ok(Ok(dates))
 }
@@ -351,9 +393,7 @@ fn period_dates(rule: &rrule::RRule) -> usize {
 }
 
 /// Move a series' `DTSTART` forward to shortly before `start`, so iteration
-/// begins near the window rather than wherever the series began. Applies to
-/// weekly and finer rules, whose steps are a fixed length of wall time; a month
-/// or a year is not.
+/// begins near the window rather than wherever the series began.
 ///
 /// The anchor moves by whole multiples of the rule's interval in local wall
 /// time, which is how rrule steps, so every later occurrence is unchanged. It
@@ -365,12 +405,15 @@ fn period_dates(rule: &rrule::RRule) -> usize {
 ///   time while BYMINUTE or BYHOUR rejects it, which drifts the grid unless the
 ///   interval divides a minute. Moving the anchor would then change the drift.
 ///
+/// - A monthly series from a day past the 28th, or a yearly one from 29
+///   February, would land on a clamped day (see [`Step::of`]).
+///
 /// The anchor never passes UNTIL, which rrule requires to be no earlier.
 fn fast_forward(set: RRuleSet, start: DateTime<Utc>) -> RRuleSet {
     let [rule] = set.get_rrule().as_slice() else {
         return set;
     };
-    let interval = i64::from(rule.get_interval().max(1));
+    let interval = rule.get_interval().max(1);
     let carries_through_a_filter = 60 % interval != 0
         && match rule.get_freq() {
             Frequency::Minutely => !rule.get_by_hour().is_empty(),
@@ -379,35 +422,31 @@ fn fast_forward(set: RRuleSet, start: DateTime<Utc>) -> RRuleSet {
             }
             _ => false,
         };
-    let Some(unit_secs) = unit_secs(rule.get_freq()) else {
-        return set;
-    };
     if rule.get_count().is_some() || !set.get_exrule().is_empty() || carries_through_a_filter {
         return set;
     }
 
     let dt_start = *set.get_dt_start();
     let tz = dt_start.timezone();
-    let step = unit_secs * interval;
     let from = dt_start.naive_local();
-    // One step and three hours of margin: wall time can run up to two hours
-    // behind the instant across a DST change, so no occurrence at or after
-    // `start` can fall before the new anchor.
-    let mut target = start.with_timezone(&tz).naive_local() - Duration::seconds(step + 3 * 3600);
+    let Some(step) = Step::of(rule.get_freq(), interval, from) else {
+        return set;
+    };
+    // Three hours of margin, then one more step below: wall time can run up to
+    // two hours behind the instant across a DST change, so no occurrence at or
+    // after `start` can fall before the new anchor.
+    let mut target = start.with_timezone(&tz).naive_local() - Duration::hours(3);
     if let Some(until) = rule.get_until() {
         target = target.min(until.with_timezone(&tz).naive_local());
     }
-    let steps = (target - from).num_seconds() / step;
+    let steps = step.count(from, target) - 1;
 
     // rrule refuses a DTSTART in a DST gap or overlap, so step back to one
     // that names a single instant.
     let anchor = (steps.saturating_sub(4)..=steps)
         .rev()
         .take_while(|k| *k > 0)
-        .find_map(|k| {
-            let naive = from.checked_add_signed(Duration::try_seconds(k.checked_mul(step)?)?)?;
-            tz.from_local_datetime(&naive).single()
-        });
+        .find_map(|k| tz.from_local_datetime(&step.advance(from, k)?).single());
     let Some(anchor) = anchor else {
         return set;
     };
@@ -415,6 +454,57 @@ fn fast_forward(set: RRuleSet, start: DateTime<Utc>) -> RRuleSet {
         .set_rrules(set.get_rrule().clone())
         .set_rdates(set.get_rdate().clone())
         .set_exdates(set.get_exdate().clone())
+}
+
+/// One step of a rule in wall time, as rrule advances it.
+enum Step {
+    Seconds(i64),
+    Months(u32),
+}
+
+impl Step {
+    /// The step for `freq` every `interval`, or `None` where moving the anchor
+    /// by whole steps would change the series. A month step from a day past
+    /// the 28th, or a year step from 29 February, is clamped by date arithmetic
+    /// to a different day, which rrule would then take as the series' day.
+    fn of(freq: Frequency, interval: u16, from: NaiveDateTime) -> Option<Self> {
+        let interval = u32::from(interval);
+        Some(match freq {
+            Frequency::Yearly if !(from.month() == 2 && from.day() == 29) => {
+                Self::Months(12 * interval)
+            }
+            Frequency::Monthly if from.day() <= 28 => Self::Months(interval),
+            _ => Self::Seconds(unit_secs(freq)? * i64::from(interval)),
+        })
+    }
+
+    /// Whole steps from `from` that land at or before `to`.
+    fn count(&self, from: NaiveDateTime, to: NaiveDateTime) -> i64 {
+        match self {
+            Self::Seconds(secs) => (to - from).num_seconds().div_euclid(*secs),
+            Self::Months(months) => {
+                let month_of =
+                    |at: NaiveDateTime| i64::from(at.year()) * 12 + i64::from(at.month0());
+                let mut whole = month_of(to) - month_of(from);
+                // A month counts only once its day and time have come round.
+                if (to.day(), to.time()) < (from.day(), from.time()) {
+                    whole -= 1;
+                }
+                whole.div_euclid(i64::from(*months))
+            }
+        }
+    }
+
+    fn advance(&self, from: NaiveDateTime, k: i64) -> Option<NaiveDateTime> {
+        match self {
+            Self::Seconds(secs) => {
+                from.checked_add_signed(Duration::try_seconds(k.checked_mul(*secs)?)?)
+            }
+            Self::Months(months) => {
+                from.checked_add_months(Months::new(u32::try_from(k).ok()?.checked_mul(*months)?))
+            }
+        }
+    }
 }
 
 /// Seconds of wall time in one step of a frequency; `None` for monthly and
@@ -837,6 +927,8 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
         // margin, and near enough that the unmoved reference stays cheap.
         let from = at(2026, 10, 25, 0);
         let starts_at = [
+            ("YEARLY", "18500315T090700", 3 * 365 * 24),
+            ("MONTHLY", "20160115T090700", 365 * 24),
             ("WEEKLY", "20230105T090700", 365 * 24),
             ("DAILY", "20260101T090700", 70 * 24),
             ("HOURLY", "20261015T000700", 3),
@@ -996,8 +1088,61 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
         reserve(&spent.work, MAX_REQUEST_WORK, MAX_REQUEST_WORK);
         assert!(matches!(
             expand_all(parse(&ics), from, to, &spent),
-            Err(Error::ExpansionTooCostly)
+            Err(Error::ExpansionTooCostly { .. })
         ));
+    }
+
+    /// The error names the series that spent the most, not whichever happened
+    /// to ask after the scope ran dry.
+    #[test]
+    fn a_scope_out_of_steps_names_its_costliest_series() {
+        let costly = series(
+            "DTSTART:20200101T000000Z",
+            "RRULE:FREQ=SECONDLY;COUNT=4000000000",
+        )
+        .replace("UID:s", "UID:costly")
+        .replace("SUMMARY:S", "SUMMARY:Spam");
+        let innocent = series("DTSTART:20260705T000000Z", "RRULE:FREQ=HOURLY;COUNT=100");
+        let (from, to) = (at(2026, 7, 6, 0), at(2026, 7, 6, 3));
+        let budget = ExpansionBudget::default();
+        for _ in 0..MAX_REQUEST_STEPS / MAX_STEPS {
+            expand_all(parse(&costly), from, to, &budget).unwrap();
+        }
+        let err = expand_all(parse(&innocent), from, to, &budget).unwrap_err();
+        assert!(err.to_string().contains("\"Spam\" (costly)"), "{err}");
+    }
+
+    /// A dense monthly rule begun years ago reaches the window by moving its
+    /// anchor whole months at a time.
+    #[test]
+    fn a_dense_monthly_series_from_years_ago_still_expands() {
+        let ics = series(
+            "DTSTART;TZID=Europe/London:20210115T080000",
+            "RRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;\
+BYHOUR=8,9,10,11,12,13,14,15,16,17,18,19,20;BYMINUTE=0,15,30,45",
+        );
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 7, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 52);
+    }
+
+    #[test]
+    fn month_steps_keep_a_late_day_where_it_is() {
+        let from = chrono::NaiveDate::from_ymd_opt(2026, 1, 31)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap();
+        assert!(Step::of(Frequency::Monthly, 1, from).is_none());
+        let leap = chrono::NaiveDate::from_ymd_opt(2024, 2, 29)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap();
+        assert!(Step::of(Frequency::Yearly, 1, leap).is_none());
     }
 
     /// rrule buffers a whole period of a daily or slower rule before yielding,
