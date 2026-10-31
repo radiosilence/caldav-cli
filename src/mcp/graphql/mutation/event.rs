@@ -260,7 +260,7 @@ impl EventMutation {
         let written = client
             .create_event(input.calendar.as_deref(), &fields)
             .await;
-        events_changed(ctx)?;
+        reads_changed(ctx).await?;
         match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
@@ -348,7 +348,7 @@ impl EventMutation {
         let written = client
             .update_event(&id, input.calendar.as_deref(), &fields)
             .await;
-        events_changed(ctx)?;
+        reads_changed(ctx).await?;
         match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
@@ -392,7 +392,7 @@ impl EventMutation {
         }
 
         let written = client.delete_event(&id, calendar.as_deref()).await;
-        events_changed(ctx)?;
+        reads_changed(ctx).await?;
         match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
@@ -446,7 +446,7 @@ impl EventMutation {
         let written = client
             .move_event(&id, calendar.as_deref(), &to_calendar)
             .await;
-        events_changed(ctx)?;
+        reads_changed(ctx).await?;
         match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
@@ -522,7 +522,7 @@ impl EventMutation {
         let written = client
             .exclude_occurrence(&id, calendar.as_deref(), &occurrence)
             .await;
-        events_changed(ctx)?;
+        reads_changed(ctx).await?;
         match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
@@ -596,7 +596,7 @@ impl EventMutation {
         let written = client
             .respond_to_invite(&id, calendar.as_deref(), partstat, attendee.as_deref())
             .await;
-        events_changed(ctx)?;
+        reads_changed(ctx).await?;
         match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),

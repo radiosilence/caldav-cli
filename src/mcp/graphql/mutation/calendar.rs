@@ -79,7 +79,7 @@ impl CalendarMutation {
             order,
         };
         let written = client.create_calendar(&name, &fields).await;
-        types::calendars_changed(ctx).await?;
+        types::reads_changed(ctx).await?;
         match written {
             Ok(calendar) => Ok(GqlCalendarResult::done(calendar)),
             Err(e) => Ok(GqlCalendarResult::failed(e.to_string())),
@@ -140,7 +140,7 @@ impl CalendarMutation {
         }
 
         let written = client.update_calendar(&id, &fields).await;
-        types::calendars_changed(ctx).await?;
+        types::reads_changed(ctx).await?;
         match written {
             Ok(calendar) => Ok(GqlCalendarResult::done(calendar)),
             Err(e) => Ok(GqlCalendarResult::failed(e.to_string())),
@@ -173,7 +173,7 @@ impl CalendarMutation {
                 Ok(c) => c,
                 Err(e) => return Ok(GqlCalendarResult::failed(e.to_string())),
             };
-            if let Some(refusal) = crate::caldav::deletion_refused(&existing) {
+            if let Err(refusal) = crate::caldav::deletion_refused(&existing) {
                 return Ok(GqlCalendarResult::failed(refusal.to_string()));
             }
             // Counting is a year-wide read, paid only on the preview. A bare
@@ -216,7 +216,7 @@ impl CalendarMutation {
         }
 
         let written = client.delete_calendar(&id).await;
-        types::calendars_changed(ctx).await?;
+        types::reads_changed(ctx).await?;
         match written {
             Ok(calendar) => Ok(GqlCalendarResult::done(calendar)),
             Err(e) => Ok(GqlCalendarResult::failed(e.to_string())),
@@ -248,7 +248,7 @@ impl CalendarMutation {
             .map(|c| c.name.clone());
 
         let moved = client.set_default_calendar(&id).await;
-        types::calendars_changed(ctx).await?;
+        types::reads_changed(ctx).await?;
         match moved {
             Ok(calendar) => Ok(GqlCalendarResult {
                 previous_default: previous,
