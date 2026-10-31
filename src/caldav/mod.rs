@@ -658,14 +658,16 @@ impl CalDavClient {
     /// With `expand`, the server returns each occurrence of a recurring series
     /// as its own VEVENT (RFC 4791 §9.6.5) — what you want for an agenda. Without
     /// it you get the master event carrying its RRULE, which is what you want
-    /// before editing a series.
-    #[instrument(skip(self))]
+    /// before editing a series. Expansion draws on `budget`, which the caller
+    /// shares across everything it reads in one go.
+    #[instrument(skip(self, budget))]
     pub async fn list_events(
         &self,
         calendar: &Calendar,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         expand: bool,
+        budget: &recur::ExpansionBudget,
     ) -> Result<Vec<Event>> {
         let body = self.query_body(start, end, expand);
 
@@ -702,7 +704,7 @@ impl CalDavClient {
         if expand {
             // Idempotent: anything the server already expanded arrives without
             // an RRULE and passes straight through.
-            events = recur::expand_all(events, start, end);
+            events = recur::expand_all(events, start, end, budget)?;
         }
         // Expansion can hand back instances just outside the window; the range
         // the caller asked for is the range they get.
@@ -801,26 +803,25 @@ impl CalDavClient {
         limit: usize,
     ) -> Result<Vec<Event>> {
         let targets = self.read_targets(calendar).await?;
+        let budget = recur::ExpansionBudget::default();
         let calls: Vec<_> = targets
             .iter()
-            .map(|cal| self.list_events(cal, start, end, expand))
+            .map(|cal| self.list_events(cal, start, end, expand, &budget))
             .collect();
         let results = fan_out(calls).await;
 
-        let mut all: Vec<Event> = results
-            .into_iter()
-            .zip(&targets)
-            // One unreadable calendar (shared, or a server hiccup) should not
-            // sink the whole agenda.
-            .filter_map(|(events, cal)| {
-                events
-                    .inspect_err(
-                        |e| tracing::warn!(calendar = %cal.name, error = %e, "skipping calendar"),
-                    )
-                    .ok()
-            })
-            .flatten()
-            .collect();
+        let mut all: Vec<Event> = Vec::new();
+        for (events, cal) in results.into_iter().zip(&targets) {
+            match events {
+                Ok(events) => all.extend(events),
+                Err(e @ (Error::TooManyOccurrences(_) | Error::ExpansionTooCostly { .. })) => {
+                    return Err(e);
+                }
+                // One unreadable calendar (shared, or a server hiccup) should
+                // not sink the whole agenda.
+                Err(e) => tracing::warn!(calendar = %cal.name, error = %e, "skipping calendar"),
+            }
+        }
 
         all.sort_by_key(|e| e.start.sort_key());
         all.truncate(limit.min(MAX_EVENTS));
@@ -1143,7 +1144,7 @@ impl CalDavClient {
                     Some(raw) => resolve_end(raw, tzid, start)?,
                     None => match fields.duration_minutes {
                         Some(mins) => ResolvedTime {
-                            instant: start.instant + Duration::minutes(mins),
+                            instant: add_minutes(start.instant, mins)?,
                             all_day: start.all_day,
                         },
                         None => ResolvedTime {
@@ -1617,16 +1618,19 @@ fn resolve_span(
         Some(raw) => resolve_end(raw, tzid, start)?,
         None => match fields.duration_minutes {
             Some(mins) => ResolvedTime {
-                instant: start.instant + Duration::minutes(mins),
+                instant: add_minutes(start.instant, mins)?,
                 all_day,
             },
             None => ResolvedTime {
-                instant: start.instant
-                    + if all_day {
+                instant: util::add_span(
+                    start.instant,
+                    Some(if all_day {
                         Duration::days(1)
                     } else {
                         Duration::hours(1)
-                    },
+                    }),
+                    || format!("{start_raw} plus the default length"),
+                )?,
                 all_day,
             },
         },
@@ -1639,6 +1643,13 @@ fn resolve_span(
         });
     }
     Ok((start, end))
+}
+
+/// `instant` plus a caller's duration in minutes.
+fn add_minutes(instant: DateTime<Utc>, minutes: i64) -> Result<DateTime<Utc>> {
+    util::add_span(instant, Duration::try_minutes(minutes), || {
+        format!("{minutes} minutes")
+    })
 }
 
 fn resolve_end(raw: &str, tzid: Option<&str>, start: ResolvedTime) -> Result<ResolvedTime> {
@@ -1720,7 +1731,8 @@ pub fn resolve_occurrence(
         vec![rule_only],
         parsed.instant - Duration::days(1),
         parsed.instant + Duration::days(2),
-    )
+        &recur::ExpansionBudget::default(),
+    )?
     .into_iter()
     .filter_map(|e| e.start.instant)
     .collect();
@@ -2420,6 +2432,30 @@ END:VCALENDAR
         assert!(!matches_query(&e, "unrelated"));
         // An empty needle matches everything.
         assert!(matches_query(&e, ""));
+    }
+
+    #[test]
+    fn an_unrepresentable_duration_is_an_error() {
+        let fields = EventFields {
+            summary: Some("x"),
+            start: Some("2026-07-24T09:00:00Z"),
+            duration_minutes: Some(9_007_199_254_740_991),
+            ..Default::default()
+        };
+        assert!(resolve_span("2026-07-24T09:00:00Z", &fields, None).is_err());
+    }
+
+    /// The default end is derived, not parsed, and still has to be a year
+    /// iCalendar can write.
+    #[test]
+    fn a_default_end_past_year_9999_is_an_error() {
+        for start in ["9999-12-31", "9999-12-31T23:30:00Z"] {
+            let fields = EventFields {
+                start: Some(start),
+                ..Default::default()
+            };
+            assert!(resolve_span(start, &fields, None).is_err(), "{start}");
+        }
     }
 
     #[test]

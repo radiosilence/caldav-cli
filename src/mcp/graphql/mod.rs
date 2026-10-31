@@ -74,6 +74,7 @@ pub fn request(
     let loaders = loaders::Loaders::new(client.clone());
     async_graphql::Request::new(query)
         .data(client)
+        .data(loaders.budget)
         .data(DefaultCalendar(default_calendar))
         .data(loaders.calendar)
         .data(loaders.window)
