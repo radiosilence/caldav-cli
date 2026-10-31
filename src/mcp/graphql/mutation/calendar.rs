@@ -77,7 +77,9 @@ impl CalendarMutation {
             color: color.as_deref(),
             order,
         };
-        match client.create_calendar(&name, &fields).await {
+        let written = client.create_calendar(&name, &fields).await;
+        types::calendars_changed(ctx).await?;
+        match written {
             Ok(calendar) => Ok(GqlCalendarResult::done(calendar)),
             Err(e) => Ok(GqlCalendarResult::failed(e.to_string())),
         }
@@ -136,7 +138,9 @@ impl CalendarMutation {
             return Ok(GqlCalendarResult::failed(msg));
         }
 
-        match client.update_calendar(&id, &fields).await {
+        let written = client.update_calendar(&id, &fields).await;
+        types::calendars_changed(ctx).await?;
+        match written {
             Ok(calendar) => Ok(GqlCalendarResult::done(calendar)),
             Err(e) => Ok(GqlCalendarResult::failed(e.to_string())),
         }
@@ -202,7 +206,9 @@ impl CalendarMutation {
             return Ok(GqlCalendarResult::failed(msg));
         }
 
-        match client.delete_calendar(&id).await {
+        let written = client.delete_calendar(&id).await;
+        types::calendars_changed(ctx).await?;
+        match written {
             Ok(calendar) => Ok(GqlCalendarResult::done(calendar)),
             Err(e) => Ok(GqlCalendarResult::failed(e.to_string())),
         }
@@ -233,8 +239,7 @@ impl CalendarMutation {
             .map(|c| c.name.clone());
 
         let moved = client.set_default_calendar(&id).await;
-        // Later fields in this request must see the new default.
-        ctx.data::<types::DefaultListing>()?.forget().await;
+        types::calendars_changed(ctx).await?;
         match moved {
             Ok(calendar) => Ok(GqlCalendarResult {
                 previous_default: previous,

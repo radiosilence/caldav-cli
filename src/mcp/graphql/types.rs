@@ -48,10 +48,13 @@ pub(crate) async fn all_calendars(ctx: &Context<'_>) -> Result<std::sync::Arc<Ve
 #[derive(Default)]
 pub struct DefaultListing(tokio::sync::Mutex<Option<std::sync::Arc<Vec<Calendar>>>>);
 
-impl DefaultListing {
-    pub(crate) async fn forget(&self) {
-        *self.0.lock().await = None;
-    }
+/// Forget the request's calendar listing, and the default resolved from it,
+/// after a write that may have changed either, so later fields in the same
+/// request read the account as it now is.
+pub(crate) async fn calendars_changed(ctx: &Context<'_>) -> Result<()> {
+    ctx.data::<std::sync::Arc<Calendars>>()?.clear::<()>();
+    *ctx.data::<DefaultListing>()?.0.lock().await = None;
+    Ok(())
 }
 
 /// The listing with the account's default flagged, which may cost a second

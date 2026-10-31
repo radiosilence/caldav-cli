@@ -813,6 +813,53 @@ async fn the_default_calendar_is_read_only_when_asked_for() {
     );
 }
 
+/// A server that names the default in its listing changes that answer after
+/// a write; a later field in the same request must read the new one, not the
+/// listing cached before it.
+#[tokio::test]
+async fn a_write_refreshes_the_listing_for_later_fields() {
+    let h = Harness::start().await;
+    let listing = |default: &str| {
+        CALENDARS_XML.replace(
+            "</multistatus>",
+            &format!(
+                "<response><href>/1234/calendars/inbox/</href><propstat><prop>\
+                 <resourcetype><collection/><c:schedule-inbox/></resourcetype>\
+                 <c:schedule-default-calendar-URL><href>/1234/calendars/{default}/</href>\
+                 </c:schedule-default-calendar-URL></prop></propstat></response></multistatus>"
+            ),
+        )
+    };
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ok(listing("team")))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ok(listing("home")))
+        .with_priority(2)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PROPPATCH"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(""))
+        .mount(&h.server)
+        .await;
+
+    let data = h
+        .run(
+            r#"mutation {
+                first: setDefaultCalendar(id: "Home") { previousDefault }
+                again: setDefaultCalendar(id: "Home") { previousDefault }
+            }"#,
+        )
+        .await;
+    assert_eq!(data["first"]["previousDefault"], "Team", "{data}");
+    assert_eq!(data["again"]["previousDefault"], "Home", "{data}");
+}
+
 #[tokio::test]
 async fn first_and_last_together_are_rejected() {
     let h = Harness::start().await;
