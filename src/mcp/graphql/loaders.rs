@@ -26,6 +26,7 @@ use chrono::{DateTime, Utc};
 
 use super::SharedClient;
 use crate::caldav::fan_out;
+use crate::caldav::recur::ExpansionBudget;
 use crate::error::Error;
 use crate::models::{Calendar, Event};
 
@@ -83,16 +84,24 @@ pub struct Window {
 /// concurrently rather than one after another, and that duplicate windows —
 /// which is what a graph query produces, every event on a page asking about the
 /// same day — collapse to one.
+///
+/// A window over the request's expansion budget resolves to its own error, so
+/// it fails the field that asked for it and not every window sharing its batch,
+/// and is cached like any other outcome rather than re-issued.
 pub struct EventWindowLoader {
     client: SharedClient,
     calendars: Arc<Calendars>,
+    budget: Arc<ExpansionBudget>,
 }
 
+/// One window's outcome, as [`EventWindowLoader`] caches it.
+pub type WindowEvents = Result<Arc<Vec<Event>>, LoadError>;
+
 impl Loader<Window> for EventWindowLoader {
-    type Value = Arc<Vec<Event>>;
+    type Value = WindowEvents;
     type Error = LoadError;
 
-    async fn load(&self, keys: &[Window]) -> Result<HashMap<Window, Arc<Vec<Event>>>, Self::Error> {
+    async fn load(&self, keys: &[Window]) -> Result<HashMap<Window, WindowEvents>, Self::Error> {
         let calendars = load_calendars(&self.calendars).await?;
 
         let calls: Vec<_> = keys
@@ -102,7 +111,7 @@ impl Loader<Window> for EventWindowLoader {
                 Some(async move {
                     let events = self
                         .client
-                        .list_events(calendar, key.start, key.end, key.expand)
+                        .list_events(calendar, key.start, key.end, key.expand, &self.budget)
                         .await;
                     (key.clone(), events)
                 })
@@ -113,7 +122,10 @@ impl Loader<Window> for EventWindowLoader {
         for (key, events) in fan_out(calls).await {
             match events {
                 Ok(events) => {
-                    out.insert(key, Arc::new(events));
+                    out.insert(key, Ok(Arc::new(events)));
+                }
+                Err(e @ (Error::TooManyOccurrences(_) | Error::ExpansionTooCostly { .. })) => {
+                    out.insert(key, Err(Arc::new(e)));
                 }
                 // One unreadable calendar (shared, or a server hiccup) shouldn't
                 // sink the whole query. An absent key resolves to an empty list,
@@ -280,6 +292,9 @@ pub type EventUids = DataLoader<EventUidLoader, HashMapCache>;
 
 /// All loaders for one GraphQL request, ready to be attached as request data.
 pub struct Loaders {
+    /// Shared by the window loader and `Event.occurrences`, so the expansion
+    /// cap holds for the request as a whole.
+    pub budget: Arc<ExpansionBudget>,
     pub calendar: Arc<Calendars>,
     pub window: EventWindows,
     pub resource: EventResources,
@@ -298,11 +313,13 @@ impl Loaders {
             HashMapCache::default(),
         ));
 
+        let budget = Arc::new(ExpansionBudget::default());
         Self {
             window: EventWindows::with_cache(
                 EventWindowLoader {
                     client: client.clone(),
                     calendars: calendar.clone(),
+                    budget: budget.clone(),
                 },
                 tokio::spawn,
                 HashMapCache::default(),
@@ -325,6 +342,7 @@ impl Loaders {
                 HashMapCache::default(),
             ),
             calendar,
+            budget,
         }
     }
 }

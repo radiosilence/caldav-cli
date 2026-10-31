@@ -11,6 +11,8 @@
 //! server implements and the one that bounds how much comes back — and
 //! everything else is decided here, where `and`/`or`/`not` can nest freely.
 
+use std::borrow::Borrow;
+
 use async_graphql::{Enum, InputObject};
 
 use crate::models::Event;
@@ -202,13 +204,14 @@ pub struct EventSort {
 
 /// Order `events` in place. With no sort given, earliest start first — the order
 /// an agenda wants and the one every read has always returned.
-pub fn sort_events(events: &mut [Event], sort: Option<&[EventSort]>) {
+pub fn sort_events<E: Borrow<Event>>(events: &mut [E], sort: Option<&[EventSort]>) {
     let Some(sort) = sort.filter(|s| !s.is_empty()) else {
-        events.sort_by_key(|e| e.start.sort_key());
+        events.sort_by_key(|e| e.borrow().start.sort_key());
         return;
     };
 
     events.sort_by(|a, b| {
+        let (a, b) = (a.borrow(), b.borrow());
         for level in sort {
             let ordering = match level.property {
                 SortProperty::Start => a.start.sort_key().cmp(&b.start.sort_key()),

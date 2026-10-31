@@ -16,6 +16,9 @@
 //!   the event is gone next time you get a "restart pagination" error rather
 //!   than a quietly different page.
 
+use std::borrow::Borrow;
+use std::sync::Arc;
+
 use async_graphql::connection::{Connection, Edge};
 use async_graphql::{Context, OutputType, Result, SimpleObject};
 
@@ -25,6 +28,7 @@ use super::types::{GqlEvent, all_calendars, clamp_page};
 use crate::caldav::resolve_calendar;
 use crate::commands::RangeArgs;
 use crate::models::{Calendar, Event};
+use chrono::{DateTime, Utc};
 
 /// Arguments every connection accepts.
 pub struct PageArgs {
@@ -171,19 +175,22 @@ pub fn paginate<T: OutputType>(
 
 /// Turn a list of events into a connection. Used by every event-shaped field, so
 /// `occurrences` and `conflicts` page exactly like the top-level `events` does.
-pub fn events_connection_of(
-    mut events: Vec<Event>,
+///
+/// Takes borrowed events as readily as owned ones: a range read filters and
+/// sorts references into the loader's cache and clones only the page it returns.
+pub fn events_connection_of<E: Borrow<Event>>(
+    mut events: Vec<E>,
     args: PageArgs,
     filter: Option<&EventFilter>,
     sort: Option<&[EventSort]>,
     calendars_queried: u64,
 ) -> Result<EventConnection> {
     if let Some(filter) = filter {
-        events.retain(|e| filter.matches(e));
+        events.retain(|e| filter.matches(e.borrow()));
     }
     sort_events(&mut events, sort);
 
-    let page = page_of(events, args, event_cursor)?;
+    let page = page_of(events, args, |e| event_cursor(e.borrow()))?;
     let mut connection = Connection::with_additional_fields(
         page.has_previous,
         page.has_next,
@@ -196,7 +203,7 @@ pub fn events_connection_of(
     connection.edges.extend(
         page.items
             .into_iter()
-            .map(|(cursor, event)| Edge::new(cursor, GqlEvent::from(event))),
+            .map(|(cursor, event)| Edge::new(cursor, GqlEvent::from(event.borrow().clone()))),
     );
     Ok(connection)
 }
@@ -212,63 +219,81 @@ pub struct EventQuery {
     pub sort: Option<Vec<EventSort>>,
 }
 
-/// Fetch a time range and build the connection.
-///
-/// One `load_many` puts every calendar's window into a single loader batch, so
-/// the REPORTs go out together instead of one after another, and a window
-/// another part of the query already asked for costs nothing.
-pub async fn events_connection(
-    ctx: &Context<'_>,
-    args: PageArgs,
-    query: EventQuery,
-) -> Result<EventConnection> {
+/// The calendars a range read spans: the one named, or every collection that
+/// holds events.
+pub async fn read_targets(ctx: &Context<'_>, calendar: Option<&str>) -> Result<Vec<Calendar>> {
     let calendars = all_calendars(ctx).await?;
-    let targets: Vec<Calendar> = match &query.calendar {
+    Ok(match calendar {
         Some(name) => vec![resolve_calendar(&calendars, Some(name))?],
         None => calendars
             .iter()
             .filter(|c| c.supports_events)
             .cloned()
             .collect(),
-    };
+    })
+}
 
-    // Nothing below this connection needs an event, so don't fetch any. The
-    // count is free once the events are here, but the events themselves are the
-    // expensive part, and `pageInfo` alone is not worth a REPORT per calendar.
-    let wants_events = ["nodes", "edges", "totalCount"]
-        .iter()
-        .any(|field| ctx.look_ahead().field(field).exists());
-    if !wants_events {
-        return events_connection_of(Vec::new(), args, None, None, targets.len() as u64);
-    }
-
-    let (start, end) = query.range.resolve()?;
+/// Each target's events over `[start, end)`, in target order, as the loader
+/// caches them.
+///
+/// One `load_many` puts every calendar's window into a single loader batch, so
+/// the REPORTs go out together instead of one after another, and a window
+/// another part of the query already asked for costs nothing. Ordered by
+/// calendar rather than however the futures settled, so repeating a query gives
+/// the same page.
+pub async fn load_windows(
+    ctx: &Context<'_>,
+    targets: &[Calendar],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    expand: bool,
+) -> Result<Vec<Arc<Vec<Event>>>> {
     let windows: Vec<Window> = targets
         .iter()
         .map(|c| Window {
             calendar_id: c.id.clone(),
             start,
             end,
-            expand: query.expand,
+            expand,
         })
         .collect();
-
-    let loaded = ctx
+    let mut loaded = ctx
         .data::<EventWindows>()?
         .load_many(windows.clone())
         .await
         .map_err(to_gql_error)?;
-
-    // Flattened in calendar order rather than however the futures settled, so
-    // repeating a query gives the same page.
-    let events: Vec<Event> = windows
+    windows
         .iter()
-        .filter_map(|w| loaded.get(w))
-        .flat_map(|events| events.iter().cloned())
-        .collect();
+        .filter_map(|w| loaded.remove(w))
+        .map(|outcome| outcome.map_err(to_gql_error))
+        .collect()
+}
 
+/// Whether anything below this connection needs an event. The count is free
+/// once the events are here, but the events themselves are the expensive part,
+/// and `pageInfo` alone is not worth a REPORT per calendar.
+pub fn wants_events(ctx: &Context<'_>) -> bool {
+    ["nodes", "edges", "totalCount"]
+        .iter()
+        .any(|field| ctx.look_ahead().field(field).exists())
+}
+
+/// Fetch a time range and build the connection.
+pub async fn events_connection(
+    ctx: &Context<'_>,
+    args: PageArgs,
+    query: EventQuery,
+) -> Result<EventConnection> {
+    let targets = read_targets(ctx, query.calendar.as_deref()).await?;
+
+    if !wants_events(ctx) {
+        return events_connection_of(Vec::<Event>::new(), args, None, None, targets.len() as u64);
+    }
+
+    let (start, end) = query.range.resolve()?;
+    let loaded = load_windows(ctx, &targets, start, end, query.expand).await?;
     events_connection_of(
-        events,
+        loaded.iter().flat_map(|events| events.iter()).collect(),
         args,
         query.filter.as_ref(),
         query.sort.as_deref(),

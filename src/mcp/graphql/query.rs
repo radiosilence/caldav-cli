@@ -79,7 +79,11 @@ impl QueryRoot {
     /// narrows the results here, where `and`/`or`/`not` nest freely.
     ///
     /// Cursors are event ids, so `after: "<last id you saw>"` resumes after that
-    /// event. `totalCount` is free and exact.
+    /// event. `totalCount` is free and counts what was read: a calendar that
+    /// fails to answer is skipped, and a recurring series yields at most 750
+    /// occurrences per window; a sub-daily one may stop sooner when reaching the
+    /// window takes too many steps. Expansions totalling more than 25,000 occurrences
+    /// in one request are an error; narrow the window or name a calendar.
     #[graphql(complexity = "page_complexity(first, last, child_complexity)")]
     async fn events(
         &self,

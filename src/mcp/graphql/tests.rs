@@ -446,6 +446,18 @@ async fn nested_edges_cost_nothing_until_selected() {
 }
 
 #[tokio::test]
+async fn conflicts_without_events_fetch_nothing() {
+    let h = Harness::start().await;
+    h.run(&format!(
+        r#"{{ events(start: "{DAY}", days: 1) {{ nodes {{ conflicts {{ pageInfo {{ hasNextPage }} }} }} }} }}"#
+    ))
+    .await;
+    // The page itself: the listing and one REPORT per calendar, and nothing for
+    // the conflicts, which select no event.
+    assert_eq!(h.reports().await, 2);
+}
+
+#[tokio::test]
 async fn occurrences_expand_locally_and_fetch_nothing() {
     let h = Harness::start().await;
     let data = h
@@ -779,7 +791,10 @@ async fn the_sdl_carries_the_guidance_that_replaced_the_prelude() {
         "master event",
         // Paging: what a cursor is and that totalCount is cheap.
         "Cursors are event ids",
-        "free and exact",
+        "free and counts what was read",
+        // What bounds an expanded read.
+        "750",
+        "25,000",
         // Filter composition.
         "AND-ed",
         "nest arbitrarily",
