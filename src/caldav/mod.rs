@@ -1136,7 +1136,7 @@ impl CalDavClient {
                     Some(raw) => resolve_end(raw, tzid, start)?,
                     None => match fields.duration_minutes {
                         Some(mins) => ResolvedTime {
-                            instant: start.instant + Duration::minutes(mins),
+                            instant: add_minutes(start.instant, mins)?,
                             all_day: start.all_day,
                         },
                         None => ResolvedTime {
@@ -1610,16 +1610,19 @@ fn resolve_span(
         Some(raw) => resolve_end(raw, tzid, start)?,
         None => match fields.duration_minutes {
             Some(mins) => ResolvedTime {
-                instant: start.instant + Duration::minutes(mins),
+                instant: add_minutes(start.instant, mins)?,
                 all_day,
             },
             None => ResolvedTime {
-                instant: start.instant
-                    + if all_day {
+                instant: util::add_span(
+                    start.instant,
+                    Some(if all_day {
                         Duration::days(1)
                     } else {
                         Duration::hours(1)
-                    },
+                    }),
+                    || format!("{start_raw} plus the default length"),
+                )?,
                 all_day,
             },
         },
@@ -1632,6 +1635,13 @@ fn resolve_span(
         });
     }
     Ok((start, end))
+}
+
+/// `instant` plus a caller's duration in minutes.
+fn add_minutes(instant: DateTime<Utc>, minutes: i64) -> Result<DateTime<Utc>> {
+    util::add_span(instant, Duration::try_minutes(minutes), || {
+        format!("{minutes} minutes")
+    })
 }
 
 fn resolve_end(raw: &str, tzid: Option<&str>, start: ResolvedTime) -> Result<ResolvedTime> {
@@ -2414,6 +2424,30 @@ END:VCALENDAR
         assert!(!matches_query(&e, "unrelated"));
         // An empty needle matches everything.
         assert!(matches_query(&e, ""));
+    }
+
+    #[test]
+    fn an_unrepresentable_duration_is_an_error() {
+        let fields = EventFields {
+            summary: Some("x"),
+            start: Some("2026-07-24T09:00:00Z"),
+            duration_minutes: Some(9_007_199_254_740_991),
+            ..Default::default()
+        };
+        assert!(resolve_span("2026-07-24T09:00:00Z", &fields, None).is_err());
+    }
+
+    /// The default end is derived, not parsed, and still has to be a year
+    /// iCalendar can write.
+    #[test]
+    fn a_default_end_past_year_9999_is_an_error() {
+        for start in ["9999-12-31", "9999-12-31T23:30:00Z"] {
+            let fields = EventFields {
+                start: Some(start),
+                ..Default::default()
+            };
+            assert!(resolve_span(start, &fields, None).is_err(), "{start}");
+        }
     }
 
     #[test]

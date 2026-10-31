@@ -59,6 +59,43 @@ pub fn parse_datetime_at(
     tzid: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<ParsedTime> {
+    let parsed = parse_unchecked(input, tzid, now)?;
+    within_ical_years(parsed.instant, input)?;
+    Ok(parsed)
+}
+
+/// Refuse an instant iCalendar cannot write. Its dates are four-digit years, so
+/// a server answers anything outside 1–9999 with an error, which a read that
+/// skips unreadable calendars would report as an empty result.
+pub fn within_ical_years(instant: DateTime<Utc>, input: &str) -> Result<()> {
+    match (1..=9999).contains(&instant.year()) {
+        true => Ok(()),
+        false => Err(out_of_range(input)),
+    }
+}
+
+/// `instant` plus `span`, refused when either is unrepresentable or the result
+/// falls outside the years iCalendar can write. `label` names the input in the
+/// error and is only built when there is one.
+pub fn add_span(
+    instant: DateTime<Utc>,
+    span: Option<Duration>,
+    label: impl FnOnce() -> String,
+) -> Result<DateTime<Utc>> {
+    span.and_then(|span| instant.checked_add_signed(span))
+        .filter(|end| (1..=9999).contains(&end.year()))
+        .ok_or_else(|| out_of_range(&label()))
+}
+
+/// The error for a value iCalendar cannot represent, naming the input.
+pub fn out_of_range(input: &str) -> Error {
+    Error::InvalidDateTime {
+        input: input.to_string(),
+        reason: "outside the years 1 to 9999".into(),
+    }
+}
+
+fn parse_unchecked(input: &str, tzid: Option<&str>, now: DateTime<Utc>) -> Result<ParsedTime> {
     let raw = input.trim();
     if raw.is_empty() {
         return Err(Error::InvalidDateTime {
@@ -102,7 +139,9 @@ pub fn parse_datetime_at(
 
     if let Some(delta) = parse_relative(&lower) {
         return Ok(ParsedTime {
-            instant: now + delta,
+            instant: delta
+                .and_then(|d| now.checked_add_signed(d))
+                .ok_or_else(|| out_of_range(input))?,
             date_only: false,
             tzid: tz_name,
         });
@@ -155,22 +194,26 @@ pub fn parse_datetime_at(
     })
 }
 
-/// `+90m`, `-2h`, `+3d`, `+1w`. Returns `None` if the shape doesn't match.
-fn parse_relative(input: &str) -> Option<Duration> {
+/// `+90m`, `-2h`, `+3d`, `+1w`. Returns `None` if the shape doesn't match, and
+/// `Some(None)` if it does but the offset is too large to represent.
+fn parse_relative(input: &str) -> Option<Option<Duration>> {
     let (sign, rest) = match input.strip_prefix('+') {
         Some(rest) => (1, rest),
         None => (-1, input.strip_prefix('-')?),
     };
     let (digits, unit) = rest.split_at(rest.find(|c: char| !c.is_ascii_digit())?);
-    let n: i64 = digits.parse().ok()?;
-    let magnitude = match unit {
-        "m" | "min" | "mins" => Duration::minutes(n),
-        "h" | "hr" | "hrs" => Duration::hours(n),
-        "d" | "day" | "days" => Duration::days(n),
-        "w" | "wk" | "weeks" => Duration::weeks(n),
+    if digits.is_empty() {
+        return None;
+    }
+    let n = digits.parse::<i64>().ok().map(|n| n * sign);
+    let magnitude: fn(i64) -> Option<Duration> = match unit {
+        "m" | "min" | "mins" => Duration::try_minutes,
+        "h" | "hr" | "hrs" => Duration::try_hours,
+        "d" | "day" | "days" => Duration::try_days,
+        "w" | "wk" | "weeks" => Duration::try_weeks,
         _ => return None,
     };
-    Some(magnitude * sign)
+    Some(n.and_then(magnitude))
 }
 
 /// Midnight on `date` in `tz`, as a UTC instant.
@@ -191,9 +234,9 @@ fn from_local(naive: NaiveDateTime, tz: Tz, input: &str) -> Result<DateTime<Utc>
         Some(dt) => Ok(dt.with_timezone(&Utc)),
         // Spring-forward gap: this wall-clock time doesn't exist. Step forward
         // an hour, which lands just past the transition.
-        None => tz
-            .from_local_datetime(&(naive + Duration::hours(1)))
-            .earliest()
+        None => naive
+            .checked_add_signed(Duration::hours(1))
+            .and_then(|later| tz.from_local_datetime(&later).earliest())
             .map(|dt| dt.with_timezone(&Utc))
             .ok_or_else(|| Error::InvalidDateTime {
                 input: input.to_string(),
@@ -288,12 +331,9 @@ pub fn split_list(input: &str) -> Vec<String> {
         .collect()
 }
 
-/// The UTC day range `[start_of_today, start_of_today + days)` in `tz`.
-pub fn day_range(days: i64, tz: Tz, now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let today = now.with_timezone(&tz).date_naive();
-    let start = start_of_day(today, tz)?;
-    let end = start_of_day(today + Duration::days(days.max(1)), tz)?;
-    Ok((start, end))
+/// Midnight today in `tz`, as a UTC instant.
+pub fn start_of_today(tz: Tz, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    start_of_day(now.with_timezone(&tz).date_naive(), tz)
 }
 
 /// The UTC range covering the calendar month containing `now` in `tz`.
@@ -379,6 +419,26 @@ mod tests {
     }
 
     #[test]
+    fn offsets_beyond_the_calendar_are_errors() {
+        // Too large for a duration, too large for a date, and past year 9999.
+        for input in ["+9999999999999w", "+99999999w", "+3650000d", "-800000w"] {
+            let err = parse_datetime_at(input, None, now()).unwrap_err();
+            assert!(err.to_string().contains("1 to 9999"), "{input}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_unit_with_no_number_gets_the_format_hint() {
+        for input in ["+d", "-h", "+weeks"] {
+            let err = parse_datetime_at(input, None, now()).unwrap_err();
+            assert!(
+                err.to_string().contains("relative offset"),
+                "{input}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_relative_offsets() {
         assert_eq!(
             format_rfc3339(parse_datetime_at("+2h", None, now()).unwrap().instant),
@@ -451,17 +511,10 @@ mod tests {
     }
 
     #[test]
-    fn day_range_covers_requested_days() {
-        let (start, end) = day_range(3, Tz::UTC, now()).unwrap();
-        assert_eq!(format_iso_date(start), "2026-07-24");
-        assert_eq!(format_iso_date(end), "2026-07-27");
-    }
-
-    #[test]
-    fn day_range_treats_zero_as_one_day() {
-        let (start, end) = day_range(0, Tz::UTC, now()).unwrap();
-        assert_eq!(format_iso_date(start), "2026-07-24");
-        assert_eq!(format_iso_date(end), "2026-07-25");
+    fn today_starts_at_local_midnight() {
+        let start = start_of_today(Tz::Asia__Tokyo, now()).unwrap();
+        // Midnight Tokyo on the 24th is 15:00Z on the 23rd.
+        assert_eq!(format_rfc3339(start), "2026-07-23T15:00:00Z");
     }
 
     #[test]

@@ -548,7 +548,10 @@ fn instantiate(
 
             let mut occurrence = master.clone();
             occurrence.start = shift(&master.start, *instant);
-            occurrence.end = shift(&master.end, *instant + duration);
+            // A server's span can be wide enough to overflow; end it where it
+            // starts, as an event with no end would.
+            let end = instant.checked_add_signed(duration).unwrap_or(*instant);
+            occurrence.end = shift(&master.end, end);
             occurrence.recurrence_id = Some(rid);
             Some(occurrence)
         })
