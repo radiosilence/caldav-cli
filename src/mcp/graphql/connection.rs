@@ -269,6 +269,15 @@ pub async fn load_windows(
         .collect()
 }
 
+/// Whether anything below this connection needs an event. The count is free
+/// once the events are here, but the events themselves are the expensive part,
+/// and `pageInfo` alone is not worth a REPORT per calendar.
+pub fn wants_events(ctx: &Context<'_>) -> bool {
+    ["nodes", "edges", "totalCount"]
+        .iter()
+        .any(|field| ctx.look_ahead().field(field).exists())
+}
+
 /// Fetch a time range and build the connection.
 pub async fn events_connection(
     ctx: &Context<'_>,
@@ -277,13 +286,7 @@ pub async fn events_connection(
 ) -> Result<EventConnection> {
     let targets = read_targets(ctx, query.calendar.as_deref()).await?;
 
-    // Nothing below this connection needs an event, so don't fetch any. The
-    // count is free once the events are here, but the events themselves are the
-    // expensive part, and `pageInfo` alone is not worth a REPORT per calendar.
-    let wants_events = ["nodes", "edges", "totalCount"]
-        .iter()
-        .any(|field| ctx.look_ahead().field(field).exists());
-    if !wants_events {
+    if !wants_events(ctx) {
         return events_connection_of(Vec::<Event>::new(), args, None, None, targets.len() as u64);
     }
 

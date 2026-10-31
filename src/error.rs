@@ -58,6 +58,12 @@ pub enum Error {
     )]
     TooManyOccurrences(usize),
 
+    #[error(
+        "the recurring events in this read take too many steps to expand; narrow the \
+         window, name a calendar, or read without expanding recurrences"
+    )]
+    ExpansionTooCostly,
+
     #[error("Server error: {0}")]
     Server(String),
 }

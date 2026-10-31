@@ -13,7 +13,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use super::connection::{
     EventConnection, EventQuery, PageArgs, event_cursor, events_connection, events_connection_of,
-    load_windows, page_complexity, read_targets,
+    load_windows, page_complexity, read_targets, wants_events,
 };
 use super::filter::{EventFilter, EventSort};
 use super::loaders::{Calendars, EventResources, Resource, to_gql_error};
@@ -495,6 +495,15 @@ impl GqlEvent {
         // The whole day, unpaged: candidates are filtered down to actual
         // overlaps here, so a page of them would lose clashes on a busy day.
         let targets = read_targets(ctx, calendar.as_deref()).await?;
+        if !wants_events(ctx) {
+            return events_connection_of(
+                Vec::<Event>::new(),
+                args,
+                None,
+                None,
+                targets.len() as u64,
+            );
+        }
         let loaded = load_windows(ctx, &targets, from, to, true).await?;
         let me = event_cursor(&self.0);
         let clashing: Vec<&Event> = loaded

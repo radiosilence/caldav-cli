@@ -29,31 +29,42 @@ const MAX_OCCURRENCES: usize = 750;
 
 /// Ceiling on dates a single series may step through, including those before
 /// the window. `rrule` iterates from `DTSTART`, so without this an old
-/// `FREQ=SECONDLY` series costs one step per second since it began.
-const MAX_STEPS: usize = 50_000;
+/// `FREQ=SECONDLY` series costs one step per second since it began. A rule
+/// whose anchor can move (see [`fast_forward`]) spends almost none of it before
+/// the window.
+const MAX_STEPS: i64 = 100_000;
 
-/// Ceiling on how far past its anchor a sub-daily series may iterate, counted
-/// in steps of its interval. rrule advances one interval at a time while
-/// BYHOUR, BYMINUTE or BYSECOND rejects the value, so a sparse filter costs
-/// this many steps between occurrences, all of them inside a single yield that
-/// [`MAX_STEPS`] never sees.
+/// Ceiling on how far past its anchor a series may iterate, counted in steps of
+/// its interval. rrule advances one interval at a time while a BYHOUR, BYMINUTE
+/// or BYSECOND filter rejects the value, and does so inside a single yield, so
+/// this distance bounds work that [`MAX_STEPS`] never sees. It is checked as
+/// each date is yielded; within one yield rrule's own loop limit applies.
 const MAX_WORK: i64 = 5_000_000;
+
+/// Ceiling on the dates rrule may buffer for one period of a daily or slower
+/// rule. It builds every day of the period crossed with every BYHOUR, BYMINUTE
+/// and BYSECOND time before yielding the first, so a yearly rule listing every
+/// second would allocate tens of millions of dates in one step.
+const MAX_PERIOD_DATES: usize = 10_000;
 
 /// Ceiling on occurrences one caller's expansions may produce in all. Each
 /// occurrence is a full copy of its master event, so this bounds the memory a
 /// wide window over many series and calendars can take.
 pub const MAX_EXPANDED: usize = 25_000;
 
-/// Ceiling on [`MAX_WORK`]-style steps across one caller's expansions, so a
-/// calendar full of hostile series costs no more per read than a few of them.
+/// Ceilings on [`MAX_STEPS`] and [`MAX_WORK`] across one caller's expansions,
+/// so a calendar full of hostile series costs no more per read than ten of
+/// them.
+const MAX_REQUEST_STEPS: i64 = 10 * MAX_STEPS;
 const MAX_REQUEST_WORK: i64 = 10 * MAX_WORK;
 
-/// What is left of [`MAX_EXPANDED`] and [`MAX_REQUEST_WORK`] for one scope: a
-/// GraphQL request, or one CLI read. Shared by every expansion in that scope, so
-/// the caps hold across calendars and fields rather than per window.
+/// What is left of the per-scope ceilings for one scope: a GraphQL request, or
+/// one CLI read. Shared by every expansion in that scope, so the caps hold
+/// across calendars and fields rather than per window.
 #[derive(Debug, Default)]
 pub struct ExpansionBudget {
     occurrences: AtomicUsize,
+    steps: AtomicI64,
     work: AtomicI64,
 }
 
@@ -67,16 +78,22 @@ impl ExpansionBudget {
             .map(drop)
             .map_err(|_| Error::TooManyOccurrences(MAX_EXPANDED))
     }
+}
 
-    /// How many steps the next series may take: its own cap, or whatever the
-    /// scope has left if that is less.
-    fn work_left(&self) -> i64 {
-        (MAX_REQUEST_WORK - self.work.load(Ordering::Relaxed)).clamp(0, MAX_WORK)
-    }
+/// Up to `want` units of a scope-wide allowance, taken now so that series
+/// expanding at the same time cannot each see the whole remainder.
+fn reserve(used: &AtomicI64, total: i64, want: i64) -> i64 {
+    let mut granted = 0;
+    let _ = used.try_update(Ordering::Relaxed, Ordering::Relaxed, |so_far| {
+        granted = (total - so_far).clamp(0, want);
+        Some(so_far + granted)
+    });
+    granted
+}
 
-    fn spend_work(&self, steps: i64) {
-        self.work.fetch_add(steps, Ordering::Relaxed);
-    }
+/// Hand back the part of a reservation a series did not use.
+fn refund(used: &AtomicI64, granted: i64, spent: i64) {
+    used.fetch_sub(granted - spent.min(granted), Ordering::Relaxed);
 }
 
 /// Expand every unexpanded series in `events` across `[start, end)`.
@@ -87,7 +104,9 @@ impl ExpansionBudget {
 /// override marked `CANCELLED` removes that occurrence entirely.
 ///
 /// Fails with [`Error::TooManyOccurrences`] rather than truncating when the
-/// occurrences would take `budget` past [`MAX_EXPANDED`].
+/// occurrences would take `budget` past [`MAX_EXPANDED`], and with
+/// [`Error::ExpansionTooCostly`] once the scope has spent its steps.
+/// Occurrences the server expanded itself count against the same budget.
 pub fn expand_all(
     events: Vec<Event>,
     start: DateTime<Utc>,
@@ -137,7 +156,7 @@ pub fn expand_all(
             continue;
         }
 
-        match occurrences(&source, start, end, budget) {
+        match occurrences(&source, start, end, budget)? {
             Ok(instants) if !instants.is_empty() => series.push((event, instants)),
             Ok(_) => {
                 // The rule is valid but yields nothing in this window. The
@@ -153,7 +172,9 @@ pub fn expand_all(
         }
     }
 
-    budget.charge(series.iter().map(|(_, instants)| instants.len()).sum())?;
+    let server_expanded = out.iter().filter(|e| e.recurrence_id.is_some()).count();
+    let generated: usize = series.iter().map(|(_, instants)| instants.len()).sum();
+    budget.charge(server_expanded + generated)?;
     for (master, instants) in &series {
         out.extend(instantiate(master, instants, &overridden, &cancelled));
     }
@@ -229,39 +250,59 @@ fn pin_dates_to_utc(source: &str) -> String {
 }
 
 /// Evaluate a recurrence set over `[start, end)`.
+///
+/// The inner result is the rule's own outcome: an `Err` means it could not be
+/// expanded, and the caller shows the master instead. The outer one is the
+/// scope running out of steps, which fails the read.
 fn occurrences(
     source: &str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     budget: &ExpansionBudget,
-) -> std::result::Result<Vec<DateTime<Utc>>, String> {
-    let set: RRuleSet = pin_dates_to_utc(source)
-        .parse()
-        .map_err(|e| format!("{e}"))?;
+) -> Result<std::result::Result<Vec<DateTime<Utc>>, String>> {
+    let set: RRuleSet = match pin_dates_to_utc(source).parse() {
+        Ok(set) => set,
+        Err(e) => return Ok(Err(format!("{e}"))),
+    };
+    if let Some(rule) = set
+        .get_rrule()
+        .iter()
+        .find(|rule| period_dates(rule) > MAX_PERIOD_DATES)
+    {
+        return Ok(Err(format!(
+            "{:?} rule would buffer more than {MAX_PERIOD_DATES} dates per period",
+            rule.get_freq()
+        )));
+    }
     let set = fast_forward(set, start);
     let anchor = set.get_dt_start().with_timezone(&Utc);
-    // The finest interval any rule steps by; `None` for daily and slower.
+    // The finest interval any rule steps by.
     let step_secs = set
         .get_rrule()
         .iter()
         .filter_map(|rule| {
-            Some(sub_daily_unit(rule.get_freq())? * i64::from(rule.get_interval().max(1)))
+            Some(unit_secs(rule.get_freq())? * i64::from(rule.get_interval().max(1)))
         })
         .min();
-    let work_cap = budget.work_left();
-    let mut work = 0;
+
+    let step_cap = reserve(&budget.steps, MAX_REQUEST_STEPS, MAX_STEPS);
+    let work_cap = reserve(&budget.work, MAX_REQUEST_WORK, MAX_WORK);
+    let (mut steps, mut work, mut exhausted) = (0, 0, false);
     let mut dates = Vec::new();
     // `limit` arms rrule's own guard against a rule that never matches, which
     // would otherwise spin inside a single `next`.
-    for (step, date) in set.limit().into_iter().enumerate() {
-        if step == MAX_STEPS {
-            debug!(limit = MAX_STEPS, "series hit the step cap");
+    for date in set.limit().into_iter() {
+        steps += 1;
+        if steps > step_cap {
+            exhausted = step_cap < MAX_STEPS;
+            debug!(limit = step_cap, "series hit the step cap");
             break;
         }
         let date = date.with_timezone(&Utc);
         if let Some(secs) = step_secs {
             work = (date - anchor).num_seconds() / secs;
             if work > work_cap {
+                exhausted = work_cap < MAX_WORK;
                 debug!(limit = work_cap, "series hit the work cap");
                 break;
             }
@@ -277,14 +318,42 @@ fn occurrences(
             }
         }
     }
-    // The yield that crossed the cap can lie a long gap past it; charge only
-    // what the series was allowed, or one sparse rule drains the whole scope.
-    budget.spend_work(work.min(work_cap));
-    Ok(dates)
+    // The yield that crossed a cap can lie a long way past it; a series is
+    // charged at most what it was granted.
+    refund(&budget.steps, step_cap, steps);
+    refund(&budget.work, work_cap, work);
+    if exhausted {
+        return Err(Error::ExpansionTooCostly);
+    }
+    Ok(Ok(dates))
 }
 
-/// Move a sub-daily series' `DTSTART` forward to shortly before `start`, so
-/// iteration begins near the window rather than wherever the series began.
+/// The most dates rrule buffers for one period of a daily or slower rule: the
+/// days a period can hold times the BYHOUR × BYMINUTE × BYSECOND times on each.
+/// Zero for sub-daily rules, which buffer one step's times at a time.
+fn period_dates(rule: &rrule::RRule) -> usize {
+    let days = match rule.get_freq() {
+        Frequency::Yearly => 366,
+        Frequency::Monthly => 31,
+        Frequency::Weekly => 7,
+        Frequency::Daily => 1,
+        _ => return 0,
+    };
+    let times = [
+        rule.get_by_hour().len(),
+        rule.get_by_minute().len(),
+        rule.get_by_second().len(),
+    ]
+    .iter()
+    .map(|n| (*n).max(1))
+    .product::<usize>();
+    days * times
+}
+
+/// Move a series' `DTSTART` forward to shortly before `start`, so iteration
+/// begins near the window rather than wherever the series began. Applies to
+/// weekly and finer rules, whose steps are a fixed length of wall time; a month
+/// or a year is not.
 ///
 /// The anchor moves by whole multiples of the rule's interval in local wall
 /// time, which is how rrule steps, so every later occurrence is unchanged. It
@@ -296,9 +365,7 @@ fn occurrences(
 ///   time while BYMINUTE or BYHOUR rejects it, which drifts the grid unless the
 ///   interval divides a minute. Moving the anchor would then change the drift.
 ///
-/// The anchor never passes UNTIL, which rrule requires to be no earlier. Daily
-/// and slower rules are left alone, since [`MAX_STEPS`] of them spans over a
-/// century.
+/// The anchor never passes UNTIL, which rrule requires to be no earlier.
 fn fast_forward(set: RRuleSet, start: DateTime<Utc>) -> RRuleSet {
     let [rule] = set.get_rrule().as_slice() else {
         return set;
@@ -312,7 +379,7 @@ fn fast_forward(set: RRuleSet, start: DateTime<Utc>) -> RRuleSet {
             }
             _ => false,
         };
-    let Some(unit_secs) = sub_daily_unit(rule.get_freq()) else {
+    let Some(unit_secs) = unit_secs(rule.get_freq()) else {
         return set;
     };
     if rule.get_count().is_some() || !set.get_exrule().is_empty() || carries_through_a_filter {
@@ -350,9 +417,12 @@ fn fast_forward(set: RRuleSet, start: DateTime<Utc>) -> RRuleSet {
         .set_exdates(set.get_exdate().clone())
 }
 
-/// Seconds in one step of a sub-daily frequency; `None` for daily and slower.
-fn sub_daily_unit(freq: Frequency) -> Option<i64> {
+/// Seconds of wall time in one step of a frequency; `None` for monthly and
+/// yearly, whose steps vary in length.
+fn unit_secs(freq: Frequency) -> Option<i64> {
     match freq {
+        Frequency::Weekly => Some(7 * 86_400),
+        Frequency::Daily => Some(86_400),
         Frequency::Hourly => Some(3600),
         Frequency::Minutely => Some(60),
         Frequency::Secondly => Some(1),
@@ -760,18 +830,22 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             ";BYSECOND=5",
             ";BYHOUR=1;BYMINUTE=0",
             ";BYDAY=SU",
+            ";BYMONTH=10,11",
         ];
         // The window straddles the end of BST at 01:00Z on 25 October 2026. Each
         // series starts far enough before it for the anchor to move past its
         // margin, and near enough that the unmoved reference stays cheap.
-        let (from, to) = (at(2026, 10, 25, 0), at(2026, 10, 25, 3));
+        let from = at(2026, 10, 25, 0);
         let starts_at = [
-            ("HOURLY", "20261015T000700"),
-            ("MINUTELY", "20261023T230700"),
-            ("SECONDLY", "20261024T190700"),
+            ("WEEKLY", "20230105T090700", 365 * 24),
+            ("DAILY", "20260101T090700", 70 * 24),
+            ("HOURLY", "20261015T000700", 3),
+            ("MINUTELY", "20261023T230700", 3),
+            ("SECONDLY", "20261024T190700", 3),
         ];
         let (mut moved, mut expected_moved) = (0, 0);
-        for (freq, local) in starts_at {
+        for (freq, local, hours) in starts_at {
+            let to = from + Duration::hours(hours);
             let dtstart = format!("DTSTART;TZID=Europe/London:{local}");
             for interval in 1..=61 {
                 for filter in filters {
@@ -909,7 +983,8 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
         assert!(out.unwrap().is_empty());
     }
 
-    /// Work spent by earlier series in the scope comes out of later ones.
+    /// Work spent by earlier series in the scope comes out of later ones, and a
+    /// scope that has run out says so rather than returning a series empty.
     #[test]
     fn the_work_cap_is_shared_across_a_scope() {
         let ics = series("DTSTART:20260705T000000Z", "RRULE:FREQ=HOURLY;COUNT=100");
@@ -918,12 +993,74 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
         assert_eq!(fresh.len(), 3);
 
         let spent = ExpansionBudget::default();
-        spent.spend_work(MAX_REQUEST_WORK);
-        assert!(
-            expand_all(parse(&ics), from, to, &spent)
-                .unwrap()
-                .is_empty()
+        reserve(&spent.work, MAX_REQUEST_WORK, MAX_REQUEST_WORK);
+        assert!(matches!(
+            expand_all(parse(&ics), from, to, &spent),
+            Err(Error::ExpansionTooCostly)
+        ));
+    }
+
+    /// rrule buffers a whole period of a daily or slower rule before yielding,
+    /// so one listing every second of a year is refused before it allocates.
+    #[test]
+    fn a_rule_buffering_too_much_per_period_shows_the_master() {
+        let every = |n: u32| (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let rule = format!(
+            "RRULE:FREQ=YEARLY;BYHOUR={};BYMINUTE={};BYSECOND={}",
+            every(24),
+            every(60),
+            every(60)
         );
+        let ics = series("DTSTART:20260101T000000Z", &rule);
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 7, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].recurrence_id.is_none(), "the master, unexpanded");
+    }
+
+    /// A dense daily rule begun years ago reaches the window by moving its
+    /// anchor rather than spending its steps on the years in between.
+    #[test]
+    fn a_dense_daily_series_from_years_ago_still_expands() {
+        let ics = series(
+            "DTSTART;TZID=Europe/London:20230101T080000",
+            "RRULE:FREQ=DAILY;BYHOUR=8,9,10,11,12,13,14,15,16,17,18,19,20;BYMINUTE=0,15,30,45",
+        );
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 7, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 52);
+    }
+
+    /// Occurrences the server expanded arrive as separate events, and still
+    /// cost what generated ones do.
+    #[test]
+    fn server_expanded_occurrences_count_against_the_budget() {
+        let occurrence = |i: usize| {
+            let mut e = parse(&series("DTSTART:20260101T000000Z", "RRULE:FREQ=HOURLY")).remove(0);
+            e.recur_source = None;
+            e.recurrence_id = Some(format!("2026-01-01T00:00:{i:02}Z"));
+            e
+        };
+        let events: Vec<Event> = (0..=MAX_EXPANDED).map(occurrence).collect();
+        assert!(matches!(
+            expand_all(
+                events,
+                at(2026, 1, 1, 0),
+                at(2026, 1, 2, 0),
+                &ExpansionBudget::default()
+            ),
+            Err(Error::TooManyOccurrences(_))
+        ));
     }
 
     /// A rule yielding once every four years crosses its cap by a whole gap,

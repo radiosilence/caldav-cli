@@ -806,7 +806,9 @@ impl CalDavClient {
         for (events, cal) in results.into_iter().zip(&targets) {
             match events {
                 Ok(events) => all.extend(events),
-                Err(e @ Error::TooManyOccurrences(_)) => return Err(e),
+                Err(e @ (Error::TooManyOccurrences(_) | Error::ExpansionTooCostly)) => {
+                    return Err(e);
+                }
                 // One unreadable calendar (shared, or a server hiccup) should
                 // not sink the whole agenda.
                 Err(e) => tracing::warn!(calendar = %cal.name, error = %e, "skipping calendar"),
