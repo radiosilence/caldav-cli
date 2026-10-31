@@ -779,7 +779,10 @@ async fn the_sdl_carries_the_guidance_that_replaced_the_prelude() {
         "master event",
         // Paging: what a cursor is and that totalCount is cheap.
         "Cursors are event ids",
-        "free and exact",
+        "free and counts what was read",
+        // What bounds an expanded read.
+        "750",
+        "25,000",
         // Filter composition.
         "AND-ed",
         "nest arbitrarily",

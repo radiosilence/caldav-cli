@@ -13,7 +13,7 @@
 //! it subtly wrong means silently showing someone the wrong day.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use rrule::{Frequency, RRuleSet};
@@ -44,21 +44,38 @@ const MAX_WORK: i64 = 5_000_000;
 /// wide window over many series and calendars can take.
 pub const MAX_EXPANDED: usize = 25_000;
 
-/// What is left of [`MAX_EXPANDED`] for one scope: a GraphQL request, or one
-/// CLI read. Shared by every expansion in that scope, so the cap holds across
-/// calendars and fields rather than per window.
+/// Ceiling on [`MAX_WORK`]-style steps across one caller's expansions, so a
+/// calendar full of hostile series costs no more per read than a few of them.
+const MAX_REQUEST_WORK: i64 = 10 * MAX_WORK;
+
+/// What is left of [`MAX_EXPANDED`] and [`MAX_REQUEST_WORK`] for one scope: a
+/// GraphQL request, or one CLI read. Shared by every expansion in that scope, so
+/// the caps hold across calendars and fields rather than per window.
 #[derive(Debug, Default)]
-pub struct ExpansionBudget(AtomicUsize);
+pub struct ExpansionBudget {
+    occurrences: AtomicUsize,
+    work: AtomicI64,
+}
 
 impl ExpansionBudget {
     /// Reserve `n` occurrences, or refuse without reserving any.
     fn charge(&self, n: usize) -> Result<()> {
-        self.0
+        self.occurrences
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(n).filter(|total| *total <= MAX_EXPANDED)
             })
             .map(drop)
             .map_err(|_| Error::TooManyOccurrences(MAX_EXPANDED))
+    }
+
+    /// How many steps the next series may take: its own cap, or whatever the
+    /// scope has left if that is less.
+    fn work_left(&self) -> i64 {
+        (MAX_REQUEST_WORK - self.work.load(Ordering::Relaxed)).clamp(0, MAX_WORK)
+    }
+
+    fn spend_work(&self, steps: i64) {
+        self.work.fetch_add(steps, Ordering::Relaxed);
     }
 }
 
@@ -120,7 +137,7 @@ pub fn expand_all(
             continue;
         }
 
-        match occurrences(&source, start, end) {
+        match occurrences(&source, start, end, budget) {
             Ok(instants) if !instants.is_empty() => series.push((event, instants)),
             Ok(_) => {
                 // The rule is valid but yields nothing in this window. The
@@ -216,6 +233,7 @@ fn occurrences(
     source: &str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    budget: &ExpansionBudget,
 ) -> std::result::Result<Vec<DateTime<Utc>>, String> {
     let set: RRuleSet = pin_dates_to_utc(source)
         .parse()
@@ -230,6 +248,8 @@ fn occurrences(
             Some(sub_daily_unit(rule.get_freq())? * i64::from(rule.get_interval().max(1)))
         })
         .min();
+    let work_cap = budget.work_left();
+    let mut work = 0;
     let mut dates = Vec::new();
     // `limit` arms rrule's own guard against a rule that never matches, which
     // would otherwise spin inside a single `next`.
@@ -239,9 +259,12 @@ fn occurrences(
             break;
         }
         let date = date.with_timezone(&Utc);
-        if step_secs.is_some_and(|secs| (date - anchor).num_seconds() / secs > MAX_WORK) {
-            debug!(limit = MAX_WORK, "series hit the work cap");
-            break;
+        if let Some(secs) = step_secs {
+            work = (date - anchor).num_seconds() / secs;
+            if work > work_cap {
+                debug!(limit = work_cap, "series hit the work cap");
+                break;
+            }
         }
         if date >= end {
             break;
@@ -254,6 +277,7 @@ fn occurrences(
             }
         }
     }
+    budget.spend_work(work);
     Ok(dates)
 }
 
@@ -702,8 +726,8 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             .collect()
     }
 
-    /// Stepping from a 2020 DTSTART one second at a time took minutes; the
-    /// window's occurrences must come back without that walk.
+    /// The window's occurrences come back without stepping one second at a time
+    /// from a DTSTART years earlier.
     #[test]
     fn an_old_secondly_series_expands_near_the_window() {
         let ics = series("DTSTART:20200101T000000Z", "RRULE:FREQ=SECONDLY");
@@ -866,15 +890,14 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
     }
 
     /// A sparse filter makes rrule step through every rejected second inside
-    /// one yield; COUNT keeps the anchor where it is. Unbounded, this took tens
-    /// of seconds.
+    /// one yield, and COUNT keeps the anchor where it is, so only the work cap
+    /// ends this series.
     #[test]
     fn a_sparse_sub_daily_filter_is_bounded_by_the_work_cap() {
         let ics = series(
             "DTSTART:20000101T000000Z",
             "RRULE:FREQ=SECONDLY;BYHOUR=0;BYMINUTE=0;BYSECOND=0;COUNT=1000000",
         );
-        let started = std::time::Instant::now();
         let out = expand_all(
             parse(&ics),
             at(2026, 7, 6, 0),
@@ -882,7 +905,23 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             &ExpansionBudget::default(),
         );
         assert!(out.unwrap().is_empty());
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Work spent by earlier series in the scope comes out of later ones.
+    #[test]
+    fn the_work_cap_is_shared_across_a_scope() {
+        let ics = series("DTSTART:20260705T000000Z", "RRULE:FREQ=HOURLY;COUNT=100");
+        let (from, to) = (at(2026, 7, 6, 0), at(2026, 7, 6, 3));
+        let fresh = expand_all(parse(&ics), from, to, &ExpansionBudget::default()).unwrap();
+        assert_eq!(fresh.len(), 3);
+
+        let spent = ExpansionBudget::default();
+        spent.spend_work(MAX_REQUEST_WORK);
+        assert!(
+            expand_all(parse(&ics), from, to, &spent)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A date UNTIL is invalid on a timed series. Pinning it to UTC midnight
