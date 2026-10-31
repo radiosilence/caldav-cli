@@ -36,6 +36,10 @@ pub struct DefaultCalendar(pub Option<String>);
 /// `calendars → events → conflicts → calendar → events` is 5.
 const MAX_DEPTH: usize = 15;
 
+/// Ceiling on a query's declared cost, the sum of every field's page size
+/// times the cost of what it selects. See [`build_schema`].
+const MAX_COMPLEXITY: usize = 250_000;
+
 /// Build the GraphQL schema with only the process-shared preview-nonce store.
 ///
 /// The CalDAV client is **not** baked in — it is supplied per request via
@@ -43,13 +47,14 @@ const MAX_DEPTH: usize = 15;
 /// credentials. The nonce store stays schema-level because preview→confirm spans
 /// two separate requests.
 pub fn build_schema() -> CalDavSchema {
-    // Complexity is deliberately **not** capped. Fields still declare costs, and
-    // those costs are surfaced in the descriptions so a caller can pick a
-    // sensible page size — but they are guidance, not a gate. Refusing an
-    // expensive-but-legitimate query leaves the caller guessing at a threshold
-    // it cannot see, which is a bad deal for a model composing a query.
+    // Fields declare their cost as page size times what is below, and the
+    // descriptions surface it so a caller can pick a sensible page size. The
+    // ceiling sits far above any query worth asking, and refuses only the
+    // multiplied ones: a page of 100 events each asking for 100 conflicts is
+    // 100,000, and a third level of nesting is a hundred times that again.
     //
-    // Depth stays capped: the graph has cycles, and nothing else bounds them.
+    // Depth is capped as well: the graph has cycles, and nothing else bounds
+    // them.
     Schema::build(
         QueryRoot,
         MutationRoot::default(),
@@ -57,6 +62,7 @@ pub fn build_schema() -> CalDavSchema {
     )
     .data(types::NonceStore::default())
     .limit_depth(MAX_DEPTH)
+    .limit_complexity(MAX_COMPLEXITY)
     .finish()
 }
 

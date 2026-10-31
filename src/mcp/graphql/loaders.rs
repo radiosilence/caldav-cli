@@ -23,9 +23,10 @@ use std::sync::Arc;
 
 use async_graphql::dataloader::{DataLoader, HashMapCache, Loader};
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
 
 use super::SharedClient;
-use crate::caldav::fan_out;
+use crate::caldav::MAX_CONCURRENT_REQUESTS;
 use crate::caldav::recur::ExpansionBudget;
 use crate::error::Error;
 use crate::models::{Calendar, Event};
@@ -52,14 +53,22 @@ pub fn to_gql_error(e: LoadError) -> async_graphql::Error {
 /// credential, so before this a long-running MCP server never saw a calendar
 /// created, renamed, or deleted after start-up. Keyed by unit, the
 /// request-scoped cache gives the same deduplication with none of the staleness.
-pub struct CalendarListLoader(SharedClient);
+pub struct CalendarListLoader {
+    client: SharedClient,
+    requests: Arc<Semaphore>,
+}
 
 impl Loader<()> for CalendarListLoader {
     type Value = Arc<Vec<Calendar>>;
     type Error = LoadError;
 
     async fn load(&self, _keys: &[()]) -> Result<HashMap<(), Arc<Vec<Calendar>>>, Self::Error> {
-        let calendars = self.0.list_calendars().await.map_err(Arc::new)?;
+        let _permit = self
+            .requests
+            .acquire()
+            .await
+            .expect("the semaphore is never closed");
+        let calendars = self.client.list_calendars().await.map_err(Arc::new)?;
         Ok(HashMap::from([((), Arc::new(calendars))]))
     }
 }
@@ -91,6 +100,7 @@ pub struct Window {
 pub struct EventWindowLoader {
     client: SharedClient,
     calendars: Arc<Calendars>,
+    requests: Arc<Semaphore>,
     budget: Arc<ExpansionBudget>,
 }
 
@@ -119,7 +129,7 @@ impl Loader<Window> for EventWindowLoader {
             .collect();
 
         let mut out = HashMap::with_capacity(calls.len());
-        for (key, events) in fan_out(calls).await {
+        for (key, events) in in_flight(&self.requests, calls).await {
             match events {
                 Ok(events) => {
                     out.insert(key, Ok(Arc::new(events)));
@@ -158,6 +168,7 @@ pub struct Resource {
 pub struct EventResourceLoader {
     client: SharedClient,
     calendars: Arc<Calendars>,
+    requests: Arc<Semaphore>,
 }
 
 impl Loader<Resource> for EventResourceLoader {
@@ -189,7 +200,7 @@ impl Loader<Resource> for EventResourceLoader {
             .collect();
 
         let mut out = HashMap::with_capacity(keys.len());
-        for (calendar_id, events) in fan_out(calls).await {
+        for (calendar_id, events) in in_flight(&self.requests, calls).await {
             match events {
                 Ok(events) => {
                     for event in events {
@@ -232,6 +243,7 @@ pub struct Uid {
 pub struct EventUidLoader {
     client: SharedClient,
     calendars: Arc<Calendars>,
+    requests: Arc<Semaphore>,
 }
 
 /// One UID's outcome: the event, or why a calendar could not be searched for it.
@@ -264,8 +276,8 @@ impl Loader<Uid> for EventUidLoader {
             .collect();
 
         let mut out: HashMap<Uid, UidEvent> = HashMap::with_capacity(keys.len());
-        for (key, found) in fan_out(calls).await {
-            // Calendars are searched in listing order and `fan_out` preserves
+        for (key, found) in in_flight(&self.requests, calls).await {
+            // Calendars are searched in listing order and `in_flight` preserves
             // it, so the first hit wins deterministically — the same calendar
             // the CLI's short-circuiting scan would have stopped at. A calendar
             // too large to search is reported unless another one has the
@@ -284,6 +296,26 @@ impl Loader<Uid> for EventUidLoader {
         }
         Ok(out)
     }
+}
+
+/// Run `calls` with at most [`MAX_CONCURRENT_REQUESTS`] of the GraphQL
+/// request's CalDAV calls in flight, across every loader and batch, and return
+/// their outputs in the order given.
+///
+/// Each loader batch used to cap only itself, and batches run concurrently, so
+/// a query with many distinct windows had no bound on the requests it sent the
+/// user's server at once. A permit is held only around a call that does
+/// network I/O and nothing else, never across another loader's await, so a
+/// batch waiting on the calendar listing cannot starve the listing of one.
+async fn in_flight<F: std::future::Future>(requests: &Semaphore, calls: Vec<F>) -> Vec<F::Output> {
+    futures_util::future::join_all(calls.into_iter().map(|call| async move {
+        let _permit = requests
+            .acquire()
+            .await
+            .expect("the semaphore is never closed");
+        call.await
+    }))
+    .await
 }
 
 /// The account's calendars, through the loader.
@@ -325,8 +357,12 @@ impl Loaders {
         // all need the listing to turn an id into a collection URL, and going
         // through the same handle means they hit the same request-scoped cache
         // instead of each paying for their own PROPFIND.
+        let requests = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
         let calendar = Arc::new(Calendars::with_cache(
-            CalendarListLoader(client.clone()),
+            CalendarListLoader {
+                client: client.clone(),
+                requests: requests.clone(),
+            },
             tokio::spawn,
             HashMapCache::default(),
         ));
@@ -338,6 +374,7 @@ impl Loaders {
                     client: client.clone(),
                     calendars: calendar.clone(),
                     budget: budget.clone(),
+                    requests: requests.clone(),
                 },
                 tokio::spawn,
                 HashMapCache::default(),
@@ -346,6 +383,7 @@ impl Loaders {
                 EventResourceLoader {
                     client: client.clone(),
                     calendars: calendar.clone(),
+                    requests: requests.clone(),
                 },
                 tokio::spawn,
                 HashMapCache::default(),
@@ -355,6 +393,7 @@ impl Loaders {
                 EventUidLoader {
                     client,
                     calendars: calendar.clone(),
+                    requests: requests.clone(),
                 },
                 tokio::spawn,
                 HashMapCache::default(),
@@ -362,5 +401,35 @@ impl Loaders {
             calendar,
             budget,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn calls_share_one_cap_and_keep_their_order() {
+        let requests = Semaphore::new(MAX_CONCURRENT_REQUESTS);
+        let (active, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let call = |i: usize| {
+            let (active, peak) = (&active, &peak);
+            async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                i
+            }
+        };
+        let (a, b) = tokio::join!(
+            in_flight(&requests, (0..10).map(call).collect()),
+            in_flight(&requests, (10..20).map(call).collect()),
+        );
+        assert_eq!(a, (0..10).collect::<Vec<_>>());
+        assert_eq!(b, (10..20).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::SeqCst) <= MAX_CONCURRENT_REQUESTS);
     }
 }

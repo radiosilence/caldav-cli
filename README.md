@@ -242,10 +242,12 @@ Two consequences worth knowing, both stated in the schema:
 `calendarsQueried` on every event connection reports how many collections were
 hit, so the cost isn't hidden. Naming `calendar:` brings it to one.
 
-Query cost is declared per field but **not** capped — refusing an
-expensive-but-legitimate query leaves the caller guessing at a threshold it
-can't see. Depth is capped at 15, because the graph has cycles by design
-(`event → calendar → events`) and nothing else bounds them.
+Query cost is declared per field as page size times what is selected below
+it, and capped at 250,000: far above any query worth asking (a page of 100
+events each asking for 100 conflicts is 100,000), so only the multiplied ones
+are refused. Depth is capped at 15, because the graph has cycles by design
+(`event → calendar → events`). However wide a query is, at most six CalDAV
+requests from it are in flight at once.
 
 ### Adding is one step; changing is two
 

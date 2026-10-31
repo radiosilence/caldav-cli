@@ -649,6 +649,29 @@ async fn a_calendar_too_large_to_search_is_an_error_not_a_miss() {
     assert!(err.contains("MiB"), "{err}");
 }
 
+/// A query that multiplies pages three deep is refused before anything is
+/// fetched; one level of conflicts under a full page is not.
+#[tokio::test]
+async fn a_multiplied_query_is_refused_and_a_plausible_one_is_not() {
+    let h = Harness::start().await;
+    let err = h
+        .run_expecting_error(&format!(
+            r#"{{ events(start: "{DAY}", days: 1, first: 100) {{ nodes {{
+                conflicts(first: 100) {{ nodes {{ conflicts(first: 100) {{ nodes {{ id }} }} }} }}
+            }} }} }}"#
+        ))
+        .await;
+    assert!(err.to_lowercase().contains("complex"), "{err}");
+    assert_eq!(h.reports().await, 0, "refused before any REPORT");
+
+    h.run(&format!(
+        r#"{{ events(start: "{DAY}", days: 1, first: 100) {{ nodes {{
+            id summary conflicts(first: 100) {{ nodes {{ id summary }} }}
+        }} }} }}"#
+    ))
+    .await;
+}
+
 #[tokio::test]
 async fn first_and_last_together_are_rejected() {
     let h = Harness::start().await;
@@ -780,9 +803,10 @@ async fn repeated_uids_in_one_query_are_deduplicated() {
 async fn depth_is_capped_before_anything_is_fetched() {
     let h = Harness::start().await;
     // The graph cycles: event → calendar → events → calendar → …
+    // Pages of one keep the cost low, so depth is what refuses it.
     let deep = format!(
-        "{{ events {{ nodes {{ {} id {} }} }} }}",
-        "calendar { events { nodes { ".repeat(9),
+        "{{ events(first: 1) {{ nodes {{ {} id {} }} }} }}",
+        "calendar { events(first: 1) { nodes { ".repeat(9),
         "} } }".repeat(9)
     );
     let err = h.run_expecting_error(&deep).await;
