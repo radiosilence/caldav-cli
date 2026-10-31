@@ -336,8 +336,8 @@ fn vevent_blocks(lines: &[String]) -> Vec<Vec<ContentLine>> {
     blocks
 }
 
-/// The `X-WR-TIMEZONE` / enclosing `VTIMEZONE` id, used to anchor floating
-/// times. Falls back to UTC.
+/// The `X-WR-TIMEZONE` id, used to anchor floating times. Falls back to UTC; a
+/// `VTIMEZONE` alone is not consulted.
 fn calendar_default_tz(lines: &[String]) -> Tz {
     lines
         .iter()
@@ -696,7 +696,12 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
     ];
     // The zone a floating time is read in, carried so a rewrite is read the
     // same way it was.
-    if let Some(zone) = spec.start.floating.filter(|zone| *zone != Tz::UTC) {
+    if let Some(zone) = spec
+        .start
+        .floating
+        .or(spec.end.floating)
+        .filter(|zone| *zone != Tz::UTC)
+    {
         lines.push(format!("X-WR-TIMEZONE:{}", zone.name()));
     }
     lines.extend([

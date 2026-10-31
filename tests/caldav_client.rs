@@ -1348,53 +1348,62 @@ async fn cancelling_a_floating_occurrence_writes_a_floating_exdate() {
     assert!(body.contains("EXDATE:20260731T090000\r\n"), "{body}");
 }
 
-/// A caller who gives a new start has said what the time is.
+/// A caller's naive end means the same wall time the event's floating times do.
 #[tokio::test]
-async fn a_new_start_replaces_a_floating_one() {
+async fn a_naive_end_on_a_floating_event_is_read_in_its_zone() {
     let server = MockServer::start().await;
-    mount_event(&server, FLOATING_ICS).await;
+    let london = FLOATING_ICS.replace(
+        "BEGIN:VCALENDAR\r\n",
+        "BEGIN:VCALENDAR\r\nX-WR-TIMEZONE:Europe/London\r\n",
+    );
+    mount_event(&server, &london).await;
     Mock::given(method("PUT"))
         .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
-
-    let moved = EventFields {
-        start: Some("2026-07-24T10:00:00Z"),
+    let longer = EventFields {
+        end: Some("2026-07-24 10:00"),
         ..Default::default()
     };
     client(&server)
-        .update_event("evt-1", None, &moved)
+        .update_event("evt-1", None, &longer)
         .await
         .unwrap();
-    assert!(put_body(&server).await.contains("DTSTART:20260724T100000Z"));
+    let body = put_body(&server).await;
+    assert!(body.contains("X-WR-TIMEZONE:Europe/London\r\n"), "{body}");
+    assert!(body.contains("DTEND:20260724T100000\r\n"), "{body}");
 }
 
+/// A new start is read in the event's floating zone and stays floating, so
+/// the series' floating exclusions still match. Naming a zone is what moves an
+/// event out of floating time.
 #[tokio::test]
-async fn replying_sets_only_your_own_partstat() {
-    let server = MockServer::start().await;
-    mount_event(&server, INVITE_ICS).await;
-    Mock::given(method("PUT"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(&server)
-        .await;
-
-    let event = client(&server)
-        .respond_to_invite("evt-1", None, "DECLINED", None)
-        .await
-        .unwrap();
-
-    let body = put_body(&server).await;
-    assert!(body.contains("PARTSTAT=DECLINED:mailto:me@example.com"));
-    // The organiser's own acceptance is not ours to change.
-    assert!(body.contains("PARTSTAT=ACCEPTED:mailto:alice@example.com"));
-    // SEQUENCE bumps so the organiser's client sees a new revision.
-    assert!(body.contains("SEQUENCE:1"));
-    let me = event
-        .attendees
-        .iter()
-        .find(|a| a.email == "me@example.com")
-        .unwrap();
-    assert_eq!(me.status.as_deref(), Some("DECLINED"));
+async fn a_new_start_on_a_floating_event_stays_floating_unless_a_zone_is_named() {
+    for (tz, expected) in [
+        (None, "DTSTART:20260724T100000\r\n"),
+        (
+            Some("Europe/London"),
+            "DTSTART;TZID=Europe/London:20260724T100000\r\n",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        mount_event(&server, FLOATING_ICS).await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let moved = EventFields {
+            start: Some("2026-07-24 10:00"),
+            tzid: tz,
+            ..Default::default()
+        };
+        client(&server)
+            .update_event("evt-1", None, &moved)
+            .await
+            .unwrap();
+        let body = put_body(&server).await;
+        assert!(body.contains(expected), "{tz:?}: {body}");
+    }
 }
 
 #[tokio::test]

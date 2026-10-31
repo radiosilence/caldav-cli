@@ -271,10 +271,15 @@ fn pin_floating(source: &str, zone: Option<chrono_tz::Tz>) -> String {
             && v.as_bytes()[8] == b'T'
             && NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").is_ok()
     };
+    // A wall time in a spring-forward gap names the instant just after it.
     let in_utc = |v: &str| {
-        NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S")
-            .ok()
-            .and_then(|naive| zone.from_local_datetime(&naive).earliest())
+        let naive = NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").ok()?;
+        zone.from_local_datetime(&naive)
+            .earliest()
+            .or_else(|| {
+                zone.from_local_datetime(&(naive + Duration::hours(1)))
+                    .earliest()
+            })
             .map(|at| util::format_ical_utc(at.with_timezone(&Utc)))
     };
     source
@@ -283,8 +288,8 @@ fn pin_floating(source: &str, zone: Option<chrono_tz::Tz>) -> String {
             let Some((head, values)) = line.split_once(':') else {
                 return line.to_string();
             };
-            let name = head.split(';').next().unwrap_or(head);
-            if matches!(name, "RRULE" | "EXRULE") {
+            let name = head.split(';').next().unwrap_or(head).to_ascii_uppercase();
+            if matches!(name.as_str(), "RRULE" | "EXRULE") {
                 let parts: Vec<String> = values
                     .split(';')
                     .map(|part| match part.split_once('=') {
@@ -297,7 +302,7 @@ fn pin_floating(source: &str, zone: Option<chrono_tz::Tz>) -> String {
                 return format!("{head}:{}", parts.join(";"));
             }
             let zoned = head.to_ascii_uppercase().contains("TZID=");
-            if !matches!(name, "DTSTART" | "EXDATE" | "RDATE")
+            if !matches!(name.as_str(), "DTSTART" | "EXDATE" | "RDATE")
                 || zoned
                 || !values.split(',').all(|v| floating(v.trim()))
             {

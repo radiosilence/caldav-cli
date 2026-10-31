@@ -1641,26 +1641,40 @@ fn check_structured(fields: &EventFields<'_>) -> Result<()> {
 /// all-day-ness and, when floating, the zone it was read in. Shared by every
 /// rewrite of a stored time, and by the EXDATE that must match DTSTART's form.
 fn stored_spec<'a>(
-    existing: &'a Event,
-    stored: &EventTime,
+    existing: &Event,
+    stored: &'a EventTime,
     instant: DateTime<Utc>,
 ) -> TimeSpec<'a> {
     TimeSpec {
         instant,
         all_day: existing.all_day,
-        tzid: existing.start.tzid.as_deref().filter(|_| !existing.all_day),
+        tzid: stored.tzid.as_deref().filter(|_| !existing.all_day),
         floating: stored.floating_zone,
     }
 }
 
-/// The zone a stored floating time keeps being written in, when the caller
-/// changes neither the start nor the zone. A caller who sets either has said
-/// what the time is, and gets that; `all_day` alone changes nothing, since
-/// without a start the stored one is kept. Each of DTSTART and DTEND answers
-/// for itself, as a floating start may sit beside a zoned end.
+/// The zone a caller's naive time on `existing` is read in: its start's TZID,
+/// or the zone a floating start is read in, so "10:00" means what the event's
+/// own times mean.
+fn input_zone(existing: &Event) -> Option<&str> {
+    existing
+        .start
+        .tzid
+        .as_deref()
+        .or(existing.start.floating_zone.map(|zone| zone.name()))
+}
+
+/// The zone a stored floating time keeps being written in, unless the caller
+/// names a zone. A new start or end is read in that same zone (see
+/// [`input_zone`]), so it stays floating too; moving the event to UTC would
+/// leave its floating exclusions behind. Each of DTSTART and DTEND answers for
+/// itself, as a floating start may sit beside a zoned end.
 fn kept_floating(stored: &EventTime, fields: &EventFields<'_>) -> Option<chrono_tz::Tz> {
-    let unchanged = fields.start.is_none() && fields.tzid.is_none();
-    unchanged.then_some(stored.floating_zone).flatten()
+    fields
+        .tzid
+        .is_none()
+        .then_some(stored.floating_zone)
+        .flatten()
 }
 
 /// The start and end an update would write: the caller's where given, else the
@@ -1670,7 +1684,7 @@ fn update_span(existing: &Event, fields: &EventFields<'_>) -> Result<(ResolvedTi
     if let Some(raw) = fields.start {
         return resolve_span(raw, fields, Some(existing));
     }
-    let tzid = fields.tzid.or(existing.start.tzid.as_deref());
+    let tzid = fields.tzid.or_else(|| input_zone(existing));
     let start = ResolvedTime {
         instant: existing.start.instant.ok_or_else(|| {
             Error::Server("stored event has an unparseable start; set --start to fix it".into())
@@ -1898,9 +1912,7 @@ fn resolve_span(
     fields: &EventFields<'_>,
     existing: Option<&Event>,
 ) -> Result<(ResolvedTime, ResolvedTime)> {
-    let tzid = fields
-        .tzid
-        .or_else(|| existing.and_then(|e| e.start.tzid.as_deref()));
+    let tzid = fields.tzid.or_else(|| existing.and_then(input_zone));
     let parsed = util::parse_datetime(start_raw, tzid)?;
     let all_day = fields.all_day.unwrap_or(parsed.date_only);
     let start = ResolvedTime {
