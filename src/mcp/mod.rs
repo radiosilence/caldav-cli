@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -59,8 +60,37 @@ pub struct Credentials {
 
 /// Cache of clients keyed by credential set, so discovery (principal →
 /// calendar-home → calendars, three round trips) runs once per account rather
-/// than on every tool call. Shared across sessions.
-type ClientCache = Arc<Mutex<HashMap<Credentials, SharedClient>>>;
+/// than on every tool call. Shared across sessions, and bounded: every distinct
+/// credential set a caller sends, a rejected password included, would otherwise
+/// stay for the life of the process.
+type ClientCache = Arc<Mutex<HashMap<Credentials, CachedClient>>>;
+
+/// Most accounts held at once. Past it the least recently used is dropped, and
+/// pays for discovery again if it returns.
+const CLIENT_CAP: usize = 1024;
+
+/// How long an account's client outlives its last request.
+const CLIENT_IDLE: Duration = Duration::from_secs(60 * 60);
+
+struct CachedClient {
+    client: SharedClient,
+    used: Instant,
+}
+
+/// Make room for one more client: drop the idle ones, then the least recently
+/// used if the cache is still full. A dropped client's in-flight requests keep
+/// their own reference to it.
+fn evict(clients: &mut HashMap<Credentials, CachedClient>, now: Instant) {
+    clients.retain(|_, cached| now.duration_since(cached.used) < CLIENT_IDLE);
+    if clients.len() >= CLIENT_CAP
+        && let Some(oldest) = clients
+            .iter()
+            .min_by_key(|(_, cached)| cached.used)
+            .map(|(creds, _)| creds.clone())
+    {
+        clients.remove(&oldest);
+    }
+}
 
 /// A non-empty, trimmed header value, if present.
 fn header<'a>(headers: Option<&'a http::HeaderMap>, name: &str) -> Option<&'a str> {
@@ -215,9 +245,13 @@ impl CalDavMcp {
 
     /// Get or lazily create a client for `creds`, caching it for reuse.
     async fn client_for(&self, creds: &Credentials) -> SharedClient {
-        if let Some(existing) = self.clients.lock().await.get(creds) {
-            return existing.clone();
+        let now = Instant::now();
+        let mut clients = self.clients.lock().await;
+        if let Some(cached) = clients.get_mut(creds) {
+            cached.used = now;
+            return cached.client.clone();
         }
+        evict(&mut clients, now);
         // Construction is cheap and does no I/O — discovery happens lazily on
         // first use and is then memoised inside the client.
         let client: SharedClient = Arc::new(CalDavClient::new(
@@ -225,12 +259,14 @@ impl CalDavMcp {
             creds.username.clone(),
             creds.password.clone(),
         ));
-        self.clients
-            .lock()
-            .await
-            .entry(creds.clone())
-            .or_insert(client)
-            .clone()
+        clients.insert(
+            creds.clone(),
+            CachedClient {
+                client: client.clone(),
+                used: now,
+            },
+        );
+        client
     }
 
     fn text_result(text: impl Into<String>) -> ToolResult {
@@ -571,6 +607,57 @@ mod tests {
             );
         }
         map
+    }
+
+    #[tokio::test]
+    async fn one_account_reuses_its_client() {
+        let mcp = CalDavMcp::build(None, None);
+        let first = mcp.client_for(&creds("a@x.test")).await;
+        let again = mcp.client_for(&creds("a@x.test")).await;
+        assert!(Arc::ptr_eq(&first, &again));
+        let other = mcp.client_for(&creds("b@x.test")).await;
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    fn cached(used: Instant) -> CachedClient {
+        CachedClient {
+            client: Arc::new(CalDavClient::new(
+                "https://caldav.example.com".into(),
+                "u".into(),
+                "p".into(),
+            )),
+            used,
+        }
+    }
+
+    #[test]
+    fn idle_clients_are_dropped() {
+        let now = Instant::now() + CLIENT_IDLE * 2;
+        let mut clients = HashMap::from([
+            (creds("idle@x.test"), cached(now - CLIENT_IDLE)),
+            (
+                creds("recent@x.test"),
+                cached(now - Duration::from_secs(60)),
+            ),
+        ]);
+        evict(&mut clients, now);
+        assert!(!clients.contains_key(&creds("idle@x.test")));
+        assert!(clients.contains_key(&creds("recent@x.test")));
+    }
+
+    #[test]
+    fn a_full_cache_drops_the_least_recently_used() {
+        let now = Instant::now() + CLIENT_IDLE;
+        let mut clients: HashMap<_, _> = (0..CLIENT_CAP)
+            .map(|i| {
+                let used = now - Duration::from_secs(i as u64 + 1);
+                (creds(&format!("{i}@x.test")), cached(used))
+            })
+            .collect();
+        evict(&mut clients, now);
+        assert_eq!(clients.len(), CLIENT_CAP - 1);
+        let oldest = creds(&format!("{}@x.test", CLIENT_CAP - 1));
+        assert!(!clients.contains_key(&oldest));
     }
 
     #[test]
