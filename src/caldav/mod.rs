@@ -2542,12 +2542,19 @@ END:VCALENDAR
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let _ = socket.read(&mut [0; 1024]).await;
-            let mut out = String::from("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.unwrap();
+            // Written apart so the client sees separate frames.
             for chunk in chunks {
-                out.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+                let frame = format!("{:x}\r\n{chunk}\r\n", chunk.len());
+                // The reader may stop at its cap and hang up first.
+                if socket.write_all(frame.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            out.push_str("0\r\n\r\n");
-            socket.write_all(out.as_bytes()).await.unwrap();
+            let _ = socket.write_all(b"0\r\n\r\n").await;
         });
         reqwest::Client::new()
             .get(format!("http://{addr}/"))
