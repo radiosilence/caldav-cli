@@ -387,6 +387,11 @@ impl CalDavClient {
         &self.username
     }
 
+    /// Whether discovery has succeeded, which only an authenticated request can.
+    pub fn has_authenticated(&self) -> bool {
+        self.home.initialized()
+    }
+
     /// The CalDAV base URL this client authenticates against.
     pub fn server_url(&self) -> &str {
         &self.base

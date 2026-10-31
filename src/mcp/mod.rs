@@ -60,35 +60,52 @@ pub struct Credentials {
 
 /// Cache of clients keyed by credential set, so discovery (principal →
 /// calendar-home → calendars, three round trips) runs once per account rather
-/// than on every tool call. Shared across sessions, and bounded: every distinct
-/// credential set a caller sends, a rejected password included, would otherwise
-/// stay for the life of the process.
-type ClientCache = Arc<Mutex<HashMap<Credentials, CachedClient>>>;
+/// than on every tool call. Shared across sessions, and bounded in both size and
+/// age, since every distinct credential set a caller sends, a rejected password
+/// included, gets an entry holding that password.
+type ClientCache = Arc<Mutex<Clients>>;
 
-/// Most accounts held at once. Past it the least recently used is dropped, and
-/// pays for discovery again if it returns.
+/// Most accounts held at once. Past it, an account that has never
+/// authenticated goes first, then the least recently used; either pays for
+/// discovery again if it returns.
 const CLIENT_CAP: usize = 1024;
 
 /// How long an account's client outlives its last request.
 const CLIENT_IDLE: Duration = Duration::from_secs(60 * 60);
+
+/// How often a request sweeps out idle accounts.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct Clients {
+    map: HashMap<Credentials, CachedClient>,
+    swept: Option<Instant>,
+}
 
 struct CachedClient {
     client: SharedClient,
     used: Instant,
 }
 
-/// Make room for one more client: drop the idle ones, then the least recently
-/// used if the cache is still full. A dropped client's in-flight requests keep
-/// their own reference to it.
-fn evict(clients: &mut HashMap<Credentials, CachedClient>, now: Instant) {
+/// Drop clients idle past [`CLIENT_IDLE`]. A dropped client's in-flight requests
+/// keep their own reference to it.
+fn sweep(clients: &mut HashMap<Credentials, CachedClient>, now: Instant) {
     clients.retain(|_, cached| now.duration_since(cached.used) < CLIENT_IDLE);
+}
+
+/// Make room for one more client in a full cache, dropping the entry that
+/// `rank` puts first.
+fn make_room<K: Ord>(
+    clients: &mut HashMap<Credentials, CachedClient>,
+    rank: impl Fn(&CachedClient) -> K,
+) {
     if clients.len() >= CLIENT_CAP
-        && let Some(oldest) = clients
+        && let Some(first) = clients
             .iter()
-            .min_by_key(|(_, cached)| cached.used)
+            .min_by_key(|(_, cached)| rank(cached))
             .map(|(creds, _)| creds.clone())
     {
-        clients.remove(&oldest);
+        clients.remove(&first);
     }
 }
 
@@ -198,7 +215,7 @@ impl CalDavMcp {
     fn build(default_credentials: Option<Credentials>, default_calendar: Option<String>) -> Self {
         Self {
             schema: Arc::new(graphql::build_schema()),
-            clients: Arc::new(Mutex::new(HashMap::new())),
+            clients: Arc::new(Mutex::new(Clients::default())),
             default_credentials,
             default_calendar,
             tool_router: Self::tool_router(),
@@ -245,13 +262,24 @@ impl CalDavMcp {
 
     /// Get or lazily create a client for `creds`, caching it for reuse.
     async fn client_for(&self, creds: &Credentials) -> SharedClient {
-        let now = Instant::now();
         let mut clients = self.clients.lock().await;
-        if let Some(cached) = clients.get_mut(creds) {
+        // Read under the lock, so a task that waited cannot stamp an older time
+        // over a newer one.
+        let now = Instant::now();
+        if clients
+            .swept
+            .is_none_or(|at| now.duration_since(at) >= SWEEP_EVERY)
+        {
+            sweep(&mut clients.map, now);
+            clients.swept = Some(now);
+        }
+        if let Some(cached) = clients.map.get_mut(creds) {
             cached.used = now;
             return cached.client.clone();
         }
-        evict(&mut clients, now);
+        make_room(&mut clients.map, |cached| {
+            (cached.client.has_authenticated(), cached.used)
+        });
         // Construction is cheap and does no I/O — discovery happens lazily on
         // first use and is then memoised inside the client.
         let client: SharedClient = Arc::new(CalDavClient::new(
@@ -259,7 +287,7 @@ impl CalDavMcp {
             creds.username.clone(),
             creds.password.clone(),
         ));
-        clients.insert(
+        clients.map.insert(
             creds.clone(),
             CachedClient {
                 client: client.clone(),
@@ -640,7 +668,7 @@ mod tests {
                 cached(now - Duration::from_secs(60)),
             ),
         ]);
-        evict(&mut clients, now);
+        sweep(&mut clients, now);
         assert!(!clients.contains_key(&creds("idle@x.test")));
         assert!(clients.contains_key(&creds("recent@x.test")));
     }
@@ -654,10 +682,31 @@ mod tests {
                 (creds(&format!("{i}@x.test")), cached(used))
             })
             .collect();
-        evict(&mut clients, now);
+        make_room(&mut clients, |cached| cached.used);
         assert_eq!(clients.len(), CLIENT_CAP - 1);
         let oldest = creds(&format!("{}@x.test", CLIENT_CAP - 1));
         assert!(!clients.contains_key(&oldest));
+    }
+
+    /// Ranked as `client_for` ranks them: never authenticated first, then by age.
+    #[test]
+    fn a_full_cache_drops_an_unauthenticated_entry_before_an_older_real_one() {
+        let now = Instant::now() + CLIENT_IDLE;
+        let mut clients: HashMap<_, _> = (0..CLIENT_CAP)
+            .map(|i| {
+                let used = now - Duration::from_secs(i as u64 + 1);
+                (creds(&format!("{i}@x.test")), cached(used))
+            })
+            .collect();
+        let guess = creds("0@x.test");
+        let unauthenticated = clients[&guess].client.clone();
+        make_room(&mut clients, |cached| {
+            (!Arc::ptr_eq(&cached.client, &unauthenticated), cached.used)
+        });
+        assert!(
+            !clients.contains_key(&guess),
+            "the newest, but never authenticated"
+        );
     }
 
     #[test]
