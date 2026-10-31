@@ -1,0 +1,1 @@
+- **Tests no longer share a connection pool across runtimes.** Each test's client has its own pool, so a connection opened in one test's runtime can never be handed to another, which failed CI with "dispatch task is gone" when a port was reused.
