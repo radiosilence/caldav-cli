@@ -1135,7 +1135,7 @@ impl CalDavClient {
                     Some(raw) => resolve_end(raw, tzid, start)?,
                     None => match fields.duration_minutes {
                         Some(mins) => ResolvedTime {
-                            instant: start.instant + Duration::minutes(mins),
+                            instant: add_minutes(start.instant, mins)?,
                             all_day: start.all_day,
                         },
                         None => ResolvedTime {
@@ -1609,7 +1609,7 @@ fn resolve_span(
         Some(raw) => resolve_end(raw, tzid, start)?,
         None => match fields.duration_minutes {
             Some(mins) => ResolvedTime {
-                instant: start.instant + Duration::minutes(mins),
+                instant: add_minutes(start.instant, mins)?,
                 all_day,
             },
             None => ResolvedTime {
@@ -1631,6 +1631,17 @@ fn resolve_span(
         });
     }
     Ok((start, end))
+}
+
+/// `instant` plus a caller's duration, refused when it leaves the range an
+/// iCalendar date can hold.
+fn add_minutes(instant: DateTime<Utc>, minutes: i64) -> Result<DateTime<Utc>> {
+    let label = format!("{minutes} minutes");
+    let end = Duration::try_minutes(minutes)
+        .and_then(|span| instant.checked_add_signed(span))
+        .ok_or_else(|| util::out_of_range(&label))?;
+    util::within_ical_years(end, &label)?;
+    Ok(end)
 }
 
 fn resolve_end(raw: &str, tzid: Option<&str>, start: ResolvedTime) -> Result<ResolvedTime> {
@@ -2412,6 +2423,17 @@ END:VCALENDAR
         assert!(!matches_query(&e, "unrelated"));
         // An empty needle matches everything.
         assert!(matches_query(&e, ""));
+    }
+
+    #[test]
+    fn an_unrepresentable_duration_is_an_error() {
+        let fields = EventFields {
+            summary: Some("x"),
+            start: Some("2026-07-24T09:00:00Z"),
+            duration_minutes: Some(9_007_199_254_740_991),
+            ..Default::default()
+        };
+        assert!(resolve_span("2026-07-24T09:00:00Z", &fields, None).is_err());
     }
 
     #[test]

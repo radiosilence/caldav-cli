@@ -75,8 +75,15 @@ impl RangeArgs {
 
         let end = match (&self.end, self.days) {
             (Some(raw), _) => util::parse_datetime_at(raw, tzid, now)?.instant,
-            (None, Some(days)) => start + chrono::Duration::days(days.max(1)),
-            (None, None) => start + chrono::Duration::days(DEFAULT_DAYS),
+            (None, days) => {
+                let days = days.unwrap_or(DEFAULT_DAYS).max(1);
+                let label = format!("{days} days");
+                let end = chrono::Duration::try_days(days)
+                    .and_then(|span| start.checked_add_signed(span))
+                    .ok_or_else(|| util::out_of_range(&label))?;
+                util::within_ical_years(end, &label)?;
+                end
+            }
         };
 
         Ok((start, end))
@@ -143,6 +150,18 @@ mod tests {
         let (start, _) = args.resolve_at(now()).unwrap();
         // Midnight on the 24th in Tokyo is 15:00Z on the 23rd.
         assert_eq!(util::format_rfc3339(start), "2026-07-23T15:00:00Z");
+    }
+
+    #[test]
+    fn a_window_past_the_calendar_is_an_error() {
+        // The first overflows chrono; the second fits it but not iCalendar.
+        for days in [100_000_000, 3_650_000] {
+            let args = RangeArgs {
+                days: Some(days),
+                ..Default::default()
+            };
+            assert!(args.resolve_at(now()).is_err(), "{days} days");
+        }
     }
 
     #[test]
