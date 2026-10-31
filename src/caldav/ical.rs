@@ -256,6 +256,9 @@ pub fn parse_time(line: &ContentLine, default_tz: Tz) -> EventTime {
             .map(|dt| dt.with_timezone(&Utc))
     };
 
+    // Only a floating value has no zone of its own to write back in.
+    let floating_zone =
+        (!is_date && tzid.is_none() && !raw.ends_with('Z') && instant.is_some()).then_some(tz);
     EventTime {
         date_time: instant.filter(|_| !is_date).map(util::format_rfc3339),
         date: instant.filter(|_| is_date).map(util::format_iso_date),
@@ -263,6 +266,7 @@ pub fn parse_time(line: &ContentLine, default_tz: Tz) -> EventTime {
         all_day: is_date,
         raw,
         instant,
+        floating_zone,
     }
 }
 
@@ -490,6 +494,7 @@ fn derive_end(start: &EventTime, span: Duration) -> EventTime {
         return start.clone();
     };
     EventTime {
+        floating_zone: start.floating_zone,
         date_time: (!start.all_day).then(|| util::format_rfc3339(instant)),
         date: start.all_day.then(|| util::format_iso_date(instant)),
         tzid: start.tzid.clone(),
@@ -618,21 +623,10 @@ pub struct TimeSpec<'a> {
     pub all_day: bool,
     /// When set, the value is written as local time with a `TZID` parameter.
     pub tzid: Option<&'a str>,
-    /// A stored floating time this one is written relative to, as its wall
-    /// time and the instant it was read as. With no `TZID`, the value is then
-    /// written floating rather than in UTC, so an edit does not pin a floating
-    /// event to UTC wall time.
-    pub floating: Option<(NaiveDateTime, DateTime<Utc>)>,
-}
-
-/// The wall time and instant of a stored floating date-time: one with neither
-/// a `TZID` nor a trailing `Z`. `None` for every other kind of time.
-pub fn floating_anchor(time: &EventTime) -> Option<(NaiveDateTime, DateTime<Utc>)> {
-    if time.all_day || time.tzid.is_some() || time.raw.ends_with('Z') {
-        return None;
-    }
-    let naive = NaiveDateTime::parse_from_str(&time.raw, "%Y%m%dT%H%M%S").ok()?;
-    Some((naive, time.instant?))
+    /// The zone a stored floating time was read in. With no `TZID`, the value
+    /// is then written as wall time in that zone with no `Z`, so an edit does
+    /// not pin a floating event to UTC wall time.
+    pub floating: Option<Tz>,
 }
 
 impl TimeSpec<'_> {
@@ -653,14 +647,11 @@ impl TimeSpec<'_> {
                 let local = self.instant.with_timezone(&tz);
                 format!("{name};TZID={id}:{}", local.format("%Y%m%dT%H%M%S"))
             }
-            // Floating time has no zone to convert through, so it moves by the
-            // same span as the instant: exact for the UTC reading it gets
-            // without X-WR-TIMEZONE, and a wall-clock shift otherwise.
-            None => match self
-                .floating
-                .and_then(|(wall, read_as)| wall.checked_add_signed(self.instant - read_as))
-            {
-                Some(wall) => format!("{name}:{}", wall.format("%Y%m%dT%H%M%S")),
+            None => match self.floating {
+                Some(zone) => {
+                    let wall = self.instant.with_timezone(&zone);
+                    format!("{name}:{}", wall.format("%Y%m%dT%H%M%S"))
+                }
                 None => format!("{name}:{}", util::format_ical_utc(self.instant)),
             },
         }
@@ -702,6 +693,13 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
         "VERSION:2.0".to_string(),
         "PRODID:-//radiosilence//caldav//EN".to_string(),
         "CALSCALE:GREGORIAN".to_string(),
+    ];
+    // The zone a floating time is read in, carried so a rewrite is read the
+    // same way it was.
+    if let Some(zone) = spec.start.floating.filter(|zone| *zone != Tz::UTC) {
+        lines.push(format!("X-WR-TIMEZONE:{}", zone.name()));
+    }
+    lines.extend([
         "BEGIN:VEVENT".to_string(),
         format!("UID:{}", one_line(spec.uid)),
         format!("DTSTAMP:{}", util::format_ical_utc(spec.stamp)),
@@ -709,7 +707,7 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
         spec.start.render("DTSTART"),
         spec.end.render("DTEND"),
         format!("SUMMARY:{}", escape_text(spec.summary)),
-    ];
+    ]);
 
     if let Some(v) = spec.description.filter(|s| !s.is_empty()) {
         lines.push(format!("DESCRIPTION:{}", escape_text(v)));
@@ -1063,23 +1061,54 @@ DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\
     }
 
     #[test]
-    fn a_floating_time_is_written_floating_and_moves_by_its_span() {
-        let read_as = Utc.with_ymd_and_hms(2026, 7, 24, 9, 0, 0).unwrap();
-        let wall = NaiveDate::from_ymd_opt(2026, 7, 24)
-            .unwrap()
-            .and_hms_opt(9, 0, 0)
-            .unwrap();
+    fn a_floating_time_is_written_as_wall_time_in_its_zone() {
+        // Read in London, so wall time holds across the end of BST.
+        let zone: Tz = "Europe/London".parse().unwrap();
         let spec = |instant| TimeSpec {
             instant,
             all_day: false,
             tzid: None,
-            floating: Some((wall, read_as)),
+            floating: Some(zone),
         };
-        assert_eq!(spec(read_as).render("DTSTART"), "DTSTART:20260724T090000");
-        assert_eq!(
-            spec(read_as + Duration::days(7)).render("EXDATE"),
-            "EXDATE:20260731T090000"
-        );
+        let summer = Utc.with_ymd_and_hms(2026, 10, 19, 8, 0, 0).unwrap();
+        let winter = Utc.with_ymd_and_hms(2026, 10, 26, 9, 0, 0).unwrap();
+        assert_eq!(spec(summer).render("DTSTART"), "DTSTART:20261019T090000");
+        assert_eq!(spec(winter).render("EXDATE"), "EXDATE:20261026T090000");
+    }
+
+    /// The zone a floating time was read in goes back with it, so a rewrite
+    /// reads the same.
+    #[test]
+    fn a_floating_rewrite_carries_its_zone() {
+        let zone: Tz = "Europe/London".parse().unwrap();
+        let stamp = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+        let at = TimeSpec {
+            instant: Utc.with_ymd_and_hms(2026, 7, 24, 8, 0, 0).unwrap(),
+            all_day: false,
+            tzid: None,
+            floating: Some(zone),
+        };
+        let ics = build_vcalendar(&VEventSpec {
+            uid: "u",
+            summary: "s",
+            start: at,
+            end: at,
+            description: None,
+            location: None,
+            url: None,
+            status: None,
+            recurrence: None,
+            recur_extra: &[],
+            attendees: &[],
+            organizer: None,
+            categories: &[],
+            sequence: 0,
+            stamp,
+        });
+        assert!(ics.contains("X-WR-TIMEZONE:Europe/London\r\n"), "{ics}");
+        assert!(ics.contains("DTSTART:20260724T090000\r\n"), "{ics}");
+        let reread = parse_events(&ics, "Home", "/c/", "/c/u.ics", None).remove(0);
+        assert_eq!(reread.start.instant, Some(at.instant));
     }
 
     #[test]
@@ -1092,10 +1121,14 @@ DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\
             .unwrap();
             parse_time(&line, Tz::UTC)
         };
-        assert!(floating_anchor(&time("20260724T090000", None)).is_some());
-        assert!(floating_anchor(&time("20260724T090000Z", None)).is_none());
-        assert!(floating_anchor(&time("20260724T090000", Some("Europe/London"))).is_none());
-        assert!(floating_anchor(&time("20260724", None)).is_none());
+        assert!(time("20260724T090000", None).floating_zone.is_some());
+        assert!(time("20260724T090000Z", None).floating_zone.is_none());
+        assert!(
+            time("20260724T090000", Some("Europe/London"))
+                .floating_zone
+                .is_none()
+        );
+        assert!(time("20260724", None).floating_zone.is_none());
     }
 
     #[test]

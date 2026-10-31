@@ -1304,6 +1304,50 @@ async fn edits_keep_a_floating_time_floating() {
     assert!(body.contains("DTSTART:20260724T090000\r\n"), "{body}");
 }
 
+/// A floating start says nothing about the end, which keeps its own form.
+#[tokio::test]
+async fn a_zoned_end_beside_a_floating_start_stays_zoned() {
+    let server = MockServer::start().await;
+    mount_event(
+        &server,
+        &FLOATING_ICS.replace("DTEND:20260724T093000", "DTEND:20260724T093000Z"),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    client(&server)
+        .respond_to_invite("evt-1", None, "ACCEPTED", None)
+        .await
+        .unwrap();
+    let body = put_body(&server).await;
+    assert!(body.contains("DTSTART:20260724T090000\r\n"), "{body}");
+    assert!(body.contains("DTEND:20260724T093000Z\r\n"), "{body}");
+}
+
+/// The EXDATE that cancels an occurrence of a floating series is floating
+/// too, at the occurrence's wall time.
+#[tokio::test]
+async fn cancelling_a_floating_occurrence_writes_a_floating_exdate() {
+    let server = MockServer::start().await;
+    let series = FLOATING_ICS.replace(
+        "DTEND:20260724T093000\r\n",
+        "DTEND:20260724T093000\r\nRRULE:FREQ=WEEKLY\r\n",
+    );
+    mount_event(&server, &series).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    client(&server)
+        .exclude_occurrence("evt-1", None, "2026-07-31")
+        .await
+        .unwrap();
+    let body = put_body(&server).await;
+    assert!(body.contains("EXDATE:20260731T090000\r\n"), "{body}");
+}
+
 /// A caller who gives a new start has said what the time is.
 #[tokio::test]
 async fn a_new_start_replaces_a_floating_one() {

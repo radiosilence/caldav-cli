@@ -231,13 +231,14 @@ pub fn check_series(
     dtstart: &str,
     rule: &str,
     extra: &[String],
+    floating: Option<chrono_tz::Tz>,
 ) -> std::result::Result<(), String> {
     let mut source = format!("{dtstart}\nRRULE:{rule}");
     for line in extra {
         source.push('\n');
         source.push_str(line);
     }
-    let set: RRuleSet = pin_dates_to_utc(&source)
+    let set: RRuleSet = pin_floating(&pin_dates_to_utc(&source), floating)
         .parse()
         .map_err(|e: rrule::RRuleError| e.to_string().trim_end_matches('.').to_string())?;
     match set
@@ -250,6 +251,62 @@ pub fn check_series(
         )),
         false => Ok(()),
     }
+}
+
+/// Give floating date-times the zone `zone` they were read in.
+///
+/// A floating `DTSTART` (no `TZID`, no `Z`) means the same wall time anywhere,
+/// and [`crate::caldav::ical::parse_time`] reads it in the calendar's
+/// `X-WR-TIMEZONE`, or UTC. rrule would read it in the zone of the machine it
+/// runs on instead, so occurrences would disagree with the event by that
+/// machine's offset, and an `EXDATE` written for one would miss. Naming the
+/// zone leaves rrule nothing to interpret. A floating `UNTIL` becomes the UTC
+/// instant it names there, which is what rrule requires beside a zoned start.
+fn pin_floating(source: &str, zone: Option<chrono_tz::Tz>) -> String {
+    let Some(zone) = zone else {
+        return source.to_string();
+    };
+    let floating = |v: &str| {
+        v.len() == 15
+            && v.as_bytes()[8] == b'T'
+            && NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S").is_ok()
+    };
+    let in_utc = |v: &str| {
+        NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S")
+            .ok()
+            .and_then(|naive| zone.from_local_datetime(&naive).earliest())
+            .map(|at| util::format_ical_utc(at.with_timezone(&Utc)))
+    };
+    source
+        .lines()
+        .map(|line| {
+            let Some((head, values)) = line.split_once(':') else {
+                return line.to_string();
+            };
+            let name = head.split(';').next().unwrap_or(head);
+            if matches!(name, "RRULE" | "EXRULE") {
+                let parts: Vec<String> = values
+                    .split(';')
+                    .map(|part| match part.split_once('=') {
+                        Some((key, v)) if key.eq_ignore_ascii_case("UNTIL") && floating(v) => {
+                            in_utc(v).map_or_else(|| part.to_string(), |at| format!("{key}={at}"))
+                        }
+                        _ => part.to_string(),
+                    })
+                    .collect();
+                return format!("{head}:{}", parts.join(";"));
+            }
+            let zoned = head.to_ascii_uppercase().contains("TZID=");
+            if !matches!(name, "DTSTART" | "EXDATE" | "RDATE")
+                || zoned
+                || !values.split(',').all(|v| floating(v.trim()))
+            {
+                return line.to_string();
+            }
+            format!("{head};TZID={}:{values}", zone.name())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Pin date-valued recurrence anchors to UTC midnight.
@@ -330,10 +387,11 @@ fn occurrences(
     end: DateTime<Utc>,
     budget: &ExpansionBudget,
 ) -> Result<std::result::Result<Vec<DateTime<Utc>>, String>> {
-    let set: RRuleSet = match pin_dates_to_utc(source).parse() {
-        Ok(set) => set,
-        Err(e) => return Ok(Err(format!("{e}"))),
-    };
+    let set: RRuleSet =
+        match pin_floating(&pin_dates_to_utc(source), event.start.floating_zone).parse() {
+            Ok(set) => set,
+            Err(e) => return Ok(Err(format!("{e}"))),
+        };
     if let Some(rule) = set
         .get_rrule()
         .iter()
@@ -589,6 +647,7 @@ fn instantiate(
 /// Rebuild an [`EventTime`] at a new instant, keeping its all-day-ness and zone.
 fn shift(template: &EventTime, instant: DateTime<Utc>) -> EventTime {
     EventTime {
+        floating_zone: template.floating_zone,
         date_time: (!template.all_day).then(|| util::format_rfc3339(instant)),
         date: template.all_day.then(|| util::format_iso_date(instant)),
         tzid: template.tzid.clone(),
@@ -1404,6 +1463,48 @@ RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     fn pinning_leaves_timed_and_rule_lines_untouched() {
         let source = "DTSTART;TZID=Europe/London:20260706T090000\nRRULE:FREQ=WEEKLY;BYDAY=MO,TU;UNTIL=20260721T000000Z";
         assert_eq!(pin_dates_to_utc(source), source);
+    }
+
+    /// A floating series is expanded in the zone it was read in, whatever zone
+    /// the machine running this is in.
+    #[test]
+    fn a_floating_series_expands_in_the_zone_it_was_read_in() {
+        let ics = "BEGIN:VCALENDAR\r\nX-WR-TIMEZONE:Europe/London\r\nBEGIN:VEVENT\r\nUID:f\r\n\
+SUMMARY:F\r\nDTSTART:20260706T090000\r\nRRULE:FREQ=WEEKLY;UNTIL=20260720T090000\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let out = expand_all(
+            parse(ics),
+            at(2026, 7, 1),
+            at(2026, 8, 1),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
+        let starts: Vec<String> = out
+            .iter()
+            .map(|e| util::format_rfc3339(e.start.instant.unwrap()))
+            .collect();
+        // 09:00 BST, three Mondays, the floating UNTIL kept inclusive.
+        assert_eq!(
+            starts,
+            [
+                "2026-07-06T08:00:00Z",
+                "2026-07-13T08:00:00Z",
+                "2026-07-20T08:00:00Z"
+            ]
+        );
+    }
+
+    #[test]
+    fn pinning_a_floating_series_names_its_zone() {
+        let zone: chrono_tz::Tz = "Europe/London".parse().unwrap();
+        let source = "DTSTART:20260706T090000\nRRULE:FREQ=WEEKLY;UNTIL=20260720T090000\nEXDATE:20260713T090000";
+        assert_eq!(
+            pin_floating(source, Some(zone)),
+            "DTSTART;TZID=Europe/London:20260706T090000\n\
+RRULE:FREQ=WEEKLY;UNTIL=20260720T080000Z\n\
+EXDATE;TZID=Europe/London:20260713T090000"
+        );
+        assert_eq!(pin_floating(source, None), source);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use tokio::sync::OnceCell;
 use tracing::{debug, instrument};
 
 use crate::error::{Error, Result};
-use crate::models::{BusyPeriod, Calendar, CalendarFields, Event, EventFields};
+use crate::models::{BusyPeriod, Calendar, CalendarFields, Event, EventFields, EventTime};
 use crate::util;
 
 use ical::{TimeSpec, VEventSpec};
@@ -1168,16 +1168,15 @@ impl CalDavClient {
             None => ical::recur_extra_lines(existing.recur_source.as_deref()),
         };
 
-        let floating = kept_floating(&existing, fields);
         let ics = ical::build_vcalendar(&VEventSpec {
             uid,
             summary,
             start: TimeSpec {
-                floating,
+                floating: kept_floating(&existing.start, fields),
                 ..start.spec(tzid)
             },
             end: TimeSpec {
-                floating,
+                floating: kept_floating(&existing.end, fields),
                 ..end.spec(tzid)
             },
             description: fields.description.or(existing.description.as_deref()),
@@ -1421,7 +1420,11 @@ impl CalDavClient {
 
         let tzid = existing.start.tzid.as_deref();
         let at = resolve_occurrence(&existing, occurrence, tzid)?;
-        let tz = util::resolve_tz(tzid)?;
+        // Floating exclusions are read in the zone the series is.
+        let tz = match existing.start.floating_zone {
+            Some(zone) => zone,
+            None => util::resolve_tz(tzid)?,
+        };
         if ical::excluded_instants(existing.recur_source.as_deref(), tz).contains(&at) {
             return Err(Error::Server(format!(
                 "the occurrence at {} is already cancelled",
@@ -1430,13 +1433,7 @@ impl CalDavClient {
         }
 
         // In the form DTSTART has, which servers require of an EXDATE.
-        let exdate = TimeSpec {
-            instant: at,
-            all_day: existing.all_day,
-            tzid: tzid.filter(|_| !existing.all_day),
-            floating: ical::floating_anchor(&existing.start),
-        }
-        .render("EXDATE");
+        let exdate = stored_spec(&existing, &existing.start, at).render("EXDATE");
 
         let mut recur_extra = ical::recur_extra_lines(existing.recur_source.as_deref());
         recur_extra.push(exdate);
@@ -1506,19 +1503,16 @@ impl CalDavClient {
         let start = existing.start.instant.ok_or_else(|| {
             Error::Server("stored event has an unparseable start; set --start to fix it".into())
         })?;
-        let tzid = existing.start.tzid.as_deref();
-        let spec = |instant| TimeSpec {
-            instant,
-            all_day: existing.all_day,
-            tzid: tzid.filter(|_| !existing.all_day),
-            floating: ical::floating_anchor(&existing.start),
-        };
 
         let ics = ical::build_vcalendar(&VEventSpec {
             uid: &existing.id,
             summary: existing.summary.as_deref().unwrap_or("(no title)"),
-            start: spec(start),
-            end: spec(existing.end.instant.unwrap_or(start)),
+            start: stored_spec(existing, &existing.start, start),
+            end: stored_spec(
+                existing,
+                &existing.end,
+                existing.end.instant.unwrap_or(start),
+            ),
             description: existing.description.as_deref(),
             location: existing.location.as_deref(),
             url: existing.url.as_deref(),
@@ -1643,17 +1637,30 @@ fn check_structured(fields: &EventFields<'_>) -> Result<()> {
     Ok(())
 }
 
-/// The stored floating start an update keeps writing relative to, when the
-/// caller changes neither the start, the all-day flag nor the zone. A caller
-/// who sets any of those has said what the time is, and gets that.
-fn kept_floating(
-    existing: &Event,
-    fields: &EventFields<'_>,
-) -> Option<(chrono::NaiveDateTime, DateTime<Utc>)> {
-    let unchanged = fields.start.is_none() && fields.all_day.is_none() && fields.tzid.is_none();
-    unchanged
-        .then(|| ical::floating_anchor(&existing.start))
-        .flatten()
+/// `instant` written in the form a stored time of `existing` has: its zone,
+/// all-day-ness and, when floating, the zone it was read in. Shared by every
+/// rewrite of a stored time, and by the EXDATE that must match DTSTART's form.
+fn stored_spec<'a>(
+    existing: &'a Event,
+    stored: &EventTime,
+    instant: DateTime<Utc>,
+) -> TimeSpec<'a> {
+    TimeSpec {
+        instant,
+        all_day: existing.all_day,
+        tzid: existing.start.tzid.as_deref().filter(|_| !existing.all_day),
+        floating: stored.floating_zone,
+    }
+}
+
+/// The zone a stored floating time keeps being written in, when the caller
+/// changes neither the start nor the zone. A caller who sets either has said
+/// what the time is, and gets that; `all_day` alone changes nothing, since
+/// without a start the stored one is kept. Each of DTSTART and DTEND answers
+/// for itself, as a floating start may sit beside a zoned end.
+fn kept_floating(stored: &EventTime, fields: &EventFields<'_>) -> Option<chrono_tz::Tz> {
+    let unchanged = fields.start.is_none() && fields.tzid.is_none();
+    unchanged.then_some(stored.floating_zone).flatten()
 }
 
 /// The start and end an update would write: the caller's where given, else the
@@ -1702,7 +1709,7 @@ pub fn check_update(
     let span = update_span(existing, fields)?;
     let tzid = fields.tzid.or(existing.start.tzid.as_deref());
     let new_start = TimeSpec {
-        floating: kept_floating(existing, fields),
+        floating: kept_floating(&existing.start, fields),
         ..span.0.spec(tzid)
     };
     if fields.recurrence.is_some() {
@@ -1720,10 +1727,12 @@ pub fn check_update(
     let written = new_start.render("DTSTART");
     let stored = source.lines().find(|line| line.starts_with("DTSTART"));
     let extra = ical::recur_extra_lines(Some(source));
-    let worked = stored.is_some_and(|dtstart| recur::check_series(dtstart, rule, &extra).is_ok());
+    let worked = stored.is_some_and(|dtstart| {
+        recur::check_series(dtstart, rule, &extra, existing.start.floating_zone).is_ok()
+    });
     if stored != Some(written.as_str())
         && worked
-        && let Err(e) = recur::check_series(&written, rule, &extra)
+        && let Err(e) = recur::check_series(&written, rule, &extra, new_start.floating)
     {
         return Err(Error::Server(format!(
             "this change rewrites the start as {written} and the series would stop expanding \
@@ -1740,7 +1749,7 @@ fn check_rule(rule: Option<&str>, start: &TimeSpec<'_>) -> Result<()> {
     let Some(rule) = rule.and_then(ical::rule_value) else {
         return Ok(());
     };
-    recur::check_series(&start.render("DTSTART"), rule, &[]).map_err(|reason| {
+    recur::check_series(&start.render("DTSTART"), rule, &[], start.floating).map_err(|reason| {
         let unexpandable_part = rule.split(';').any(|part| {
             let key = part
                 .split('=')
