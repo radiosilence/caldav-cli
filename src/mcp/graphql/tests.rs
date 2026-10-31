@@ -633,6 +633,22 @@ async fn a_window_past_the_calendar_is_an_error() {
     assert!(err.contains("1 to 9999"), "{err}");
 }
 
+/// A calendar too large to search for a UID is an error for the field, not
+/// "no such event".
+#[tokio::test]
+async fn a_calendar_too_large_to_search_is_an_error_not_a_miss() {
+    let h = Harness::start().await;
+    Mock::given(method("REPORT"))
+        .respond_with(ResponseTemplate::new(207).set_body_string("x".repeat(33 * 1024 * 1024)))
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    let err = h
+        .run_expecting_error(r#"{ event(id: "standup", calendar: "Home") { summary } }"#)
+        .await;
+    assert!(err.contains("MiB"), "{err}");
+}
+
 #[tokio::test]
 async fn first_and_last_together_are_rejected() {
     let h = Harness::start().await;
