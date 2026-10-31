@@ -559,12 +559,7 @@ pub fn recur_extra_lines(recur_source: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
         .lines()
         .map(str::trim)
-        .filter(|line| {
-            matches!(
-                line_name(line).to_ascii_uppercase().as_str(),
-                "EXDATE" | "RDATE" | "EXRULE"
-            )
-        })
+        .filter(|line| is_recurrence_extra(line))
         .map(str::to_string)
         .collect()
 }
@@ -659,7 +654,8 @@ pub struct VEventSpec<'a> {
     pub status: Option<&'a str>,
     pub recurrence: Option<&'a str>,
     /// The recurrence properties other than `RRULE` — `EXDATE`, `RDATE`,
-    /// `EXRULE` — as complete content lines, written back verbatim.
+    /// `EXRULE` — as complete content lines, written back as the server holds
+    /// them, one property to a line.
     ///
     /// These carry structured values this tool doesn't model, and rebuilding a
     /// series without them silently resurrects every cancelled occurrence. Get
@@ -702,16 +698,19 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
     if let Some(v) = spec.status.filter(|s| !s.is_empty()) {
         lines.push(format!("STATUS:{}", one_line(&v.to_ascii_uppercase())));
     }
-    if let Some(v) = spec.recurrence.filter(|s| !s.is_empty()) {
+    if let Some(v) = spec.recurrence.and_then(rule_value) {
         // RRULE is structured, not TEXT — it must not be escaped.
-        lines.push(format!(
-            "RRULE:{}",
-            one_line(v.trim_start_matches("RRULE:"))
-        ));
+        lines.push(format!("RRULE:{}", one_line(v)));
     }
-    // Already complete content lines, straight off the wire — not escaped, and
-    // only meaningful next to the RRULE they qualify.
-    lines.extend(spec.recur_extra.iter().map(|line| one_line(line)));
+    // Complete content lines from the server — not escaped, and only
+    // meaningful next to the RRULE they qualify.
+    lines.extend(
+        spec.recur_extra
+            .iter()
+            .flat_map(|line| line.split(['\r', '\n']))
+            .filter(|line| is_recurrence_extra(line))
+            .map(str::to_string),
+    );
     if !spec.categories.is_empty() {
         let joined: Vec<String> = spec.categories.iter().map(|c| escape_text(c)).collect();
         lines.push(format!("CATEGORIES:{}", joined.join(",")));
@@ -748,6 +747,23 @@ fn render_participant(name: &str, p: &Attendee) -> String {
     }
     line.push_str(&format!(":mailto:{}", one_line(&p.email)));
     line
+}
+
+/// A caller's RRULE as it is written: trimmed, without a leading `RRULE:`, and
+/// `None` when nothing is left.
+pub fn rule_value(raw: &str) -> Option<&str> {
+    let rule = raw.trim();
+    Some(rule.strip_prefix("RRULE:").unwrap_or(rule).trim()).filter(|r| !r.is_empty())
+}
+
+/// Whether a content line is one of the recurrence properties carried across a
+/// rewrite. A stray line break inside one splits it into its parts, and each
+/// part is kept only if it is one of these.
+fn is_recurrence_extra(line: &str) -> bool {
+    matches!(
+        line_name(line).trim().to_ascii_uppercase().as_str(),
+        "EXDATE" | "RDATE" | "EXRULE"
+    )
 }
 
 /// A value outside a TEXT property, with any line break removed. Callers'
@@ -1005,12 +1021,11 @@ DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\
                 stamp,
             });
         let names: Vec<&str> = ics.split(['\r', '\n']).map(line_name).collect();
-        for injected in ["ATTACH", "RDATE"] {
-            assert!(
-                !names.contains(&injected),
-                "{injected} became a property:\n{ics}"
-            );
-        }
+        assert!(!names.contains(&"ATTACH"), "an injected property:\n{ics}");
+        // The caller's RRULE carried no RDATE of its own; the server line split
+        // at its stray CR into the two properties it held.
+        assert_eq!(names.iter().filter(|n| **n == "RDATE").count(), 1, "{ics}");
+        assert_eq!(names.iter().filter(|n| **n == "EXDATE").count(), 1, "{ics}");
         // Two documents, each one VCALENDAR around one VEVENT.
         for delimiter in ["BEGIN", "END"] {
             assert_eq!(
