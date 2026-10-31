@@ -1,0 +1,1 @@
+- **The HTTP server no longer keeps every account it has seen.** Each distinct set of credentials, a rejected password included, stayed cached for the life of the process with its own connection pool. Accounts now share one HTTP client, and the cache drops accounts idle for an hour and the least recently used past 1,024.
