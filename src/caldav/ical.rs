@@ -559,12 +559,7 @@ pub fn recur_extra_lines(recur_source: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
         .lines()
         .map(str::trim)
-        .filter(|line| {
-            matches!(
-                line_name(line).to_ascii_uppercase().as_str(),
-                "EXDATE" | "RDATE" | "EXRULE"
-            )
-        })
+        .filter(|line| is_recurrence_extra(line))
         .map(str::to_string)
         .collect()
 }
@@ -659,7 +654,8 @@ pub struct VEventSpec<'a> {
     pub status: Option<&'a str>,
     pub recurrence: Option<&'a str>,
     /// The recurrence properties other than `RRULE` — `EXDATE`, `RDATE`,
-    /// `EXRULE` — as complete content lines, written back verbatim.
+    /// `EXRULE` — as complete content lines, written back as the server holds
+    /// them, one property to a line.
     ///
     /// These carry structured values this tool doesn't model, and rebuilding a
     /// series without them silently resurrects every cancelled occurrence. Get
@@ -682,7 +678,7 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
         "PRODID:-//radiosilence//caldav//EN".to_string(),
         "CALSCALE:GREGORIAN".to_string(),
         "BEGIN:VEVENT".to_string(),
-        format!("UID:{}", spec.uid),
+        format!("UID:{}", one_line(spec.uid)),
         format!("DTSTAMP:{}", util::format_ical_utc(spec.stamp)),
         format!("SEQUENCE:{}", spec.sequence),
         spec.start.render("DTSTART"),
@@ -697,18 +693,24 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
         lines.push(format!("LOCATION:{}", escape_text(v)));
     }
     if let Some(v) = spec.url.filter(|s| !s.is_empty()) {
-        lines.push(format!("URL:{v}"));
+        lines.push(format!("URL:{}", one_line(v)));
     }
     if let Some(v) = spec.status.filter(|s| !s.is_empty()) {
-        lines.push(format!("STATUS:{}", v.to_ascii_uppercase()));
+        lines.push(format!("STATUS:{}", one_line(&v.to_ascii_uppercase())));
     }
-    if let Some(v) = spec.recurrence.filter(|s| !s.is_empty()) {
+    if let Some(v) = spec.recurrence.and_then(rule_value) {
         // RRULE is structured, not TEXT — it must not be escaped.
-        lines.push(format!("RRULE:{}", v.trim_start_matches("RRULE:")));
+        lines.push(format!("RRULE:{}", one_line(v)));
     }
-    // Already complete content lines, straight off the wire — not escaped, and
-    // only meaningful next to the RRULE they qualify.
-    lines.extend(spec.recur_extra.iter().cloned());
+    // Complete content lines from the server — not escaped, and only
+    // meaningful next to the RRULE they qualify.
+    lines.extend(
+        spec.recur_extra
+            .iter()
+            .flat_map(|line| line.split(['\r', '\n']))
+            .filter(|line| is_recurrence_extra(line))
+            .map(str::to_string),
+    );
     if !spec.categories.is_empty() {
         let joined: Vec<String> = spec.categories.iter().map(|c| escape_text(c)).collect();
         lines.push(format!("CATEGORIES:{}", joined.join(",")));
@@ -735,16 +737,40 @@ fn render_participant(name: &str, p: &Attendee) -> String {
     let mut line = String::from(name);
     if let Some(cn) = p.name.as_deref().filter(|s| !s.is_empty()) {
         // CN is quoted so commas and colons in a display name stay in-parameter.
-        line.push_str(&format!(";CN=\"{}\"", cn.replace('"', "'")));
+        line.push_str(&format!(";CN=\"{}\"", one_line(&cn.replace('"', "'"))));
     }
     if let Some(role) = p.role.as_deref().filter(|s| !s.is_empty()) {
-        line.push_str(&format!(";ROLE={role}"));
+        line.push_str(&format!(";ROLE={}", one_line(role)));
     }
     if let Some(status) = p.status.as_deref().filter(|s| !s.is_empty()) {
-        line.push_str(&format!(";PARTSTAT={status}"));
+        line.push_str(&format!(";PARTSTAT={}", one_line(status)));
     }
-    line.push_str(&format!(":mailto:{}", p.email));
+    line.push_str(&format!(":mailto:{}", one_line(&p.email)));
     line
+}
+
+/// A caller's RRULE as it is written: trimmed, without a leading `RRULE:`, and
+/// `None` when nothing is left.
+pub fn rule_value(raw: &str) -> Option<&str> {
+    let rule = raw.trim();
+    Some(rule.strip_prefix("RRULE:").unwrap_or(rule).trim()).filter(|r| !r.is_empty())
+}
+
+/// Whether a content line is one of the recurrence properties carried across a
+/// rewrite. A stray line break inside one splits it into its parts, and each
+/// part is kept only if it is one of these.
+fn is_recurrence_extra(line: &str) -> bool {
+    matches!(
+        line_name(line).trim().to_ascii_uppercase().as_str(),
+        "EXDATE" | "RDATE" | "EXRULE"
+    )
+}
+
+/// A value outside a TEXT property, with any line break removed. Callers'
+/// values are refused before this point; what reaches here with one came from a
+/// server, and a property must still end where it is meant to.
+fn one_line(value: &str) -> String {
+    value.replace(['\r', '\n'], "")
 }
 
 #[cfg(test)]
@@ -941,6 +967,73 @@ DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\
     #[test]
     fn short_lines_are_not_folded() {
         assert_eq!(fold_line("UID:x"), "UID:x");
+    }
+
+    /// A line break that reached the builder in a structured value must not end
+    /// its property and start another.
+    #[test]
+    fn structured_values_stay_on_their_line() {
+        let stamp = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+        let at = TimeSpec {
+            instant: stamp,
+            all_day: false,
+            tzid: None,
+        };
+        let attendees = vec![Attendee {
+            email: "a@x.test\r\nBEGIN:VTODO".into(),
+            name: Some("Eve\nEND:VEVENT".into()),
+            role: None,
+            status: None,
+        }];
+        let ics = build_vcalendar(&VEventSpec {
+            uid: "u",
+            summary: "s",
+            start: TimeSpec { ..at },
+            end: TimeSpec { ..at },
+            description: None,
+            location: None,
+            url: Some("https://x.test/\r\nATTACH:evil"),
+            status: None,
+            recurrence: Some("FREQ=DAILY\nRDATE:20260101"),
+            recur_extra: &[],
+            attendees: &attendees,
+            organizer: None,
+            categories: &[],
+            sequence: 0,
+            stamp,
+        });
+        let ics = ics
+            + &build_vcalendar(&VEventSpec {
+                uid: "u",
+                summary: "s",
+                start: TimeSpec { ..at },
+                end: TimeSpec { ..at },
+                description: None,
+                location: None,
+                url: None,
+                status: None,
+                recurrence: None,
+                recur_extra: &["EXDATE:20260101T000000Z\rRDATE:20260102T000000Z".to_string()],
+                attendees: &[],
+                organizer: None,
+                categories: &[],
+                sequence: 0,
+                stamp,
+            });
+        let names: Vec<&str> = ics.split(['\r', '\n']).map(line_name).collect();
+        assert!(!names.contains(&"ATTACH"), "an injected property:\n{ics}");
+        // The caller's RRULE carried no RDATE of its own; the server line split
+        // at its stray CR into the two properties it held.
+        assert_eq!(names.iter().filter(|n| **n == "RDATE").count(), 1, "{ics}");
+        assert_eq!(names.iter().filter(|n| **n == "EXDATE").count(), 1, "{ics}");
+        // Two documents, each one VCALENDAR around one VEVENT.
+        for delimiter in ["BEGIN", "END"] {
+            assert_eq!(
+                names.iter().filter(|n| **n == delimiter).count(),
+                4,
+                "{ics}"
+            );
+        }
     }
 
     #[test]

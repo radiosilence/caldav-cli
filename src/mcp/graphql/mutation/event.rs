@@ -4,6 +4,7 @@
 use async_graphql::{Context, Object, Result};
 
 use super::{join_or_none, show_time};
+use crate::caldav::check_update;
 use crate::commands::parse_attendee_spec;
 use crate::models::{Attendee, Event, EventFields};
 use crate::util;
@@ -317,10 +318,17 @@ impl EventMutation {
         parts.extend(input.fingerprint_parts());
         let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
 
+        let attendees = input.parsed_attendees();
+        let fields = input.fields(attendees.as_deref(), input.categories.as_deref());
+
         if action == WriteAction::Preview {
             let Some(existing) = client.get_event(&id, input.calendar.as_deref()).await? else {
                 return Ok(GqlEventResult::failed(format!("Event not found: {id}")));
             };
+            // Refused now rather than after the user has approved it.
+            if let Err(e) = check_update(&existing, &fields) {
+                return Ok(GqlEventResult::failed(e.to_string()));
+            }
             let token = issue_nonce(nonce_store, client, &refs).await;
             return Ok(GqlEventResult::pending(
                 preview_update(&existing, &input),
@@ -333,8 +341,6 @@ impl EventMutation {
             return Ok(GqlEventResult::failed(msg));
         }
 
-        let attendees = input.parsed_attendees();
-        let fields = input.fields(attendees.as_deref(), input.categories.as_deref());
         match client
             .update_event(&id, input.calendar.as_deref(), &fields)
             .await
