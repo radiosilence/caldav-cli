@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.7.0
+
+### Security
+
+- **CalDAV responses are read only up to 32 MiB.** Bodies were read whole, so a server, which in HTTP mode the caller names, could make the process allocate without limit. A larger successful response is now an error, and error pages are read only as far as their message needs.
+- **Event fields can no longer write extra properties into the stored event.** A line break in a URL, status, recurrence rule or attendee field ended its property, and the rest of the value was written as properties or components of its own. Such values are now refused, and a recurrence rule that would not expand is refused with the fix, in the preview as well as the write.
+- **Preview tokens answer only for the account that asked.** The HTTP server shares one token store across accounts, so a token issued to one account could confirm the same change for another, and one account issuing many previews evicted everyone else's. Tokens are now bound to their account and capped per account.
+
+### Changed
+
+- **Listing calendars takes one round trip on iCloud.** Servers that name the default calendar only on the scheduling inbox cost a second request on every read. The GraphQL API now asks for the default only when a query needs it: `isDefault`, `calendar` with no id, or setting a new default.
+
+### Fixed
+
+- **Recurring events can no longer stall a read.** Expansion stepped through every recurrence since a series began, so one old `FREQ=SECONDLY` invite took minutes to read. Every series now has a step budget, and a sub-daily series starts near the window. A request whose expansions total more than 25,000 occurrences gets an error rather than an oversized response. An all-day series with a date `UNTIL` expands again instead of showing only its first event, and `conflicts` no longer misses clashes on a day with more than 100 events.
+- **Out-of-range dates and durations are errors, not crashes.** A huge `days`, relative offset or `durationMinutes`, or a server event with an enormous `DURATION`, overflowed chrono and panicked the request; the server-supplied case did so on every read of its calendar. Such values are now refused, or, from a server, read as if the event had no `DURATION`. Times outside years 1–9999, including an end derived from such a start, are refused, since iCalendar cannot write them and the server would reject them.
+- **The HTTP server no longer keeps every account it has seen.** Each distinct set of credentials, a rejected password included, stayed cached for the life of the process with its own connection pool. Accounts now share one HTTP client, and the cache drops accounts idle for an hour and the least recently used past 1,024.
+- **Failed requests are not retried when the answer would not change.** A rate-limited or timed-out expanded read was asked again at once without `<expand>`, doubling the wait, and any failed move fell back to copying and deleting, which could leave the event in two calendars. A read is now retried only when the server may have refused `<expand>`, and a move falls back only when the server does not support it.
+- **Floating times keep their meaning through edits and expansion.** A time with no zone was written back in UTC on every update, invite reply or cancelled occurrence, and a recurring one was expanded in the zone of the machine running the tool, so on a laptop outside UTC its occurrences were off by the local offset and cancelling one excluded nothing. Floating times are now read, expanded and written back in the calendar's own zone (`X-WR-TIMEZONE`, or UTC).
+- **Large filters no longer cost minutes of CPU.** Each filter lowercased its text and every field it searched again for every event, and a filter could nest without limit. Filters are now prepared once, each event's fields are lowercased at most once, one filter holds at most 1,000 nested filters and a request 10,000, and an over-limit filter is refused before anything is fetched.
+- **One GraphQL request can no longer multiply its cost without bound.** Nested pages had no ceiling, so conflicts under conflicts under a page of events meant a million resolutions, and concurrent loader batches each sent up to six requests at once with no shared limit. A query's declared cost is now capped at 250,000, far above any query worth asking, and a request has at most six CalDAV requests in flight.
+- **Discovery and UID lookups do less repeated work.** The calendar listing is parsed once rather than up to three times, the scheduling inbox is remembered once found, and a calendar whose server refuses UID filters is not asked again, so later lookups there scan directly instead of being refused first.
+- **Deleting a calendar is refused at the preview when it would be refused at the delete.** A read-only calendar or the account's default got a confirmation token, and the delete then failed after the user had approved it. The preview's event count also says "500 or more" when it reaches its cap, and an event written in a request is visible to the reads that follow it in the same request.
+
+### Internal
+
+- **Tests that talk to a mock server no longer share a connection pool across runtimes.** Their clients each have their own pool, so a connection opened in one test's runtime is never handed to another, which failed CI with "dispatch task is gone" when a port was reused. Tests that never complete a connection still use the shared pool.
+
 ## 0.6.5
 
 ### Security
