@@ -343,7 +343,7 @@ fn calendar_default_tz(lines: &[String]) -> Tz {
     // before any of them is parsed.
     lines
         .iter()
-        .filter(|l| line_name(l).eq_ignore_ascii_case("X-WR-TIMEZONE"))
+        .filter(|l| line_name(l).trim().eq_ignore_ascii_case("X-WR-TIMEZONE"))
         .filter_map(|l| parse_content_line(l))
         .next()
         .and_then(|l| l.value.trim().parse::<Tz>().ok())

@@ -205,6 +205,31 @@ async fn an_oversized_response_is_refused() {
     assert!(err.to_string().contains("32 MiB"), "{err}");
 }
 
+/// A limited view holds its requests to six in flight, so twelve slow ones
+/// take at least two rounds.
+#[tokio::test]
+async fn a_limited_client_holds_six_requests_in_flight() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    let delay = std::time::Duration::from_millis(300);
+    Mock::given(method("REPORT"))
+        .respond_with(ok(EMPTY_MULTISTATUS).set_delay(delay))
+        .mount(&server)
+        .await;
+    let client = client(&server).limited();
+    let calendars = client.list_calendars().await.unwrap();
+    let (start, end) = window();
+    let budget = Default::default();
+    let started = std::time::Instant::now();
+    let reads: Vec<_> = (0..12)
+        .map(|_| client.list_events(&calendars[0], start, end, false, &budget))
+        .collect();
+    for read in futures_util::future::join_all(reads).await {
+        read.unwrap();
+    }
+    assert!(started.elapsed() >= delay * 2, "{:?}", started.elapsed());
+}
+
 #[tokio::test]
 async fn rejected_credentials_surface_as_an_auth_error() {
     let server = MockServer::start().await;
@@ -681,6 +706,57 @@ END:VCALENDAR</c:calendar-data>
         .filter(|r| String::from_utf8_lossy(&r.body).contains("prop-filter"))
         .count();
     assert_eq!(filters, 1);
+}
+
+/// A refusal is remembered for the calendar that gave it, not the account: a
+/// server may refuse the filter on one collection and honour it on the rest.
+#[tokio::test]
+async fn a_refused_uid_filter_is_remembered_per_calendar() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    Mock::given(method("REPORT"))
+        .and(body_string_contains("calendar-multiget"))
+        .respond_with(ok(EMPTY_MULTISTATUS))
+        .mount(&server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .and(body_string_contains("prop-filter"))
+        .respond_with(ResponseTemplate::new(412))
+        .mount(&server)
+        .await;
+    Mock::given(method("REPORT"))
+        .respond_with(ok(EMPTY_MULTISTATUS))
+        .mount(&server)
+        .await;
+
+    let client = client(&server);
+    for _ in 0..2 {
+        client.get_event("absent", None).await.unwrap();
+    }
+    let filters = |calendar: &'static str| {
+        let server = &server;
+        async move {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == calendar)
+                .filter(|r| String::from_utf8_lossy(&r.body).contains("prop-filter"))
+                .count()
+        }
+    };
+    assert_eq!(
+        filters("/1234/calendars/home/").await,
+        1,
+        "refused once, then scanned"
+    );
+    assert_eq!(
+        filters("/1234/calendars/team/").await,
+        2,
+        "still asked where it works"
+    );
 }
 
 /// A lookup that broke used to surface as "event not found", so every write

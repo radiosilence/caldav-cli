@@ -9,13 +9,13 @@
 pub mod ical;
 pub mod recur;
 
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore, SemaphorePermit};
 use tracing::{debug, instrument};
 
 use crate::error::{Error, Result};
@@ -156,14 +156,19 @@ pub struct CalDavClient {
     username: String,
     password: String,
     /// Discovery is three round trips; the principal and home don't change, so
-    /// cache them for the client's life.
-    home: OnceCell<String>,
-    /// The scheduling inbox, as the calendar listing names it. Cached for the
-    /// same reason as `home`: it does not move.
-    inbox: OnceCell<String>,
-    /// Set once the server has refused a UID `prop-filter`, so later lookups
-    /// go straight to the scan rather than asking again for every calendar.
-    uid_filter_refused: AtomicBool,
+    /// cache them for the client's life. Shared with every [`Self::limited`]
+    /// view of the client.
+    home: Arc<OnceCell<String>>,
+    /// The scheduling inbox, as the calendar listing names it. Cached and
+    /// shared like `home`: it does not move.
+    inbox: Arc<OnceCell<String>>,
+    /// Calendars, by href, whose server has refused a UID `prop-filter`, so
+    /// later lookups there go straight to the scan. Per calendar, because a
+    /// server may refuse it on one collection (a virtual birthday calendar, a
+    /// subscription) and honour it on the rest.
+    uid_filter_refused: Arc<Mutex<HashSet<String>>>,
+    /// The permits this view's requests draw on, when it has a limit.
+    in_flight: Option<Arc<Semaphore>>,
 }
 
 impl CalDavClient {
@@ -173,9 +178,42 @@ impl CalDavClient {
             base: base.trim_end_matches('/').to_string(),
             username,
             password,
-            home: OnceCell::new(),
-            inbox: OnceCell::new(),
-            uid_filter_refused: AtomicBool::new(false),
+            home: Arc::new(OnceCell::new()),
+            inbox: Arc::new(OnceCell::new()),
+            uid_filter_refused: Arc::default(),
+            in_flight: None,
+        }
+    }
+
+    /// The same account, with at most [`MAX_CONCURRENT_REQUESTS`] of its
+    /// requests in flight at once. One view serves one GraphQL request, so every
+    /// path that request takes to the server, through a loader or not, shares
+    /// the one bound; discovery stays shared with the client it came from.
+    pub fn limited(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            base: self.base.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            home: self.home.clone(),
+            inbox: self.inbox.clone(),
+            uid_filter_refused: self.uid_filter_refused.clone(),
+            in_flight: Some(Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS))),
+        }
+    }
+
+    /// A permit for one request, held until its response has been read. Taken
+    /// only around a single request, never across another await, so no caller
+    /// holds one while waiting for a second.
+    async fn permit(&self) -> Option<SemaphorePermit<'_>> {
+        match &self.in_flight {
+            Some(limit) => Some(
+                limit
+                    .acquire()
+                    .await
+                    .expect("the semaphore is never closed"),
+            ),
+            None => None,
         }
     }
 
@@ -203,6 +241,7 @@ impl CalDavClient {
             req = req.header("Content-Type", content_type).body(body);
         }
 
+        let _permit = self.permit().await;
         let response = req.send().await?;
         let status = response.status();
         debug!(%method, %url, %status, "CalDAV response");
@@ -345,12 +384,13 @@ impl CalDavClient {
                 Some(BODY.into()),
             )
             .await?;
-        let Ok(doc) = roxmltree::Document::parse(&xml) else {
-            return Ok(Vec::new());
-        };
+        let doc = roxmltree::Document::parse(&xml)
+            .map_err(|e| Error::Server(format!("the calendar listing could not be read: {e}")))?;
         let mut calendars = parse_calendars(&doc, home);
         calendars.sort_by_key(|c| c.name.to_lowercase());
-        if let Some(inbox) = parse_inbox_href(&doc, home) {
+        if self.inbox.get().is_none()
+            && let Some(inbox) = parse_inbox_href(&doc, home)
+        {
             let _ = self.inbox.set(inbox);
         }
 
@@ -677,14 +717,16 @@ impl CalDavClient {
                 Some(BODY.into()),
             )
             .await?;
-        let doc = roxmltree::Document::parse(&xml).map_err(|e| Error::Server(e.to_string()))?;
-        let inbox = parse_inbox_href(&doc, home).ok_or_else(|| {
-            Error::Server(
-                "this account has no scheduling inbox, so it has no default-calendar \
+        let inbox = roxmltree::Document::parse(&xml)
+            .ok()
+            .and_then(|doc| parse_inbox_href(&doc, home))
+            .ok_or_else(|| {
+                Error::Server(
+                    "this account has no scheduling inbox, so it has no default-calendar \
                  property to set"
-                    .into(),
-            )
-        })?;
+                        .into(),
+                )
+            })?;
         let _ = self.inbox.set(inbox.clone());
         Ok(inbox)
     }
@@ -901,6 +943,15 @@ impl CalDavClient {
             Err(e) => debug!(error = %e, "href guess failed, falling back to a UID query"),
         }
 
+        let refused = self
+            .uid_filter_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&calendar.href);
+        if refused {
+            return self.scan_for_uid(uid, calendar).await;
+        }
+
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
@@ -918,9 +969,6 @@ impl CalDavClient {
             xml_escape(uid)
         );
 
-        if self.uid_filter_refused.load(Ordering::Relaxed) {
-            return self.scan_for_uid(uid, calendar).await;
-        }
         match self
             .dav(
                 "REPORT",
@@ -935,7 +983,10 @@ impl CalDavClient {
             // UID actually equals what was asked for.
             Ok(xml) => Ok(pick_uid(parse_event_responses(&xml, calendar), uid)),
             Err(Error::Dav { status, .. }) if refuses_uid_filter(status) => {
-                self.uid_filter_refused.store(true, Ordering::Relaxed);
+                self.uid_filter_refused
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(calendar.href.clone());
                 tracing::warn!(
                     calendar = %calendar.name,
                     status,
@@ -1302,6 +1353,7 @@ impl CalDavClient {
         let source_url = existing.resource_url.clone();
         debug!(%source_url, %dest_url, "moving event");
 
+        let permit = self.permit().await;
         let moved = self
             .client
             .request(reqwest::Method::from_bytes(b"MOVE").unwrap(), &source_url)
@@ -1323,6 +1375,8 @@ impl CalDavClient {
             Ok(response) if refuses_move(response.status().as_u16()) => {
                 let status = response.status().as_u16();
                 debug!(status, "MOVE refused, falling back to copy and delete");
+                // The copy takes permits of its own.
+                drop(permit);
                 self.copy_then_delete(&source_url, &dest_url, existing.etag.as_deref())
                     .await?;
             }
@@ -1396,6 +1450,7 @@ impl CalDavClient {
 
     /// GET a resource's body unchanged.
     async fn get_raw(&self, url: &str) -> Result<String> {
+        let _permit = self.permit().await;
         let response = self
             .client
             .get(url)
@@ -1613,6 +1668,7 @@ impl CalDavClient {
         method: &str,
         url: &str,
     ) -> Result<()> {
+        let _permit = self.permit().await;
         let response = request.send().await?;
         let status = response.status();
         if status.is_success() {
