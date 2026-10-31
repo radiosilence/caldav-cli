@@ -112,9 +112,10 @@ impl ExpansionBudget {
             Some(c) => (c.uid, c.summary),
             None => (event.id.clone(), event.summary.clone()),
         };
+        // Both come from whoever wrote the event, and land in every errored field.
         Error::ExpansionTooCostly {
-            uid,
-            summary: summary.unwrap_or_else(|| "(no title)".into()),
+            uid: super::truncate(&uid, 80),
+            summary: super::truncate(summary.as_deref().unwrap_or("(no title)"), 80),
         }
     }
 }
