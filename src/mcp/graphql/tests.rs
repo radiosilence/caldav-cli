@@ -611,6 +611,16 @@ async fn a_stale_cursor_says_how_to_recover() {
     assert!(err.contains("Restart pagination"), "{err}");
 }
 
+/// Once a panic that left the caller waiting on a request that never answered.
+#[tokio::test]
+async fn a_window_past_the_calendar_is_an_error() {
+    let h = Harness::start().await;
+    let err = h
+        .run_expecting_error(r#"{ events(days: 100000000) { nodes { id } } }"#)
+        .await;
+    assert!(err.contains("1 to 9999"), "{err}");
+}
+
 #[tokio::test]
 async fn first_and_last_together_are_rejected() {
     let h = Harness::start().await;

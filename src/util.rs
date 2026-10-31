@@ -497,6 +497,11 @@ mod tests {
     }
 
     #[test]
+    fn day_range_refuses_a_span_past_the_calendar() {
+        assert!(day_range(i64::MAX, Tz::UTC, now()).is_err());
+    }
+
+    #[test]
     fn day_range_treats_zero_as_one_day() {
         let (start, end) = day_range(0, Tz::UTC, now()).unwrap();
         assert_eq!(format_iso_date(start), "2026-07-24");
