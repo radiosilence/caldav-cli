@@ -1,0 +1,1 @@
+- **CalDAV responses are read only up to 32 MiB.** Bodies were read whole, so a server, which in HTTP mode the caller names, could make the process allocate without limit. A larger successful response is now an error, and error pages are read only as far as their message needs.
