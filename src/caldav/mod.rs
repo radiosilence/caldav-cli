@@ -650,14 +650,16 @@ impl CalDavClient {
     /// With `expand`, the server returns each occurrence of a recurring series
     /// as its own VEVENT (RFC 4791 §9.6.5) — what you want for an agenda. Without
     /// it you get the master event carrying its RRULE, which is what you want
-    /// before editing a series.
-    #[instrument(skip(self))]
+    /// before editing a series. Expansion draws on `budget`, which the caller
+    /// shares across everything it reads in one go.
+    #[instrument(skip(self, budget))]
     pub async fn list_events(
         &self,
         calendar: &Calendar,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         expand: bool,
+        budget: &recur::ExpansionBudget,
     ) -> Result<Vec<Event>> {
         let body = self.query_body(start, end, expand);
 
@@ -694,7 +696,7 @@ impl CalDavClient {
         if expand {
             // Idempotent: anything the server already expanded arrives without
             // an RRULE and passes straight through.
-            events = recur::expand_all(events, start, end);
+            events = recur::expand_all(events, start, end, budget)?;
         }
         // Expansion can hand back instances just outside the window; the range
         // the caller asked for is the range they get.
@@ -793,26 +795,25 @@ impl CalDavClient {
         limit: usize,
     ) -> Result<Vec<Event>> {
         let targets = self.read_targets(calendar).await?;
+        let budget = recur::ExpansionBudget::default();
         let calls: Vec<_> = targets
             .iter()
-            .map(|cal| self.list_events(cal, start, end, expand))
+            .map(|cal| self.list_events(cal, start, end, expand, &budget))
             .collect();
         let results = fan_out(calls).await;
 
-        let mut all: Vec<Event> = results
-            .into_iter()
-            .zip(&targets)
-            // One unreadable calendar (shared, or a server hiccup) should not
-            // sink the whole agenda.
-            .filter_map(|(events, cal)| {
-                events
-                    .inspect_err(
-                        |e| tracing::warn!(calendar = %cal.name, error = %e, "skipping calendar"),
-                    )
-                    .ok()
-            })
-            .flatten()
-            .collect();
+        let mut all: Vec<Event> = Vec::new();
+        for (events, cal) in results.into_iter().zip(&targets) {
+            match events {
+                Ok(events) => all.extend(events),
+                Err(e @ (Error::TooManyOccurrences(_) | Error::ExpansionTooCostly { .. })) => {
+                    return Err(e);
+                }
+                // One unreadable calendar (shared, or a server hiccup) should
+                // not sink the whole agenda.
+                Err(e) => tracing::warn!(calendar = %cal.name, error = %e, "skipping calendar"),
+            }
+        }
 
         all.sort_by_key(|e| e.start.sort_key());
         all.truncate(limit.min(MAX_EVENTS));
@@ -1723,7 +1724,8 @@ pub fn resolve_occurrence(
         vec![rule_only],
         parsed.instant - Duration::days(1),
         parsed.instant + Duration::days(2),
-    )
+        &recur::ExpansionBudget::default(),
+    )?
     .into_iter()
     .filter_map(|e| e.start.instant)
     .collect();
