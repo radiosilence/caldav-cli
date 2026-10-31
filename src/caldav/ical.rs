@@ -612,11 +612,27 @@ pub fn excluded_instants(recur_source: Option<&str>, default_tz: Tz) -> Vec<Date
 }
 
 /// How a DTSTART/DTEND should be written back out.
+#[derive(Clone, Copy)]
 pub struct TimeSpec<'a> {
     pub instant: DateTime<Utc>,
     pub all_day: bool,
     /// When set, the value is written as local time with a `TZID` parameter.
     pub tzid: Option<&'a str>,
+    /// A stored floating time this one is written relative to, as its wall
+    /// time and the instant it was read as. With no `TZID`, the value is then
+    /// written floating rather than in UTC, so an edit does not pin a floating
+    /// event to UTC wall time.
+    pub floating: Option<(NaiveDateTime, DateTime<Utc>)>,
+}
+
+/// The wall time and instant of a stored floating date-time: one with neither
+/// a `TZID` nor a trailing `Z`. `None` for every other kind of time.
+pub fn floating_anchor(time: &EventTime) -> Option<(NaiveDateTime, DateTime<Utc>)> {
+    if time.all_day || time.tzid.is_some() || time.raw.ends_with('Z') {
+        return None;
+    }
+    let naive = NaiveDateTime::parse_from_str(&time.raw, "%Y%m%dT%H%M%S").ok()?;
+    Some((naive, time.instant?))
 }
 
 impl TimeSpec<'_> {
@@ -637,7 +653,16 @@ impl TimeSpec<'_> {
                 let local = self.instant.with_timezone(&tz);
                 format!("{name};TZID={id}:{}", local.format("%Y%m%dT%H%M%S"))
             }
-            None => format!("{name}:{}", util::format_ical_utc(self.instant)),
+            // Floating time has no zone to convert through, so it moves by the
+            // same span as the instant: exact for the UTC reading it gets
+            // without X-WR-TIMEZONE, and a wall-clock shift otherwise.
+            None => match self
+                .floating
+                .and_then(|(wall, read_as)| wall.checked_add_signed(self.instant - read_as))
+            {
+                Some(wall) => format!("{name}:{}", wall.format("%Y%m%dT%H%M%S")),
+                None => format!("{name}:{}", util::format_ical_utc(self.instant)),
+            },
         }
     }
 }
@@ -978,6 +1003,7 @@ DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\
             instant: stamp,
             all_day: false,
             tzid: None,
+            floating: None,
         };
         let attendees = vec![Attendee {
             email: "a@x.test\r\nBEGIN:VTODO".into(),
@@ -1037,6 +1063,42 @@ DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\
     }
 
     #[test]
+    fn a_floating_time_is_written_floating_and_moves_by_its_span() {
+        let read_as = Utc.with_ymd_and_hms(2026, 7, 24, 9, 0, 0).unwrap();
+        let wall = NaiveDate::from_ymd_opt(2026, 7, 24)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap();
+        let spec = |instant| TimeSpec {
+            instant,
+            all_day: false,
+            tzid: None,
+            floating: Some((wall, read_as)),
+        };
+        assert_eq!(spec(read_as).render("DTSTART"), "DTSTART:20260724T090000");
+        assert_eq!(
+            spec(read_as + Duration::days(7)).render("EXDATE"),
+            "EXDATE:20260731T090000"
+        );
+    }
+
+    #[test]
+    fn only_a_zoneless_unmarked_time_is_floating() {
+        let time = |raw: &str, tzid: Option<&str>| {
+            let line = parse_content_line(&format!(
+                "DTSTART{}:{raw}",
+                tzid.map(|t| format!(";TZID={t}")).unwrap_or_default()
+            ))
+            .unwrap();
+            parse_time(&line, Tz::UTC)
+        };
+        assert!(floating_anchor(&time("20260724T090000", None)).is_some());
+        assert!(floating_anchor(&time("20260724T090000Z", None)).is_none());
+        assert!(floating_anchor(&time("20260724T090000", Some("Europe/London"))).is_none());
+        assert!(floating_anchor(&time("20260724", None)).is_none());
+    }
+
+    #[test]
     fn builds_and_reparses_an_event() {
         let stamp = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
         let attendees = vec![Attendee {
@@ -1052,11 +1114,13 @@ DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\
                 instant: Utc.with_ymd_and_hms(2026, 7, 24, 8, 0, 0).unwrap(),
                 all_day: false,
                 tzid: Some("Europe/London"),
+                floating: None,
             },
             end: TimeSpec {
                 instant: Utc.with_ymd_and_hms(2026, 7, 24, 9, 0, 0).unwrap(),
                 all_day: false,
                 tzid: Some("Europe/London"),
+                floating: None,
             },
             description: Some("Line one\nline two"),
             location: Some("Room 4"),
@@ -1102,11 +1166,13 @@ DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\
                 instant: Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).unwrap(),
                 all_day: true,
                 tzid: None,
+                floating: None,
             },
             end: TimeSpec {
                 instant: Utc.with_ymd_and_hms(2026, 7, 25, 0, 0, 0).unwrap(),
                 all_day: true,
                 tzid: None,
+                floating: None,
             },
             description: None,
             location: None,
@@ -1204,11 +1270,13 @@ RDATE;TZID=Europe/London:20260801T140000\r\nEND:VEVENT\r\nEND:VCALENDAR";
                 instant: event.start.instant.unwrap(),
                 all_day: false,
                 tzid: Some("Europe/London"),
+                floating: None,
             },
             end: TimeSpec {
                 instant: event.end.instant.unwrap(),
                 all_day: false,
                 tzid: Some("Europe/London"),
+                floating: None,
             },
             description: None,
             location: None,

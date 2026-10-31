@@ -1208,6 +1208,68 @@ async fn mount_event(server: &MockServer, ics: &str) {
         .await;
 }
 
+const FLOATING_ICS: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:evt-1\r\nSUMMARY:Standup\r\n\
+DTSTART:20260724T090000\r\nDTEND:20260724T093000\r\nORGANIZER:mailto:alice@example.com\r\n\
+ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+/// A floating time has no zone. Writing it back in UTC would pin the event to
+/// UTC wall time in every client.
+#[tokio::test]
+async fn edits_keep_a_floating_time_floating() {
+    let server = MockServer::start().await;
+    mount_event(&server, FLOATING_ICS).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let retitle = EventFields {
+        summary: Some("Standup (moved room)"),
+        ..Default::default()
+    };
+    client(&server)
+        .update_event("evt-1", None, &retitle)
+        .await
+        .unwrap();
+    let body = put_body(&server).await;
+    assert!(body.contains("DTSTART:20260724T090000\r\n"), "{body}");
+    assert!(body.contains("DTEND:20260724T093000\r\n"), "{body}");
+
+    server.reset().await;
+    mount_event(&server, FLOATING_ICS).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    client(&server)
+        .respond_to_invite("evt-1", None, "ACCEPTED", None)
+        .await
+        .unwrap();
+    let body = put_body(&server).await;
+    assert!(body.contains("DTSTART:20260724T090000\r\n"), "{body}");
+}
+
+/// A caller who gives a new start has said what the time is.
+#[tokio::test]
+async fn a_new_start_replaces_a_floating_one() {
+    let server = MockServer::start().await;
+    mount_event(&server, FLOATING_ICS).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let moved = EventFields {
+        start: Some("2026-07-24T10:00:00Z"),
+        ..Default::default()
+    };
+    client(&server)
+        .update_event("evt-1", None, &moved)
+        .await
+        .unwrap();
+    assert!(put_body(&server).await.contains("DTSTART:20260724T100000Z"));
+}
+
 #[tokio::test]
 async fn replying_sets_only_your_own_partstat() {
     let server = MockServer::start().await;

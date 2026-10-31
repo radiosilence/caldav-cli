@@ -1168,11 +1168,18 @@ impl CalDavClient {
             None => ical::recur_extra_lines(existing.recur_source.as_deref()),
         };
 
+        let floating = kept_floating(&existing, fields);
         let ics = ical::build_vcalendar(&VEventSpec {
             uid,
             summary,
-            start: start.spec(tzid),
-            end: end.spec(tzid),
+            start: TimeSpec {
+                floating,
+                ..start.spec(tzid)
+            },
+            end: TimeSpec {
+                floating,
+                ..end.spec(tzid)
+            },
             description: fields.description.or(existing.description.as_deref()),
             location: fields.location.or(existing.location.as_deref()),
             url: fields.url.or(existing.url.as_deref()),
@@ -1400,10 +1407,12 @@ impl CalDavClient {
             )));
         }
 
+        // In the form DTSTART has, which servers require of an EXDATE.
         let exdate = TimeSpec {
             instant: at,
             all_day: existing.all_day,
             tzid: tzid.filter(|_| !existing.all_day),
+            floating: ical::floating_anchor(&existing.start),
         }
         .render("EXDATE");
 
@@ -1480,6 +1489,7 @@ impl CalDavClient {
             instant,
             all_day: existing.all_day,
             tzid: tzid.filter(|_| !existing.all_day),
+            floating: ical::floating_anchor(&existing.start),
         };
 
         let ics = ical::build_vcalendar(&VEventSpec {
@@ -1611,6 +1621,19 @@ fn check_structured(fields: &EventFields<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The stored floating start an update keeps writing relative to, when the
+/// caller changes neither the start, the all-day flag nor the zone. A caller
+/// who sets any of those has said what the time is, and gets that.
+fn kept_floating(
+    existing: &Event,
+    fields: &EventFields<'_>,
+) -> Option<(chrono::NaiveDateTime, DateTime<Utc>)> {
+    let unchanged = fields.start.is_none() && fields.all_day.is_none() && fields.tzid.is_none();
+    unchanged
+        .then(|| ical::floating_anchor(&existing.start))
+        .flatten()
+}
+
 /// The start and end an update would write: the caller's where given, else the
 /// stored ones, with an unspecified end following the stored duration so moving
 /// an event doesn't silently resize it.
@@ -1656,7 +1679,10 @@ pub fn check_update(
     check_structured(fields)?;
     let span = update_span(existing, fields)?;
     let tzid = fields.tzid.or(existing.start.tzid.as_deref());
-    let new_start = span.0.spec(tzid);
+    let new_start = TimeSpec {
+        floating: kept_floating(existing, fields),
+        ..span.0.spec(tzid)
+    };
     if fields.recurrence.is_some() {
         check_rule(fields.recurrence, &new_start)?;
         return Ok(span);
@@ -1798,6 +1824,7 @@ impl ResolvedTime {
             instant: self.instant,
             all_day: self.all_day,
             tzid: tzid.filter(|_| !self.all_day),
+            floating: None,
         }
     }
 }
@@ -2708,9 +2735,8 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
         };
         assert!(check_update(&floating, &zoned).is_err());
 
-        // Any rewrite renders a floating start as UTC, so even a retitle would
-        // break this series.
-        assert!(check_update(&floating, &retitle).is_err());
+        // A retitle keeps the floating start, so the series keeps expanding.
+        assert!(check_update(&floating, &retitle).is_ok());
 
         let odd = stored("DTSTART:20260706T090000Z", "FREQ=WEEKLY;X-ODD=1");
         let moved = EventFields {
@@ -2726,6 +2752,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             instant: Utc.with_ymd_and_hms(2026, 7, 6, 8, 0, 0).unwrap(),
             all_day: false,
             tzid: Some("Europe/London"),
+            floating: None,
         };
         assert!(check_rule(Some("FREQ=WEEKLY;BYDAY=MO"), &timed).is_ok());
         assert!(check_rule(Some("FREQ=WEEKLY;UNTIL=20261231T235959Z"), &timed).is_ok());
