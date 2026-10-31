@@ -1304,6 +1304,38 @@ async fn edits_keep_a_floating_time_floating() {
     assert!(body.contains("DTSTART:20260724T090000\r\n"), "{body}");
 }
 
+/// On update too, a zoned end keeps its own zone beside a floating start.
+#[tokio::test]
+async fn an_update_keeps_a_zoned_end_beside_a_floating_start() {
+    let server = MockServer::start().await;
+    mount_event(
+        &server,
+        &FLOATING_ICS.replace(
+            "DTEND:20260724T093000",
+            "DTEND;TZID=America/New_York:20260724T053000",
+        ),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let retitle = EventFields {
+        summary: Some("Standup (moved room)"),
+        ..Default::default()
+    };
+    client(&server)
+        .update_event("evt-1", None, &retitle)
+        .await
+        .unwrap();
+    let body = put_body(&server).await;
+    assert!(body.contains("DTSTART:20260724T090000\r\n"), "{body}");
+    assert!(
+        body.contains("DTEND;TZID=America/New_York:20260724T053000\r\n"),
+        "{body}"
+    );
+}
+
 /// A floating start says nothing about the end, which keeps its own form.
 #[tokio::test]
 async fn a_zoned_end_beside_a_floating_start_stays_zoned() {

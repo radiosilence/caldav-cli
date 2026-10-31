@@ -1175,9 +1175,14 @@ impl CalDavClient {
                 floating: kept_floating(&existing.start, fields),
                 ..start.spec(tzid)
             },
+            // DTEND keeps its own form unless the caller names a zone.
             end: TimeSpec {
                 floating: kept_floating(&existing.end, fields),
-                ..end.spec(tzid)
+                ..end.spec(match fields.tzid {
+                    Some(zone) => Some(zone),
+                    None if existing.end.floating_zone.is_some() => None,
+                    None => existing.end.tzid.as_deref().or(tzid),
+                })
             },
             description: fields.description.or(existing.description.as_deref()),
             location: fields.location.or(existing.location.as_deref()),
