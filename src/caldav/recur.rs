@@ -277,7 +277,9 @@ fn occurrences(
             }
         }
     }
-    budget.spend_work(work);
+    // The yield that crossed the cap can lie a long gap past it; charge only
+    // what the series was allowed, or one sparse rule drains the whole scope.
+    budget.spend_work(work.min(work_cap));
     Ok(dates)
 }
 
@@ -921,6 +923,25 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             expand_all(parse(&ics), from, to, &spent)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// A rule yielding once every four years crosses its cap by a whole gap,
+    /// which must not cost the series after it anything beyond the cap.
+    #[test]
+    fn a_sparse_series_is_charged_no_more_than_its_cap() {
+        let sparse = series(
+            "DTSTART:20000229T000000Z",
+            "RRULE:FREQ=SECONDLY;BYMONTH=2;BYMONTHDAY=29;BYHOUR=0;BYMINUTE=0;BYSECOND=0;COUNT=100",
+        );
+        let hourly = series("DTSTART:20260705T000000Z", "RRULE:FREQ=HOURLY;COUNT=100")
+            .replace("UID:s", "UID:h");
+        let (from, to) = (at(2026, 7, 6, 0), at(2026, 7, 6, 3));
+        let budget = ExpansionBudget::default();
+        expand_all(parse(&sparse), from, to, &budget).unwrap();
+        assert_eq!(
+            expand_all(parse(&hourly), from, to, &budget).unwrap().len(),
+            3
         );
     }
 
