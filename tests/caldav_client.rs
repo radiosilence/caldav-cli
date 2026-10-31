@@ -114,7 +114,7 @@ async fn mount_discovery(server: &MockServer) {
 }
 
 fn client(server: &MockServer) -> CalDavClient {
-    CalDavClient::new(server.uri(), "me@example.com".into(), "app-password".into())
+    CalDavClient::with_own_pool(server.uri(), "me@example.com".into(), "app-password".into())
 }
 
 fn window() -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
@@ -908,7 +908,8 @@ async fn follows_the_calendar_home_onto_a_different_host() {
         .await;
 
     // The client is only ever told about the entry host.
-    let client = CalDavClient::new(entry.uri(), "me@example.com".into(), "app-password".into());
+    let client =
+        CalDavClient::with_own_pool(entry.uri(), "me@example.com".into(), "app-password".into());
     let (start, end) = window();
 
     let events = client
