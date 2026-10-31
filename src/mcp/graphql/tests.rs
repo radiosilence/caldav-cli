@@ -790,7 +790,7 @@ async fn the_default_calendar_is_read_only_when_asked_for() {
 
     // "The default calendar" goes through the same resolution, blank id or
     // none. Team is read-only, so new events fall through to Home, as
-    // createEvent would; the inbox is not read again.
+    // createEvent would.
     let data = h
         .run(r#"{ a: calendar { name } b: calendar(id: " ") { name } }"#)
         .await;
