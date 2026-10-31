@@ -1588,7 +1588,8 @@ async fn read_body(response: reqwest::Response, url: &str) -> Result<String> {
     {
         return Err(too_large());
     }
-    match read_capped(response, MAX_BODY).await? {
+    let expected = response.content_length().unwrap_or(0) as usize;
+    match read_capped(response, MAX_BODY, expected).await? {
         (body, false) => Ok(body),
         (_, true) => Err(too_large()),
     }
@@ -1597,19 +1598,22 @@ async fn read_body(response: reqwest::Response, url: &str) -> Result<String> {
 /// The start of an error response, for the message. Bodies can be long HTML
 /// error pages, and a failure to read one is no reason to hide the status.
 async fn error_body(response: reqwest::Response) -> String {
-    match read_capped(response, MAX_ERROR_BODY).await {
+    match read_capped(response, MAX_ERROR_BODY, 0).await {
         Ok((body, _)) => truncate(&body, 400),
         Err(_) => String::new(),
     }
 }
 
 /// Up to `cap` bytes of the body as text, and whether more remained. Decoded the
-/// way `Response::text` decodes without a charset feature: lossy UTF-8.
+/// way `Response::text` decodes without a charset feature, lossy UTF-8, but
+/// without copying a body that is already valid. `expected` sizes the buffer,
+/// so it does not double past the cap on its way there.
 async fn read_capped(
     mut response: reqwest::Response,
     cap: usize,
+    expected: usize,
 ) -> reqwest::Result<(String, bool)> {
-    let mut body = Vec::new();
+    let mut body = Vec::with_capacity(expected.min(cap));
     let mut truncated = false;
     while let Some(chunk) = response.chunk().await? {
         let room = cap - body.len();
@@ -1620,7 +1624,9 @@ async fn read_capped(
         }
         body.extend_from_slice(&chunk);
     }
-    Ok((String::from_utf8_lossy(&body).into_owned(), truncated))
+    let text = String::from_utf8(body)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    Ok((text, truncated))
 }
 
 /// A user-supplied time resolved to an instant plus its all-day-ness.
@@ -2527,13 +2533,46 @@ END:VCALENDAR
         assert_eq!(xml_escape("a<b>&c"), "a&lt;b&gt;&amp;c");
     }
 
+    /// Serve `chunks` once as a chunked response with no `Content-Length`, the
+    /// shape that only the chunk loop can bound.
+    async fn chunked(chunks: &'static [&'static str]) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 1024]).await;
+            let mut out = String::from("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            for chunk in chunks {
+                out.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+            }
+            out.push_str("0\r\n\r\n");
+            socket.write_all(out.as_bytes()).await.unwrap();
+        });
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn reading_stops_at_the_cap() {
-        let response = |len: usize| reqwest::Response::from(http::Response::new(vec![b'x'; len]));
-        let (body, truncated) = read_capped(response(10), 4).await.unwrap();
-        assert_eq!((body.as_str(), truncated), ("xxxx", true));
-        let (body, truncated) = read_capped(response(4), 4).await.unwrap();
-        assert_eq!((body.as_str(), truncated), ("xxxx", false));
+    async fn reading_stops_at_the_cap_across_chunks() {
+        let response = chunked(&["abc", "def", "ghi"]).await;
+        assert_eq!(response.content_length(), None);
+        let (body, truncated) = read_capped(response, 7, 0).await.unwrap();
+        assert_eq!((body.as_str(), truncated), ("abcdefg", true));
+
+        let response = chunked(&["abc", "def"]).await;
+        let (body, truncated) = read_capped(response, 6, 0).await.unwrap();
+        assert_eq!((body.as_str(), truncated), ("abcdef", false));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_still_reads_lossily() {
+        let response = reqwest::Response::from(http::Response::new(vec![b'a', 0xff, b'b']));
+        let (body, _) = read_capped(response, 10, 0).await.unwrap();
+        assert_eq!(body, "a\u{fffd}b");
     }
 
     #[test]
