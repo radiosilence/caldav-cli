@@ -1252,6 +1252,101 @@ async fn an_unknown_calendar_fails_the_preview_instead_of_issuing_a_token() {
     assert_eq!(data["deleteCalendar"]["success"], false);
     assert!(data["deleteCalendar"]["confirmationToken"].is_null());
 }
+
+/// A read nested under a write's result sees the account after the write,
+/// not a window cached earlier in the same request.
+#[tokio::test]
+async fn a_read_after_a_write_sees_the_write() {
+    let h = Harness::start().await;
+    let one = || {
+        (
+            "/1234/calendars/home/a.ics",
+            ics("a", "A", "20260727T080000Z", "20260727T083000Z", ""),
+        )
+    };
+    let two = || {
+        (
+            "/1234/calendars/home/b.ics",
+            ics("b", "B", "20260727T150000Z", "20260727T153000Z", ""),
+        )
+    };
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .respond_with(ok(report_of(&[one()])))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("REPORT"))
+        .and(path("/1234/calendars/home/"))
+        .respond_with(ok(report_of(&[one(), two()])))
+        .with_priority(2)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&h.server)
+        .await;
+
+    let window = format!(
+        r#"calendar {{ events(start: "{DAY}", days: 1, expand: false) {{ totalCount }} }}"#
+    );
+    let data = h
+        .run(&format!(
+            r#"mutation {{
+                first: createEvent(summary: "A", start: "2026-07-27T08:00:00Z", calendar: "Home") {{ event {{ {window} }} }}
+                second: createEvent(summary: "B", start: "2026-07-27T15:00:00Z", calendar: "Home") {{ event {{ {window} }} }}
+            }}"#
+        ))
+        .await;
+    let count = |field: &str| data[field]["event"]["calendar"]["events"]["totalCount"].clone();
+    assert_eq!(
+        (count("first"), count("second")),
+        (1.into(), 2.into()),
+        "{data}"
+    );
+}
+
+/// The preview refuses what the delete would, so the user is never asked to
+/// approve a deletion that then fails.
+#[tokio::test]
+async fn a_calendar_the_delete_would_refuse_fails_the_preview() {
+    let h = Harness::start().await;
+    let read_only = h
+        .run(r#"mutation { deleteCalendar(action: PREVIEW, id: "team") { success error confirmationToken } }"#)
+        .await;
+    assert_eq!(read_only["deleteCalendar"]["success"], false);
+    assert!(
+        read_only["deleteCalendar"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("read-only")
+    );
+    assert!(read_only["deleteCalendar"]["confirmationToken"].is_null());
+
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ok(CALENDARS_XML.replace(
+            "</multistatus>",
+            "<response><href>/1234/calendars/inbox/</href><propstat><prop>\
+             <resourcetype><collection/><c:schedule-inbox/></resourcetype>\
+             <c:schedule-default-calendar-URL><href>/1234/calendars/home/</href>\
+             </c:schedule-default-calendar-URL></prop></propstat></response></multistatus>",
+        )))
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    let default = h
+        .run(r#"mutation { deleteCalendar(action: PREVIEW, id: "home") { success error } }"#)
+        .await;
+    assert_eq!(default["deleteCalendar"]["success"], false);
+    assert!(
+        default["deleteCalendar"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("default")
+    );
+}
 /// `calendar` with no id is documented as "where a new event lands if you
 /// don't say otherwise" — so it has to apply the same fallback `createEvent`
 /// does. It didn't, and answered the account's default while a create with the

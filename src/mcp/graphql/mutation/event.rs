@@ -257,10 +257,11 @@ impl EventMutation {
         let client = ctx.data::<SharedClient>()?;
         let attendees = input.parsed_attendees();
         let fields = input.fields(attendees.as_deref(), input.categories.as_deref());
-        match client
+        let written = client
             .create_event(input.calendar.as_deref(), &fields)
-            .await
-        {
+            .await;
+        reads_changed(ctx).await?;
+        match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
         }
@@ -344,10 +345,11 @@ impl EventMutation {
             return Ok(GqlEventResult::failed(msg));
         }
 
-        match client
+        let written = client
             .update_event(&id, input.calendar.as_deref(), &fields)
-            .await
-        {
+            .await;
+        reads_changed(ctx).await?;
+        match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
         }
@@ -389,7 +391,9 @@ impl EventMutation {
             return Ok(GqlEventResult::failed(msg));
         }
 
-        match client.delete_event(&id, calendar.as_deref()).await {
+        let written = client.delete_event(&id, calendar.as_deref()).await;
+        reads_changed(ctx).await?;
+        match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
         }
@@ -439,10 +443,11 @@ impl EventMutation {
             return Ok(GqlEventResult::failed(msg));
         }
 
-        match client
+        let written = client
             .move_event(&id, calendar.as_deref(), &to_calendar)
-            .await
-        {
+            .await;
+        reads_changed(ctx).await?;
+        match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
         }
@@ -514,10 +519,11 @@ impl EventMutation {
             return Ok(GqlEventResult::failed(msg));
         }
 
-        match client
+        let written = client
             .exclude_occurrence(&id, calendar.as_deref(), &occurrence)
-            .await
-        {
+            .await;
+        reads_changed(ctx).await?;
+        match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
         }
@@ -587,10 +593,11 @@ impl EventMutation {
             return Ok(GqlEventResult::failed(msg));
         }
 
-        match client
+        let written = client
             .respond_to_invite(&id, calendar.as_deref(), partstat, attendee.as_deref())
-            .await
-        {
+            .await;
+        reads_changed(ctx).await?;
+        match written {
             Ok(event) => Ok(GqlEventResult::done(event)),
             Err(e) => Ok(GqlEventResult::failed(e.to_string())),
         }

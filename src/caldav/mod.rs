@@ -668,19 +668,7 @@ impl CalDavClient {
     #[instrument(skip(self))]
     pub async fn delete_calendar(&self, calendar: &str) -> Result<Calendar> {
         let existing = self.find_calendar(Some(calendar)).await?;
-        if existing.read_only {
-            return Err(Error::Server(format!(
-                "calendar '{}' is read-only",
-                existing.name
-            )));
-        }
-        if existing.is_default {
-            return Err(Error::Server(format!(
-                "calendar '{}' is the account's default calendar — point the default \
-                 at another calendar first",
-                existing.name
-            )));
-        }
+        deletion_refused(&existing)?;
         debug!(url = %existing.url, "deleting calendar");
         let request = self
             .client
@@ -2292,11 +2280,27 @@ fn first_href_under(xml: &str, ns: &str, prop: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Where an unaddressed event goes: the account's own default calendar, else
-/// the first calendar it can actually be written to. A read-only default is
-/// skipped — some servers keep pointing at a calendar the user has since lost
-/// write access to — as is a task-only collection, which would swallow the
-/// event somewhere no calendar app shows it.
+/// Why `calendar` cannot be deleted, if it cannot: a read-only calendar, or the
+/// account's default, which new events would otherwise have nowhere to go.
+/// Shared by the delete and its preview, so the preview never offers what the
+/// delete would refuse.
+pub fn deletion_refused(calendar: &Calendar) -> Result<()> {
+    if calendar.read_only {
+        return Err(Error::Server(format!(
+            "calendar '{}' is read-only",
+            calendar.name
+        )));
+    }
+    if calendar.is_default {
+        return Err(Error::Server(format!(
+            "calendar '{}' is the account's default calendar — point the default \
+             at another calendar first",
+            calendar.name
+        )));
+    }
+    Ok(())
+}
+
 /// Match a calendar in an already-fetched listing, by id, display name, or
 /// href. Split out from [`CalDavClient::find_calendar`] so the GraphQL layer can
 /// resolve names against its own per-request listing rather than the client's
@@ -2334,6 +2338,11 @@ fn refuses_uid_filter(status: u16) -> bool {
     matches!(status, 400 | 412 | 422 | 501)
 }
 
+/// Where an unaddressed event goes: the account's own default calendar, else
+/// the first calendar it can actually be written to. A read-only default is
+/// skipped — some servers keep pointing at a calendar the user has since lost
+/// write access to — as is a task-only collection, which would swallow the
+/// event somewhere no calendar app shows it.
 fn pick_default(calendars: &[Calendar]) -> Option<&Calendar> {
     let usable = |c: &&Calendar| !c.read_only && c.supports_events;
     calendars

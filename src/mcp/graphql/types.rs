@@ -16,7 +16,9 @@ use super::connection::{
     load_windows, page_complexity, prepare_filter, read_targets, wants_events,
 };
 use super::filter::{EventFilter, EventSort};
-use super::loaders::{Calendars, EventResources, Resource, to_gql_error};
+use super::loaders::{
+    Calendars, EventResources, EventUids, EventWindows, Resource, Uid, Window, to_gql_error,
+};
 use crate::caldav::recur;
 use crate::commands::RangeArgs;
 use crate::models::{Attendee, BusyPeriod, Calendar, Event, EventTime};
@@ -48,12 +50,17 @@ pub(crate) async fn all_calendars(ctx: &Context<'_>) -> Result<std::sync::Arc<Ve
 #[derive(Default)]
 pub struct DefaultListing(tokio::sync::Mutex<Option<std::sync::Arc<Vec<Calendar>>>>);
 
-/// Forget the request's calendar listing, and the default resolved from it,
-/// after a write that may have changed either, so later fields in the same
-/// request read the account as it now is.
-pub(crate) async fn calendars_changed(ctx: &Context<'_>) -> Result<()> {
+/// Forget everything the request has read after any write, so later fields in
+/// the same request read the account as it now is. One call for every
+/// mutation, rather than a choice per mutation of which reads it touched: a
+/// calendar delete removes events too, and writes are rare enough that
+/// refetching is no cost worth saving.
+pub(crate) async fn reads_changed(ctx: &Context<'_>) -> Result<()> {
     ctx.data::<std::sync::Arc<Calendars>>()?.clear::<()>();
     *ctx.data::<DefaultListing>()?.0.lock().await = None;
+    ctx.data::<EventWindows>()?.clear::<Window>();
+    ctx.data::<EventResources>()?.clear::<Resource>();
+    ctx.data::<EventUids>()?.clear::<Uid>();
     Ok(())
 }
 
