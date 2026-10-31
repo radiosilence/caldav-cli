@@ -18,7 +18,7 @@ use tokio::sync::OnceCell;
 use tracing::{debug, instrument};
 
 use crate::error::{Error, Result};
-use crate::models::{BusyPeriod, Calendar, CalendarFields, Event, EventFields};
+use crate::models::{BusyPeriod, Calendar, CalendarFields, Event, EventFields, EventTime};
 use crate::util;
 
 use ical::{TimeSpec, VEventSpec};
@@ -1171,8 +1171,19 @@ impl CalDavClient {
         let ics = ical::build_vcalendar(&VEventSpec {
             uid,
             summary,
-            start: start.spec(tzid),
-            end: end.spec(tzid),
+            start: TimeSpec {
+                floating: kept_floating(&existing.start, fields),
+                ..start.spec(tzid)
+            },
+            // DTEND keeps its own form unless the caller names a zone.
+            end: TimeSpec {
+                floating: kept_floating(&existing.end, fields),
+                ..end.spec(match fields.tzid {
+                    Some(zone) => Some(zone),
+                    None if existing.end.floating_zone.is_some() => None,
+                    None => existing.end.tzid.as_deref().or(tzid),
+                })
+            },
             description: fields.description.or(existing.description.as_deref()),
             location: fields.location.or(existing.location.as_deref()),
             url: fields.url.or(existing.url.as_deref()),
@@ -1414,7 +1425,11 @@ impl CalDavClient {
 
         let tzid = existing.start.tzid.as_deref();
         let at = resolve_occurrence(&existing, occurrence, tzid)?;
-        let tz = util::resolve_tz(tzid)?;
+        // Floating exclusions are read in the zone the series is.
+        let tz = match existing.start.floating_zone {
+            Some(zone) => zone,
+            None => util::resolve_tz(tzid)?,
+        };
         if ical::excluded_instants(existing.recur_source.as_deref(), tz).contains(&at) {
             return Err(Error::Server(format!(
                 "the occurrence at {} is already cancelled",
@@ -1422,12 +1437,8 @@ impl CalDavClient {
             )));
         }
 
-        let exdate = TimeSpec {
-            instant: at,
-            all_day: existing.all_day,
-            tzid: tzid.filter(|_| !existing.all_day),
-        }
-        .render("EXDATE");
+        // In the form DTSTART has, which servers require of an EXDATE.
+        let exdate = stored_spec(&existing, &existing.start, at).render("EXDATE");
 
         let mut recur_extra = ical::recur_extra_lines(existing.recur_source.as_deref());
         recur_extra.push(exdate);
@@ -1497,18 +1508,16 @@ impl CalDavClient {
         let start = existing.start.instant.ok_or_else(|| {
             Error::Server("stored event has an unparseable start; set --start to fix it".into())
         })?;
-        let tzid = existing.start.tzid.as_deref();
-        let spec = |instant| TimeSpec {
-            instant,
-            all_day: existing.all_day,
-            tzid: tzid.filter(|_| !existing.all_day),
-        };
 
         let ics = ical::build_vcalendar(&VEventSpec {
             uid: &existing.id,
             summary: existing.summary.as_deref().unwrap_or("(no title)"),
-            start: spec(start),
-            end: spec(existing.end.instant.unwrap_or(start)),
+            start: stored_spec(existing, &existing.start, start),
+            end: stored_spec(
+                existing,
+                &existing.end,
+                existing.end.instant.unwrap_or(start),
+            ),
             description: existing.description.as_deref(),
             location: existing.location.as_deref(),
             url: existing.url.as_deref(),
@@ -1633,6 +1642,46 @@ fn check_structured(fields: &EventFields<'_>) -> Result<()> {
     Ok(())
 }
 
+/// `instant` written in the form a stored time of `existing` has: its zone,
+/// all-day-ness and, when floating, the zone it was read in. Shared by every
+/// rewrite of a stored time, and by the EXDATE that must match DTSTART's form.
+fn stored_spec<'a>(
+    existing: &Event,
+    stored: &'a EventTime,
+    instant: DateTime<Utc>,
+) -> TimeSpec<'a> {
+    TimeSpec {
+        instant,
+        all_day: existing.all_day,
+        tzid: stored.tzid.as_deref().filter(|_| !existing.all_day),
+        floating: stored.floating_zone,
+    }
+}
+
+/// The zone a caller's naive time on `existing` is read in: its start's TZID,
+/// or the zone a floating start is read in, so "10:00" means what the event's
+/// own times mean.
+fn input_zone(existing: &Event) -> Option<&str> {
+    existing
+        .start
+        .tzid
+        .as_deref()
+        .or(existing.start.floating_zone.map(|zone| zone.name()))
+}
+
+/// The zone a stored floating time keeps being written in, unless the caller
+/// names a zone. A new start or end is read in that same zone (see
+/// [`input_zone`]), so it stays floating too; moving the event to UTC would
+/// leave its floating exclusions behind. Each of DTSTART and DTEND answers for
+/// itself, as a floating start may sit beside a zoned end.
+fn kept_floating(stored: &EventTime, fields: &EventFields<'_>) -> Option<chrono_tz::Tz> {
+    fields
+        .tzid
+        .is_none()
+        .then_some(stored.floating_zone)
+        .flatten()
+}
+
 /// The start and end an update would write: the caller's where given, else the
 /// stored ones, with an unspecified end following the stored duration so moving
 /// an event doesn't silently resize it.
@@ -1640,7 +1689,7 @@ fn update_span(existing: &Event, fields: &EventFields<'_>) -> Result<(ResolvedTi
     if let Some(raw) = fields.start {
         return resolve_span(raw, fields, Some(existing));
     }
-    let tzid = fields.tzid.or(existing.start.tzid.as_deref());
+    let tzid = fields.tzid.or_else(|| input_zone(existing));
     let start = ResolvedTime {
         instant: existing.start.instant.ok_or_else(|| {
             Error::Server("stored event has an unparseable start; set --start to fix it".into())
@@ -1678,7 +1727,10 @@ pub fn check_update(
     check_structured(fields)?;
     let span = update_span(existing, fields)?;
     let tzid = fields.tzid.or(existing.start.tzid.as_deref());
-    let new_start = span.0.spec(tzid);
+    let new_start = TimeSpec {
+        floating: kept_floating(&existing.start, fields),
+        ..span.0.spec(tzid)
+    };
     if fields.recurrence.is_some() {
         check_rule(fields.recurrence, &new_start)?;
         return Ok(span);
@@ -1694,10 +1746,12 @@ pub fn check_update(
     let written = new_start.render("DTSTART");
     let stored = source.lines().find(|line| line.starts_with("DTSTART"));
     let extra = ical::recur_extra_lines(Some(source));
-    let worked = stored.is_some_and(|dtstart| recur::check_series(dtstart, rule, &extra).is_ok());
+    let worked = stored.is_some_and(|dtstart| {
+        recur::check_series(dtstart, rule, &extra, existing.start.floating_zone).is_ok()
+    });
     if stored != Some(written.as_str())
         && worked
-        && let Err(e) = recur::check_series(&written, rule, &extra)
+        && let Err(e) = recur::check_series(&written, rule, &extra, new_start.floating)
     {
         return Err(Error::Server(format!(
             "this change rewrites the start as {written} and the series would stop expanding \
@@ -1714,7 +1768,7 @@ fn check_rule(rule: Option<&str>, start: &TimeSpec<'_>) -> Result<()> {
     let Some(rule) = rule.and_then(ical::rule_value) else {
         return Ok(());
     };
-    recur::check_series(&start.render("DTSTART"), rule, &[]).map_err(|reason| {
+    recur::check_series(&start.render("DTSTART"), rule, &[], start.floating).map_err(|reason| {
         let unexpandable_part = rule.split(';').any(|part| {
             let key = part
                 .split('=')
@@ -1851,6 +1905,7 @@ impl ResolvedTime {
             instant: self.instant,
             all_day: self.all_day,
             tzid: tzid.filter(|_| !self.all_day),
+            floating: None,
         }
     }
 }
@@ -1862,9 +1917,7 @@ fn resolve_span(
     fields: &EventFields<'_>,
     existing: Option<&Event>,
 ) -> Result<(ResolvedTime, ResolvedTime)> {
-    let tzid = fields
-        .tzid
-        .or_else(|| existing.and_then(|e| e.start.tzid.as_deref()));
+    let tzid = fields.tzid.or_else(|| existing.and_then(input_zone));
     let parsed = util::parse_datetime(start_raw, tzid)?;
     let all_day = fields.all_day.unwrap_or(parsed.date_only);
     let start = ResolvedTime {
@@ -1968,6 +2021,9 @@ pub fn resolve_occurrence(
     occurrence: &str,
     tzid: Option<&str>,
 ) -> Result<DateTime<Utc>> {
+    // A floating series has no TZID but does have a zone: the one it is read
+    // in. Its days are that zone's days, or a bare date names a neighbour.
+    let tzid = tzid.or(event.start.floating_zone.map(|zone| zone.name()));
     let parsed = util::parse_datetime(occurrence, tzid)?;
     // All-day times are anchored at UTC midnight so the date survives the round
     // trip; resolving their "day" through a zone would move it.
@@ -2761,9 +2817,8 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
         };
         assert!(check_update(&floating, &zoned).is_err());
 
-        // Any rewrite renders a floating start as UTC, so even a retitle would
-        // break this series.
-        assert!(check_update(&floating, &retitle).is_err());
+        // A retitle keeps the floating start, so the series keeps expanding.
+        assert!(check_update(&floating, &retitle).is_ok());
 
         let odd = stored("DTSTART:20260706T090000Z", "FREQ=WEEKLY;X-ODD=1");
         let moved = EventFields {
@@ -2779,6 +2834,7 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             instant: Utc.with_ymd_and_hms(2026, 7, 6, 8, 0, 0).unwrap(),
             all_day: false,
             tzid: Some("Europe/London"),
+            floating: None,
         };
         assert!(check_rule(Some("FREQ=WEEKLY;BYDAY=MO"), &timed).is_ok());
         assert!(check_rule(Some("FREQ=WEEKLY;UNTIL=20261231T235959Z"), &timed).is_ok());
@@ -3048,6 +3104,17 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    /// 00:30 in London is the previous day in UTC, so bucketing by UTC days
+    /// would name the wrong meeting.
+    #[test]
+    fn a_floating_series_resolves_dates_in_its_own_zone() {
+        let ics = "BEGIN:VCALENDAR\r\nX-WR-TIMEZONE:Europe/London\r\nBEGIN:VEVENT\r\nUID:late\r\n\
+SUMMARY:Late\r\nDTSTART:20260701T003000\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let series = ical::parse_events(ics, "Home", "/c/", "/c/late.ics", None).remove(0);
+        let at = resolve_occurrence(&series, "2026-08-03", None).unwrap();
+        assert_eq!(util::format_rfc3339(at), "2026-08-02T23:30:00Z");
     }
 
     #[test]

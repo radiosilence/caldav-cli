@@ -63,6 +63,10 @@ pub struct EventTime {
     /// `date_time` is the wire form.
     #[serde(skip)]
     pub instant: Option<DateTime<Utc>>,
+    /// For a floating date-time (no `TZID`, no `Z`), the zone it was read in,
+    /// so it can be written back floating. Not serialised.
+    #[serde(skip)]
+    pub floating_zone: Option<chrono_tz::Tz>,
 }
 
 impl EventTime {
