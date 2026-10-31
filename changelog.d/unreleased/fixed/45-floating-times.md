@@ -1,0 +1,1 @@
+- **Edits keep floating times floating.** A time with no zone was written back in UTC on every update, invite reply or cancelled occurrence, pinning the event to UTC wall time in every client. Stored floating times are now written back as they were, unless the edit sets a new start, all-day flag or zone.
