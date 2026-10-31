@@ -1,0 +1,1 @@
+- **Large filters no longer cost minutes of CPU.** Each filter condition lowercased its text and every field it searched again for every event, and a filter could have any number of conditions. Filters are now prepared once, each event's fields are lowercased at most once, and a filter is limited to 1,000 conditions.
