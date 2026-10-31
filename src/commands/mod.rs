@@ -77,12 +77,9 @@ impl RangeArgs {
             (Some(raw), _) => util::parse_datetime_at(raw, tzid, now)?.instant,
             (None, days) => {
                 let days = days.unwrap_or(DEFAULT_DAYS).max(1);
-                let label = format!("{days} days");
-                let end = chrono::Duration::try_days(days)
-                    .and_then(|span| start.checked_add_signed(span))
-                    .ok_or_else(|| util::out_of_range(&label))?;
-                util::within_ical_years(end, &label)?;
-                end
+                util::add_span(start, chrono::Duration::try_days(days), || {
+                    format!("{days} days")
+                })?
             }
         };
 

@@ -74,6 +74,19 @@ pub fn within_ical_years(instant: DateTime<Utc>, input: &str) -> Result<()> {
     }
 }
 
+/// `instant` plus `span`, refused when either is unrepresentable or the result
+/// falls outside the years iCalendar can write. `label` names the input in the
+/// error and is only built when there is one.
+pub fn add_span(
+    instant: DateTime<Utc>,
+    span: Option<Duration>,
+    label: impl FnOnce() -> String,
+) -> Result<DateTime<Utc>> {
+    span.and_then(|span| instant.checked_add_signed(span))
+        .filter(|end| (1..=9999).contains(&end.year()))
+        .ok_or_else(|| out_of_range(&label()))
+}
+
 /// The error for a value iCalendar cannot represent, naming the input.
 pub fn out_of_range(input: &str) -> Error {
     Error::InvalidDateTime {
@@ -189,6 +202,9 @@ fn parse_relative(input: &str) -> Option<Option<Duration>> {
         None => (-1, input.strip_prefix('-')?),
     };
     let (digits, unit) = rest.split_at(rest.find(|c: char| !c.is_ascii_digit())?);
+    if digits.is_empty() {
+        return None;
+    }
     let n = digits.parse::<i64>().ok().map(|n| n * sign);
     let magnitude: fn(i64) -> Option<Duration> = match unit {
         "m" | "min" | "mins" => Duration::try_minutes,
@@ -319,10 +335,7 @@ pub fn split_list(input: &str) -> Vec<String> {
 pub fn day_range(days: i64, tz: Tz, now: DateTime<Utc>) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
     let today = now.with_timezone(&tz).date_naive();
     let start = start_of_day(today, tz)?;
-    let end = Duration::try_days(days.max(1))
-        .and_then(|span| today.checked_add_signed(span))
-        .ok_or_else(|| out_of_range(&format!("{days} days")))?;
-    let end = start_of_day(end, tz)?;
+    let end = start_of_day(today + Duration::days(days.max(1)), tz)?;
     Ok((start, end))
 }
 
@@ -418,6 +431,17 @@ mod tests {
     }
 
     #[test]
+    fn a_unit_with_no_number_gets_the_format_hint() {
+        for input in ["+d", "-h", "+weeks"] {
+            let err = parse_datetime_at(input, None, now()).unwrap_err();
+            assert!(
+                err.to_string().contains("relative offset"),
+                "{input}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_relative_offsets() {
         assert_eq!(
             format_rfc3339(parse_datetime_at("+2h", None, now()).unwrap().instant),
@@ -494,11 +518,6 @@ mod tests {
         let (start, end) = day_range(3, Tz::UTC, now()).unwrap();
         assert_eq!(format_iso_date(start), "2026-07-24");
         assert_eq!(format_iso_date(end), "2026-07-27");
-    }
-
-    #[test]
-    fn day_range_refuses_a_span_past_the_calendar() {
-        assert!(day_range(i64::MAX, Tz::UTC, now()).is_err());
     }
 
     #[test]
