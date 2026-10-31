@@ -16,7 +16,7 @@ use super::connection::{
     load_windows, page_complexity, prepare_filter, read_targets, wants_events,
 };
 use super::filter::{EventFilter, EventSort};
-use super::loaders::{Calendars, EventResources, Resource, to_gql_error};
+use super::loaders::{Calendars, DefaultCalendars, EventResources, Resource, to_gql_error};
 use crate::caldav::recur;
 use crate::commands::RangeArgs;
 use crate::models::{Attendee, BusyPeriod, Calendar, Event, EventTime};
@@ -35,6 +35,19 @@ pub(crate) fn clamp_page(size: Option<u32>) -> u32 {
 /// different points still costs a single `PROPFIND`.
 pub(crate) async fn all_calendars(ctx: &Context<'_>) -> Result<std::sync::Arc<Vec<Calendar>>> {
     ctx.data::<std::sync::Arc<Calendars>>()?
+        .load_one(())
+        .await
+        .map_err(to_gql_error)?
+        .ok_or_else(|| async_graphql::Error::new("Calendar listing unavailable"))
+}
+
+/// The listing with the account's default flagged, which may cost a second
+/// round trip. Only fields that need the default use this; the rest use
+/// [`all_calendars`].
+pub(crate) async fn calendars_with_default(
+    ctx: &Context<'_>,
+) -> Result<std::sync::Arc<Vec<Calendar>>> {
+    ctx.data::<DefaultCalendars>()?
         .load_one(())
         .await
         .map_err(to_gql_error)?
@@ -148,8 +161,14 @@ impl GqlCalendar {
     }
     /// The account's own default calendar, per the server. New events land here
     /// unless the user picked another one or `calendar` is given.
-    async fn is_default(&self) -> bool {
-        self.0.is_default
+    async fn is_default(&self, ctx: &Context<'_>) -> Result<bool> {
+        if self.0.is_default {
+            return Ok(true);
+        }
+        Ok(calendars_with_default(ctx)
+            .await?
+            .iter()
+            .any(|c| c.is_default && c.href == self.0.href))
     }
 
     /// Events in this calendar over a time window, defaulting to the next 7

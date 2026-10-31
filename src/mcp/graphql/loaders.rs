@@ -59,7 +59,26 @@ impl Loader<()> for CalendarListLoader {
     type Error = LoadError;
 
     async fn load(&self, _keys: &[()]) -> Result<HashMap<(), Arc<Vec<Calendar>>>, Self::Error> {
-        let calendars = self.0.list_calendars().await.map_err(Arc::new)?;
+        let calendars = self.0.calendar_listing().await.map_err(Arc::new)?;
+        Ok(HashMap::from([((), Arc::new(calendars))]))
+    }
+}
+
+/// The calendar listing with the account's default flagged, for the fields
+/// that need to know it. Separate from [`CalendarListLoader`] because finding
+/// the default can cost a second round trip, which only these should pay.
+pub struct DefaultListLoader {
+    client: SharedClient,
+    calendars: Arc<Calendars>,
+}
+
+impl Loader<()> for DefaultListLoader {
+    type Value = Arc<Vec<Calendar>>;
+    type Error = LoadError;
+
+    async fn load(&self, _keys: &[()]) -> Result<HashMap<(), Arc<Vec<Calendar>>>, Self::Error> {
+        let mut calendars = (*load_calendars(&self.calendars).await?).clone();
+        self.client.resolve_default(&mut calendars).await;
         Ok(HashMap::from([((), Arc::new(calendars))]))
     }
 }
@@ -304,6 +323,7 @@ const MULTIGET_BATCH: usize = 100;
 // request-scoped cache: a calendar pulled for one field is free for every later
 // field in the same query.
 pub type Calendars = DataLoader<CalendarListLoader, HashMapCache>;
+pub type DefaultCalendars = DataLoader<DefaultListLoader, HashMapCache>;
 pub type EventWindows = DataLoader<EventWindowLoader, HashMapCache>;
 pub type EventResources = DataLoader<EventResourceLoader, HashMapCache>;
 pub type EventUids = DataLoader<EventUidLoader, HashMapCache>;
@@ -314,6 +334,7 @@ pub struct Loaders {
     /// cap holds for the request as a whole.
     pub budget: Arc<ExpansionBudget>,
     pub calendar: Arc<Calendars>,
+    pub default: DefaultCalendars,
     pub window: EventWindows,
     pub resource: EventResources,
     pub uid: EventUids,
@@ -333,6 +354,14 @@ impl Loaders {
 
         let budget = Arc::new(ExpansionBudget::default());
         Self {
+            default: DefaultCalendars::with_cache(
+                DefaultListLoader {
+                    client: client.clone(),
+                    calendars: calendar.clone(),
+                },
+                tokio::spawn,
+                HashMapCache::default(),
+            ),
             window: EventWindows::with_cache(
                 EventWindowLoader {
                     client: client.clone(),

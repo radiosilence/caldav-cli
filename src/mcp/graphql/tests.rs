@@ -745,6 +745,50 @@ async fn a_refused_uid_filter_is_remembered_across_requests() {
     );
 }
 
+/// A server that names its default only on the scheduling inbox is asked
+/// there only when something needs the default.
+#[tokio::test]
+async fn the_default_calendar_is_read_only_when_asked_for() {
+    let h = Harness::start().await;
+    let with_inbox = CALENDARS_XML.replace(
+        "</multistatus>",
+        "<response><href>/1234/calendars/inbox/</href><propstat><prop>\
+         <resourcetype><collection/><c:schedule-inbox/></resourcetype>\
+         </prop></propstat></response></multistatus>",
+    );
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/"))
+        .respond_with(ok(with_inbox))
+        .with_priority(1)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("PROPFIND"))
+        .and(path("/1234/calendars/inbox/"))
+        .respond_with(ok(r#"<?xml version="1.0"?>
+<multistatus xmlns="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><response>
+<href>/1234/calendars/inbox/</href><propstat><prop><c:schedule-default-calendar-URL>
+<href>/1234/calendars/team/</href></c:schedule-default-calendar-URL></prop></propstat>
+</response></multistatus>"#
+            .into()))
+        .mount(&h.server)
+        .await;
+    let inbox_reads = || async { h.count("PROPFIND", "/inbox/").await };
+
+    h.run("{ calendars { nodes { name } } }").await;
+    assert_eq!(inbox_reads().await, 0, "the listing alone needs no default");
+
+    let data = h.run("{ calendars { nodes { name isDefault } } }").await;
+    assert_eq!(inbox_reads().await, 1, "asked once for the whole page");
+    let defaults: Vec<&str> = data["calendars"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["isDefault"] == true)
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(defaults, ["Team"]);
+}
+
 #[tokio::test]
 async fn first_and_last_together_are_rejected() {
     let h = Harness::start().await;

@@ -226,7 +226,7 @@ impl CalendarMutation {
         #[graphql(desc = "Calendar name or id to make the default")] id: String,
     ) -> Result<GqlCalendarResult> {
         let client = ctx.data::<SharedClient>()?;
-        let previous = types::all_calendars(ctx)
+        let previous = types::calendars_with_default(ctx)
             .await?
             .iter()
             .find(|c| c.is_default)
