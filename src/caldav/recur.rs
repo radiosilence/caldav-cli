@@ -13,6 +13,7 @@
 //! it subtly wrong means silently showing someone the wrong day.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use rrule::{Frequency, RRuleSet};
@@ -31,10 +32,35 @@ const MAX_OCCURRENCES: usize = 750;
 /// `FREQ=SECONDLY` series costs one step per second since it began.
 const MAX_STEPS: usize = 50_000;
 
-/// Ceiling on occurrences one expansion may produce across every series. Each
+/// Ceiling on how far past its anchor a sub-daily series may iterate, counted
+/// in steps of its interval. rrule advances one interval at a time while
+/// BYHOUR, BYMINUTE or BYSECOND rejects the value, so a sparse filter costs
+/// this many steps between occurrences, all of them inside a single yield that
+/// [`MAX_STEPS`] never sees.
+const MAX_WORK: i64 = 5_000_000;
+
+/// Ceiling on occurrences one caller's expansions may produce in all. Each
 /// occurrence is a full copy of its master event, so this bounds the memory a
-/// wide window over many series can take.
+/// wide window over many series and calendars can take.
 pub const MAX_EXPANDED: usize = 25_000;
+
+/// What is left of [`MAX_EXPANDED`] for one scope: a GraphQL request, or one
+/// CLI read. Shared by every expansion in that scope, so the cap holds across
+/// calendars and fields rather than per window.
+#[derive(Debug, Default)]
+pub struct ExpansionBudget(AtomicUsize);
+
+impl ExpansionBudget {
+    /// Reserve `n` occurrences, or refuse without reserving any.
+    fn charge(&self, n: usize) -> Result<()> {
+        self.0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(n).filter(|total| *total <= MAX_EXPANDED)
+            })
+            .map(drop)
+            .map_err(|_| Error::TooManyOccurrences(MAX_EXPANDED))
+    }
+}
 
 /// Expand every unexpanded series in `events` across `[start, end)`.
 ///
@@ -44,12 +70,12 @@ pub const MAX_EXPANDED: usize = 25_000;
 /// override marked `CANCELLED` removes that occurrence entirely.
 ///
 /// Fails with [`Error::TooManyOccurrences`] rather than truncating when the
-/// window holds more than [`MAX_EXPANDED`] occurrences, so a result that does
-/// come back is complete up to the per-series cap.
+/// occurrences would take `budget` past [`MAX_EXPANDED`].
 pub fn expand_all(
     events: Vec<Event>,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    budget: &ExpansionBudget,
 ) -> Result<Vec<Event>> {
     // Overrides are keyed by (series uid, occurrence instant) so a generated
     // instance can be replaced by the edited one.
@@ -110,10 +136,7 @@ pub fn expand_all(
         }
     }
 
-    let total: usize = series.iter().map(|(_, instants)| instants.len()).sum();
-    if total > MAX_EXPANDED {
-        return Err(Error::TooManyOccurrences(MAX_EXPANDED));
-    }
+    budget.charge(series.iter().map(|(_, instants)| instants.len()).sum())?;
     for (master, instants) in &series {
         out.extend(instantiate(master, instants, &overridden, &cancelled));
     }
@@ -135,17 +158,26 @@ pub fn expand_all(
 /// interpret, and matches how [`crate::caldav::ical::parse_time`] resolves the
 /// same date. A no-op for timed series, whose values carry a time and are
 /// therefore left alone.
+///
+/// A date `UNTIL` on an all-day series is pinned the same way. It is inclusive
+/// of its day (RFC 5545 §3.3.10), and UTC midnight on that day is the instant
+/// the last occurrence lands on. On a timed series a date `UNTIL` is invalid,
+/// and no single instant says "through the end of that day" in every zone, so it
+/// is left for rrule to refuse.
 fn pin_dates_to_utc(source: &str) -> String {
+    let is_bare_date = |v: &str| v.len() == 8 && v.bytes().all(|b| b.is_ascii_digit());
+    let all_day = source.lines().any(|line| {
+        line.split_once(':').is_some_and(|(head, value)| {
+            head.split(';').next() == Some("DTSTART") && is_bare_date(value.trim())
+        })
+    });
     source
         .lines()
         .map(|line| {
             let Some((head, values)) = line.split_once(':') else {
                 return line.to_string();
             };
-            let is_bare_date = |v: &str| v.len() == 8 && v.bytes().all(|b| b.is_ascii_digit());
-            // A date UNTIL is inclusive of its day (RFC 5545 §3.3.10), and
-            // UTC midnight on that day is the first instant rrule must keep.
-            if matches!(head, "RRULE" | "EXRULE") {
+            if all_day && matches!(head, "RRULE" | "EXRULE") {
                 let parts: Vec<String> = values
                     .split(';')
                     .map(|part| match part.split_once('=') {
@@ -188,15 +220,29 @@ fn occurrences(
     let set: RRuleSet = pin_dates_to_utc(source)
         .parse()
         .map_err(|e| format!("{e}"))?;
+    let set = fast_forward(set, start);
+    let anchor = set.get_dt_start().with_timezone(&Utc);
+    // The finest interval any rule steps by; `None` for daily and slower.
+    let step_secs = set
+        .get_rrule()
+        .iter()
+        .filter_map(|rule| {
+            Some(sub_daily_unit(rule.get_freq())? * i64::from(rule.get_interval().max(1)))
+        })
+        .min();
     let mut dates = Vec::new();
     // `limit` arms rrule's own guard against a rule that never matches, which
     // would otherwise spin inside a single `next`.
-    for (step, date) in fast_forward(set, start).limit().into_iter().enumerate() {
+    for (step, date) in set.limit().into_iter().enumerate() {
         if step == MAX_STEPS {
             debug!(limit = MAX_STEPS, "series hit the step cap");
             break;
         }
         let date = date.with_timezone(&Utc);
+        if step_secs.is_some_and(|secs| (date - anchor).num_seconds() / secs > MAX_WORK) {
+            debug!(limit = MAX_WORK, "series hit the work cap");
+            break;
+        }
         if date >= end {
             break;
         }
@@ -240,11 +286,8 @@ fn fast_forward(set: RRuleSet, start: DateTime<Utc>) -> RRuleSet {
             }
             _ => false,
         };
-    let unit_secs = match rule.get_freq() {
-        Frequency::Hourly => 3600,
-        Frequency::Minutely => 60,
-        Frequency::Secondly => 1,
-        _ => return set,
+    let Some(unit_secs) = sub_daily_unit(rule.get_freq()) else {
+        return set;
     };
     if rule.get_count().is_some() || !set.get_exrule().is_empty() || carries_through_a_filter {
         return set;
@@ -279,6 +322,16 @@ fn fast_forward(set: RRuleSet, start: DateTime<Utc>) -> RRuleSet {
         .set_rrules(set.get_rrule().clone())
         .set_rdates(set.get_rdate().clone())
         .set_exdates(set.get_exdate().clone())
+}
+
+/// Seconds in one step of a sub-daily frequency; `None` for daily and slower.
+fn sub_daily_unit(freq: Frequency) -> Option<i64> {
+    match freq {
+        Frequency::Hourly => Some(3600),
+        Frequency::Minutely => Some(60),
+        Frequency::Secondly => Some(1),
+        _ => None,
+    }
 }
 
 /// Clone the master into one event per occurrence, preserving its duration.
@@ -368,7 +421,13 @@ DTSTART:20260724T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn expands_a_weekly_series_across_the_window() {
         // Three Mondays: 6, 13, 20 July 2026.
-        let out = expand_all(parse(WEEKLY), at(2026, 7, 6, 0), at(2026, 7, 21, 0)).unwrap();
+        let out = expand_all(
+            parse(WEEKLY),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 21, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 3);
         let starts: Vec<&str> = out
             .iter()
@@ -392,7 +451,13 @@ DTSTART:20260724T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
     #[test]
     fn occurrences_keep_the_series_duration() {
-        let out = expand_all(parse(WEEKLY), at(2026, 7, 6, 0), at(2026, 7, 8, 0)).unwrap();
+        let out = expand_all(
+            parse(WEEKLY),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 8, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(
             out[0].start.date_time.as_deref(),
             Some("2026-07-06T08:00:00Z")
@@ -407,7 +472,13 @@ DTSTART:20260724T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     fn expansion_holds_local_time_across_a_dst_boundary() {
         // A weekly 09:00 London meeting is 08:00Z in BST and 09:00Z in GMT.
         // Expanding in UTC without the TZID would drift it by an hour.
-        let out = expand_all(parse(WEEKLY), at(2026, 10, 20, 0), at(2026, 11, 3, 0)).unwrap();
+        let out = expand_all(
+            parse(WEEKLY),
+            at(2026, 10, 20, 0),
+            at(2026, 11, 3, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         let starts: Vec<&str> = out
             .iter()
             .map(|e| e.start.date_time.as_deref().unwrap())
@@ -423,7 +494,13 @@ DTSTART:20260724T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn window_is_half_open() {
         // The 20 July occurrence sits exactly on the upper bound — excluded.
-        let out = expand_all(parse(WEEKLY), at(2026, 7, 13, 0), at(2026, 7, 20, 8)).unwrap();
+        let out = expand_all(
+            parse(WEEKLY),
+            at(2026, 7, 13, 0),
+            at(2026, 7, 20, 8),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].start.date_time.as_deref(),
@@ -437,7 +514,13 @@ DTSTART:20260724T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             "RRULE:FREQ=WEEKLY;BYDAY=MO\r\n",
             "RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEXDATE;TZID=Europe/London:20260713T090000\r\n",
         );
-        let out = expand_all(parse(&ics), at(2026, 7, 6, 0), at(2026, 7, 21, 0)).unwrap();
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 21, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         let starts: Vec<&str> = out
             .iter()
             .map(|e| e.start.date_time.as_deref().unwrap())
@@ -448,7 +531,13 @@ DTSTART:20260724T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn honours_count_and_until() {
         let counted = WEEKLY.replace("FREQ=WEEKLY;BYDAY=MO", "FREQ=WEEKLY;BYDAY=MO;COUNT=2");
-        let out = expand_all(parse(&counted), at(2026, 7, 6, 0), at(2026, 8, 30, 0)).unwrap();
+        let out = expand_all(
+            parse(&counted),
+            at(2026, 7, 6, 0),
+            at(2026, 8, 30, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
     }
 
@@ -461,7 +550,13 @@ RECURRENCE-ID:20260713T080000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let mut events = parse(WEEKLY);
         events.extend(parse(override_ics));
 
-        let out = expand_all(events, at(2026, 7, 6, 0), at(2026, 7, 21, 0)).unwrap();
+        let out = expand_all(
+            events,
+            at(2026, 7, 6, 0),
+            at(2026, 7, 21, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 3, "override must replace, not duplicate");
         let moved = out
             .iter()
@@ -486,7 +581,13 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         let mut events = parse(WEEKLY);
         events.extend(parse(cancelled));
 
-        let out = expand_all(events, at(2026, 7, 6, 0), at(2026, 7, 21, 0)).unwrap();
+        let out = expand_all(
+            events,
+            at(2026, 7, 6, 0),
+            at(2026, 7, 21, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
         assert!(
             !out.iter()
@@ -501,7 +602,13 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         let instance = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:standup\r\nSUMMARY:Standup\r\n\
 DTSTART:20260713T080000Z\r\nDTEND:20260713T083000Z\r\nRECURRENCE-ID:20260713T080000Z\r\n\
 END:VEVENT\r\nEND:VCALENDAR\r\n";
-        let out = expand_all(parse(instance), at(2026, 7, 6, 0), at(2026, 7, 21, 0)).unwrap();
+        let out = expand_all(
+            parse(instance),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 21, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].start.date_time.as_deref(),
@@ -513,7 +620,13 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     fn plain_events_are_left_alone() {
         let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:one\r\nSUMMARY:Once\r\n\
 DTSTART:20260724T090000Z\r\nDTEND:20260724T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let out = expand_all(parse(ics), at(2026, 7, 1, 0), at(2026, 8, 1, 0)).unwrap();
+        let out = expand_all(
+            parse(ics),
+            at(2026, 7, 1, 0),
+            at(2026, 8, 1, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].recurrence_id.is_none());
     }
@@ -521,7 +634,13 @@ DTSTART:20260724T090000Z\r\nDTEND:20260724T100000Z\r\nEND:VEVENT\r\nEND:VCALENDA
     #[test]
     fn an_unparseable_rule_still_shows_the_event() {
         let ics = WEEKLY.replace("FREQ=WEEKLY;BYDAY=MO", "FREQ=NONSENSE");
-        let out = expand_all(parse(&ics), at(2026, 7, 6, 0), at(2026, 7, 21, 0)).unwrap();
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 21, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1, "a bad rule must not hide the event");
         assert_eq!(out[0].summary.as_deref(), Some("Standup"));
     }
@@ -531,7 +650,13 @@ DTSTART:20260724T090000Z\r\nDTEND:20260724T100000Z\r\nEND:VEVENT\r\nEND:VCALENDA
         let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:bins\r\nSUMMARY:Bin day\r\n\
 DTSTART;VALUE=DATE:20260706\r\nDTEND;VALUE=DATE:20260707\r\n\
 RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let out = expand_all(parse(ics), at(2026, 7, 6, 0), at(2026, 7, 21, 0)).unwrap();
+        let out = expand_all(
+            parse(ics),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 21, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 3);
         assert!(out.iter().all(|e| e.all_day));
         assert_eq!(out[1].start.date.as_deref(), Some("2026-07-13"));
@@ -540,7 +665,13 @@ RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
     #[test]
     fn output_is_sorted_by_start() {
-        let out = expand_all(parse(WEEKLY), at(2026, 7, 6, 0), at(2026, 7, 28, 0)).unwrap();
+        let out = expand_all(
+            parse(WEEKLY),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 28, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         let mut sorted = out.clone();
         sorted.sort_by_key(|e| e.start.sort_key());
         let a: Vec<_> = out.iter().map(|e| e.start.sort_key()).collect();
@@ -577,7 +708,13 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
     fn an_old_secondly_series_expands_near_the_window() {
         let ics = series("DTSTART:20200101T000000Z", "RRULE:FREQ=SECONDLY");
         let from = at(2026, 7, 6, 9);
-        let out = expand_all(parse(&ics), from, from + Duration::seconds(10)).unwrap();
+        let out = expand_all(
+            parse(&ics),
+            from,
+            from + Duration::seconds(10),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(
             starts(&out),
             (0..10)
@@ -586,48 +723,59 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
         );
     }
 
+    /// Every sub-daily rule shape the anchor may move for must expand exactly
+    /// as it would unmoved, and the shapes it must not move for must stay put.
     #[test]
     fn moving_the_anchor_leaves_every_occurrence_where_it_was() {
-        let cases = [
-            // Crosses the end of BST on 25 October 2026 on a 5-hour grid.
-            (
-                "DTSTART;TZID=Europe/London:20260101T093000",
-                "RRULE:FREQ=HOURLY;INTERVAL=5",
-            ),
-            (
-                "DTSTART;TZID=Europe/London:20260101T093000",
-                "RRULE:FREQ=HOURLY;BYDAY=SU",
-            ),
-            (
-                "DTSTART;TZID=America/New_York:20260301T011500",
-                "RRULE:FREQ=MINUTELY;INTERVAL=7",
-            ),
-            (
-                "DTSTART:20260601T000003Z",
-                "RRULE:FREQ=SECONDLY;INTERVAL=15;BYMINUTE=0",
-            ),
-            // Grids rrule drifts through a filter, which must not move.
-            (
-                "DTSTART:20260601T000003Z",
-                "RRULE:FREQ=SECONDLY;INTERVAL=13;BYMINUTE=0",
-            ),
-            (
-                "DTSTART:20260301T000000Z",
-                "RRULE:FREQ=MINUTELY;INTERVAL=7;BYHOUR=9",
-            ),
+        let filters = [
+            "",
+            ";BYHOUR=9",
+            ";BYMINUTE=0",
+            ";BYSECOND=5",
+            ";BYHOUR=1;BYMINUTE=0",
+            ";BYDAY=SU",
         ];
-        let (from, to) = (at(2026, 10, 24, 0), at(2026, 10, 27, 0));
-        for (dtstart, rule) in cases {
-            let ics = series(dtstart, rule);
-            let out = expand_all(parse(&ics), from, to).unwrap();
-            let mut expected = unshifted(&ics, from, to);
-            expected.truncate(MAX_OCCURRENCES);
-            assert!(
-                !expected.is_empty(),
-                "{rule}: the case must have occurrences"
-            );
-            assert_eq!(starts(&out), expected, "{dtstart} {rule}");
+        // The window straddles the end of BST at 01:00Z on 25 October 2026. Each
+        // series starts far enough before it for the anchor to move past its
+        // margin, and near enough that the unmoved reference stays cheap.
+        let (from, to) = (at(2026, 10, 25, 0), at(2026, 10, 25, 3));
+        let starts_at = [
+            ("HOURLY", "20261015T000700"),
+            ("MINUTELY", "20261023T230700"),
+            ("SECONDLY", "20261024T190700"),
+        ];
+        let (mut moved, mut expected_moved) = (0, 0);
+        for (freq, local) in starts_at {
+            let dtstart = format!("DTSTART;TZID=Europe/London:{local}");
+            for interval in 1..=61 {
+                for filter in filters {
+                    let drifts = 60 % interval != 0
+                        && match freq {
+                            "MINUTELY" => filter.contains("BYHOUR"),
+                            "SECONDLY" => filter.contains("BYHOUR") || filter.contains("BYMINUTE"),
+                            _ => false,
+                        };
+                    if !drifts {
+                        expected_moved += 1;
+                    }
+                    let rule = format!("RRULE:FREQ={freq};INTERVAL={interval}{filter}");
+                    let ics = series(&dtstart, &rule);
+                    let source = parse(&ics).remove(0).recur_source.unwrap();
+                    let set: RRuleSet = pin_dates_to_utc(&source).parse().unwrap();
+                    let before = *set.get_dt_start();
+                    if *fast_forward(set, from).get_dt_start() != before {
+                        moved += 1;
+                    }
+
+                    let out = expand_all(parse(&ics), from, to, &ExpansionBudget::default());
+                    let mut expected = unshifted(&ics, from, to);
+                    expected.truncate(MAX_OCCURRENCES);
+                    assert_eq!(starts(&out.unwrap()), expected, "{rule}");
+                }
+            }
         }
+        // Without this the comparison could pass with nothing ever moved.
+        assert_eq!(moved, expected_moved);
     }
 
     #[test]
@@ -636,7 +784,13 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             "DTSTART;TZID=Europe/London:20200101T090000",
             "RRULE:FREQ=HOURLY;UNTIL=20200301T000000Z",
         );
-        let out = expand_all(parse(&ics), at(2026, 7, 6, 0), at(2026, 7, 7, 0)).unwrap();
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 7, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert!(
             out.is_empty(),
             "a finished series must not fall back to its master"
@@ -649,7 +803,13 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             "DTSTART:20200101T000000Z",
             "RRULE:FREQ=SECONDLY;COUNT=4000000000",
         );
-        let out = expand_all(parse(&ics), at(2026, 7, 6, 0), at(2026, 7, 7, 0)).unwrap();
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 7, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert!(out.is_empty());
     }
 
@@ -659,7 +819,13 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             "DTSTART:20200101T000000Z",
             "RRULE:FREQ=SECONDLY\r\nEXRULE:FREQ=SECONDLY",
         );
-        expand_all(parse(&ics), at(2026, 7, 6, 0), at(2026, 7, 7, 0)).unwrap();
+        expand_all(
+            parse(&ics),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 7, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -668,25 +834,64 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             "DTSTART:20260101T000000Z",
             "RRULE:FREQ=SECONDLY;BYMONTH=2;BYMONTHDAY=30",
         );
-        let out = expand_all(parse(&ics), at(2026, 1, 1, 0), at(2027, 1, 1, 0)).unwrap();
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 1, 1, 0),
+            at(2027, 1, 1, 0),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert!(out.is_empty());
     }
 
+    /// The budget spans every expansion sharing it, so many calendars cannot
+    /// each stay just under the cap.
     #[test]
-    fn a_window_over_the_budget_is_refused_rather_than_cut() {
-        let per_series = 500;
-        let events: Vec<Event> = (0..=MAX_EXPANDED / per_series)
-            .flat_map(|i| {
-                let ics = series("DTSTART:20260101T000000Z", "RRULE:FREQ=HOURLY")
-                    .replace("UID:s", &format!("UID:s{i}"));
-                parse(&ics)
-            })
-            .collect();
-        let to = at(2026, 1, 1, 0) + Duration::hours(per_series as i64);
+    fn a_budget_over_its_cap_is_refused_rather_than_cut() {
+        let hours = 500;
+        let to = at(2026, 1, 1, 0) + Duration::hours(hours);
+        let calendar = |i: usize| {
+            let ics = series("DTSTART:20260101T000000Z", "RRULE:FREQ=HOURLY")
+                .replace("UID:s", &format!("UID:s{i}"));
+            parse(&ics)
+        };
+        let budget = ExpansionBudget::default();
+        for i in 0..MAX_EXPANDED / hours as usize {
+            expand_all(calendar(i), at(2026, 1, 1, 0), to, &budget).unwrap();
+        }
         assert!(matches!(
-            expand_all(events, at(2026, 1, 1, 0), to),
+            expand_all(calendar(0), at(2026, 1, 1, 0), to, &budget),
             Err(Error::TooManyOccurrences(_))
         ));
+    }
+
+    /// A sparse filter makes rrule step through every rejected second inside
+    /// one yield; COUNT keeps the anchor where it is. Unbounded, this took tens
+    /// of seconds.
+    #[test]
+    fn a_sparse_sub_daily_filter_is_bounded_by_the_work_cap() {
+        let ics = series(
+            "DTSTART:20000101T000000Z",
+            "RRULE:FREQ=SECONDLY;BYHOUR=0;BYMINUTE=0;BYSECOND=0;COUNT=1000000",
+        );
+        let started = std::time::Instant::now();
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 7, 6, 0),
+            at(2026, 7, 7, 0),
+            &ExpansionBudget::default(),
+        );
+        assert!(out.unwrap().is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A date UNTIL is invalid on a timed series. Pinning it to UTC midnight
+    /// would silently drop the last day, so it is left for rrule to refuse and
+    /// the master is shown as before.
+    #[test]
+    fn a_date_until_on_a_timed_series_is_not_pinned() {
+        let source = "DTSTART;TZID=Europe/London:20260706T090000\nRRULE:FREQ=WEEKLY;UNTIL=20261231";
+        assert_eq!(pin_dates_to_utc(source), source);
     }
 }
 
@@ -714,7 +919,13 @@ RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     /// Sunday, and the first Monday dropped for sorting before the window.
     #[test]
     fn all_day_occurrences_keep_their_date_regardless_of_local_zone() {
-        let out = expand_all(parse(BINS), at(2026, 7, 6), at(2026, 7, 21)).unwrap();
+        let out = expand_all(
+            parse(BINS),
+            at(2026, 7, 6),
+            at(2026, 7, 21),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
 
         let dates: Vec<&str> = out
             .iter()
@@ -733,7 +944,13 @@ RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     /// out — the original symptom was three Mondays coming back as two.
     #[test]
     fn an_occurrence_on_the_first_day_of_the_window_is_kept() {
-        let out = expand_all(parse(BINS), at(2026, 7, 6), at(2026, 7, 13)).unwrap();
+        let out = expand_all(
+            parse(BINS),
+            at(2026, 7, 6),
+            at(2026, 7, 13),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].start.date.as_deref(), Some("2026-07-06"));
     }
@@ -746,7 +963,13 @@ RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             "RRULE:FREQ=WEEKLY;BYDAY=MO\r\n",
             "RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEXDATE;VALUE=DATE:20260713\r\n",
         );
-        let out = expand_all(parse(&ics), at(2026, 7, 6), at(2026, 7, 21)).unwrap();
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 7, 6),
+            at(2026, 7, 21),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         let dates: Vec<&str> = out
             .iter()
             .map(|e| e.start.date.as_deref().unwrap_or("<none>"))
@@ -762,7 +985,13 @@ RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 DTSTART;TZID=Europe/London:20261019T090000\r\nDTEND;TZID=Europe/London:20261019T093000\r\n\
 RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         // The window straddles the end of BST (25 October 2026).
-        let out = expand_all(parse(ics), at(2026, 10, 19), at(2026, 11, 3)).unwrap();
+        let out = expand_all(
+            parse(ics),
+            at(2026, 10, 19),
+            at(2026, 11, 3),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         let london: Vec<String> = out
             .iter()
             .map(|e| {
@@ -786,7 +1015,13 @@ RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn an_all_day_series_ends_on_its_until_date() {
         let ics = BINS.replace("BYDAY=MO", "BYDAY=MO;UNTIL=20260720");
-        let out = expand_all(parse(&ics), at(2026, 7, 1), at(2026, 8, 1)).unwrap();
+        let out = expand_all(
+            parse(&ics),
+            at(2026, 7, 1),
+            at(2026, 8, 1),
+            &ExpansionBudget::default(),
+        )
+        .unwrap();
         let dates: Vec<&str> = out.iter().filter_map(|e| e.start.date.as_deref()).collect();
         assert_eq!(dates, ["2026-07-06", "2026-07-13", "2026-07-20"]);
     }
@@ -800,8 +1035,10 @@ RRULE:FREQ=WEEKLY;BYDAY=MO\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     #[test]
     fn pinning_rewrites_a_date_until() {
         assert_eq!(
-            pin_dates_to_utc("RRULE:FREQ=WEEKLY;UNTIL=20260720;BYDAY=MO"),
-            "RRULE:FREQ=WEEKLY;UNTIL=20260720T000000Z;BYDAY=MO"
+            pin_dates_to_utc(
+                "DTSTART;VALUE=DATE:20260706\nRRULE:FREQ=WEEKLY;UNTIL=20260720;BYDAY=MO"
+            ),
+            "DTSTART:20260706T000000Z\nRRULE:FREQ=WEEKLY;UNTIL=20260720T000000Z;BYDAY=MO"
         );
     }
 

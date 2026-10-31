@@ -229,12 +229,13 @@ can't collapse rather than implying it away:
 
 Two consequences worth knowing, both stated in the schema:
 
-- **`totalCount` is free and exact.** CalDAV has no windowed query — the range
+- **`totalCount` is free.** CalDAV has no windowed query — the range
   arrives whole — so the count is a length, not extra work for the server.
-  Expansion is bounded instead: a series yields at most 750 occurrences per
-  window, and a window that would expand to more than 25,000 is refused with an
-  error rather than cut short, so a count that comes back is never a partial
-  one.
+  It counts what was read: a calendar that fails to answer is skipped and
+  logged, and expanding a recurring series stops at 750 occurrences per window,
+  or sooner for a sub-daily series that would take too many steps to reach it.
+  A request whose expansions would total more than 25,000 occurrences gets an
+  error for the field that crossed the line, not a truncated list.
 - **Paging is slicing, and a cursor lasts as long as its event.** If the event
   is gone you get a "restart pagination" error, not a quietly different page.
 

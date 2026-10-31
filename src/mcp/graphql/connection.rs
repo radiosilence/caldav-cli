@@ -262,7 +262,11 @@ pub async fn load_windows(
         .load_many(windows.clone())
         .await
         .map_err(to_gql_error)?;
-    Ok(windows.iter().filter_map(|w| loaded.remove(w)).collect())
+    windows
+        .iter()
+        .filter_map(|w| loaded.remove(w))
+        .map(|outcome| outcome.map_err(to_gql_error))
+        .collect()
 }
 
 /// Fetch a time range and build the connection.

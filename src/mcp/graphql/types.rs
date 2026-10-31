@@ -417,6 +417,7 @@ impl GqlEvent {
     #[graphql(complexity = "page_complexity(first, last, child_complexity)")]
     async fn occurrences(
         &self,
+        ctx: &Context<'_>,
         #[graphql(desc = "Window start. Default: today.")] start: Option<String>,
         #[graphql(desc = "Window end. Takes precedence over `days`.")] end: Option<String>,
         #[graphql(desc = "Days from `start`. Default 7 — widen to look further ahead.")]
@@ -437,7 +438,12 @@ impl GqlEvent {
         }
         .resolve()?;
         let events = match self.0.recurrence {
-            Some(_) => recur::expand_all(vec![self.0.clone()], from, to)?,
+            Some(_) => recur::expand_all(
+                vec![self.0.clone()],
+                from,
+                to,
+                ctx.data::<std::sync::Arc<recur::ExpansionBudget>>()?,
+            )?,
             None => Vec::new(),
         };
         events_connection_of(
