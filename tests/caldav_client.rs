@@ -1263,32 +1263,179 @@ async fn mount_event(server: &MockServer, ics: &str) {
         .await;
 }
 
+const FLOATING_ICS: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:evt-1\r\nSUMMARY:Standup\r\n\
+DTSTART:20260724T090000\r\nDTEND:20260724T093000\r\nORGANIZER:mailto:alice@example.com\r\n\
+ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:me@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+/// A floating time has no zone. Writing it back in UTC would pin the event to
+/// UTC wall time in every client.
 #[tokio::test]
-async fn replying_sets_only_your_own_partstat() {
+async fn edits_keep_a_floating_time_floating() {
     let server = MockServer::start().await;
-    mount_event(&server, INVITE_ICS).await;
+    mount_event(&server, FLOATING_ICS).await;
     Mock::given(method("PUT"))
         .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
 
-    let event = client(&server)
-        .respond_to_invite("evt-1", None, "DECLINED", None)
+    let retitle = EventFields {
+        summary: Some("Standup (moved room)"),
+        ..Default::default()
+    };
+    client(&server)
+        .update_event("evt-1", None, &retitle)
         .await
         .unwrap();
-
     let body = put_body(&server).await;
-    assert!(body.contains("PARTSTAT=DECLINED:mailto:me@example.com"));
-    // The organiser's own acceptance is not ours to change.
-    assert!(body.contains("PARTSTAT=ACCEPTED:mailto:alice@example.com"));
-    // SEQUENCE bumps so the organiser's client sees a new revision.
-    assert!(body.contains("SEQUENCE:1"));
-    let me = event
-        .attendees
-        .iter()
-        .find(|a| a.email == "me@example.com")
+    assert!(body.contains("DTSTART:20260724T090000\r\n"), "{body}");
+    assert!(body.contains("DTEND:20260724T093000\r\n"), "{body}");
+
+    server.reset().await;
+    mount_event(&server, FLOATING_ICS).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    client(&server)
+        .respond_to_invite("evt-1", None, "ACCEPTED", None)
+        .await
         .unwrap();
-    assert_eq!(me.status.as_deref(), Some("DECLINED"));
+    let body = put_body(&server).await;
+    assert!(body.contains("DTSTART:20260724T090000\r\n"), "{body}");
+}
+
+/// On update too, a zoned end keeps its own zone beside a floating start.
+#[tokio::test]
+async fn an_update_keeps_a_zoned_end_beside_a_floating_start() {
+    let server = MockServer::start().await;
+    mount_event(
+        &server,
+        &FLOATING_ICS.replace(
+            "DTEND:20260724T093000",
+            "DTEND;TZID=America/New_York:20260724T053000",
+        ),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let retitle = EventFields {
+        summary: Some("Standup (moved room)"),
+        ..Default::default()
+    };
+    client(&server)
+        .update_event("evt-1", None, &retitle)
+        .await
+        .unwrap();
+    let body = put_body(&server).await;
+    assert!(body.contains("DTSTART:20260724T090000\r\n"), "{body}");
+    assert!(
+        body.contains("DTEND;TZID=America/New_York:20260724T053000\r\n"),
+        "{body}"
+    );
+}
+
+/// A floating start says nothing about the end, which keeps its own form.
+#[tokio::test]
+async fn a_zoned_end_beside_a_floating_start_stays_zoned() {
+    let server = MockServer::start().await;
+    mount_event(
+        &server,
+        &FLOATING_ICS.replace("DTEND:20260724T093000", "DTEND:20260724T093000Z"),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    client(&server)
+        .respond_to_invite("evt-1", None, "ACCEPTED", None)
+        .await
+        .unwrap();
+    let body = put_body(&server).await;
+    assert!(body.contains("DTSTART:20260724T090000\r\n"), "{body}");
+    assert!(body.contains("DTEND:20260724T093000Z\r\n"), "{body}");
+}
+
+/// The EXDATE that cancels an occurrence of a floating series is floating
+/// too, at the occurrence's wall time.
+#[tokio::test]
+async fn cancelling_a_floating_occurrence_writes_a_floating_exdate() {
+    let server = MockServer::start().await;
+    let series = FLOATING_ICS.replace(
+        "DTEND:20260724T093000\r\n",
+        "DTEND:20260724T093000\r\nRRULE:FREQ=WEEKLY\r\n",
+    );
+    mount_event(&server, &series).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    client(&server)
+        .exclude_occurrence("evt-1", None, "2026-07-31")
+        .await
+        .unwrap();
+    let body = put_body(&server).await;
+    assert!(body.contains("EXDATE:20260731T090000\r\n"), "{body}");
+}
+
+/// A caller's naive end means the same wall time the event's floating times do.
+#[tokio::test]
+async fn a_naive_end_on_a_floating_event_is_read_in_its_zone() {
+    let server = MockServer::start().await;
+    let london = FLOATING_ICS.replace(
+        "BEGIN:VCALENDAR\r\n",
+        "BEGIN:VCALENDAR\r\nX-WR-TIMEZONE:Europe/London\r\n",
+    );
+    mount_event(&server, &london).await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let longer = EventFields {
+        end: Some("2026-07-24 10:00"),
+        ..Default::default()
+    };
+    client(&server)
+        .update_event("evt-1", None, &longer)
+        .await
+        .unwrap();
+    let body = put_body(&server).await;
+    assert!(body.contains("X-WR-TIMEZONE:Europe/London\r\n"), "{body}");
+    assert!(body.contains("DTEND:20260724T100000\r\n"), "{body}");
+}
+
+/// A new start is read in the event's floating zone and stays floating, so
+/// the series' floating exclusions still match. Naming a zone is what moves an
+/// event out of floating time.
+#[tokio::test]
+async fn a_new_start_on_a_floating_event_stays_floating_unless_a_zone_is_named() {
+    for (tz, expected) in [
+        (None, "DTSTART:20260724T100000\r\n"),
+        (
+            Some("Europe/London"),
+            "DTSTART;TZID=Europe/London:20260724T100000\r\n",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        mount_event(&server, FLOATING_ICS).await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let moved = EventFields {
+            start: Some("2026-07-24 10:00"),
+            tzid: tz,
+            ..Default::default()
+        };
+        client(&server)
+            .update_event("evt-1", None, &moved)
+            .await
+            .unwrap();
+        let body = put_body(&server).await;
+        assert!(body.contains(expected), "{tz:?}: {body}");
+    }
 }
 
 #[tokio::test]
