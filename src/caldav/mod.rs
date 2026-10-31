@@ -1056,12 +1056,16 @@ impl CalDavClient {
         calendar: Option<&str>,
         fields: &EventFields<'_>,
     ) -> Result<Event> {
+        check_structured(fields)?;
         let summary = fields
             .summary
             .ok_or_else(|| Error::Server("summary is required to create an event".into()))?;
         let start_raw = fields
             .start
             .ok_or_else(|| Error::Server("start is required to create an event".into()))?;
+
+        let (start, end) = resolve_span(start_raw, fields, None)?;
+        check_rule(fields.recurrence, &start.spec(fields.tzid))?;
 
         let cal = self.find_calendar(calendar).await?;
         if cal.read_only {
@@ -1071,7 +1075,6 @@ impl CalDavClient {
             )));
         }
 
-        let (start, end) = resolve_span(start_raw, fields, None)?;
         let uid = uuid::Uuid::new_v4().to_string();
         let attendees = fields.attendees.unwrap_or(&[]).to_vec();
         let categories = fields.categories.unwrap_or(&[]).to_vec();
@@ -1128,46 +1131,18 @@ impl CalDavClient {
         calendar: Option<&str>,
         fields: &EventFields<'_>,
     ) -> Result<Event> {
+        check_structured(fields)?;
         let existing = self
             .get_event(uid, calendar)
             .await?
             .ok_or_else(|| Error::EventNotFound(uid.to_string()))?;
+        let (start, end) = check_update(&existing, fields)?;
 
         let summary = fields
             .summary
             .or(existing.summary.as_deref())
             .unwrap_or("(no title)");
         let tzid = fields.tzid.or(existing.start.tzid.as_deref());
-
-        // Unspecified start keeps the stored one; unspecified end follows the
-        // stored duration so moving an event doesn't silently resize it.
-        let (start, end) = match fields.start {
-            Some(raw) => resolve_span(raw, fields, Some(&existing))?,
-            None => {
-                let start = ResolvedTime {
-                    instant: existing.start.instant.ok_or_else(|| {
-                        Error::Server(
-                            "stored event has an unparseable start; set --start to fix it".into(),
-                        )
-                    })?,
-                    all_day: existing.all_day,
-                };
-                let end = match fields.end {
-                    Some(raw) => resolve_end(raw, tzid, start)?,
-                    None => match fields.duration_minutes {
-                        Some(mins) => ResolvedTime {
-                            instant: add_minutes(start.instant, mins)?,
-                            all_day: start.all_day,
-                        },
-                        None => ResolvedTime {
-                            instant: existing.end.instant.unwrap_or(start.instant),
-                            all_day: existing.all_day,
-                        },
-                    },
-                };
-                (start, end)
-            }
-        };
 
         let attendees = match fields.attendees {
             Some(a) => a.to_vec(),
@@ -1596,12 +1571,149 @@ impl CalDavClient {
     }
 }
 
+/// Refuse a line break in any caller-supplied value written outside a TEXT
+/// property. iCalendar escapes line breaks only in TEXT, so one anywhere else
+/// would end the property and let the rest of the value write properties, or
+/// whole components, of its own.
+fn check_structured(fields: &EventFields<'_>) -> Result<()> {
+    let attendees = fields.attendees.unwrap_or(&[]);
+    let values = [
+        ("url", fields.url),
+        ("status", fields.status),
+        ("tz", fields.tzid),
+        ("recurrence", fields.recurrence),
+    ]
+    .into_iter()
+    .chain(attendees.iter().flat_map(|a| {
+        [
+            ("attendee", Some(a.email.as_str())),
+            ("attendee name", a.name.as_deref()),
+            ("attendee role", a.role.as_deref()),
+            ("attendee status", a.status.as_deref()),
+        ]
+    }));
+    for (field, value) in values {
+        if value.is_some_and(|v| v.contains(['\r', '\n'])) {
+            return Err(Error::Server(format!(
+                "{field} cannot contain a line break"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The start and end an update would write: the caller's where given, else the
+/// stored ones, with an unspecified end following the stored duration so moving
+/// an event doesn't silently resize it.
+fn update_span(existing: &Event, fields: &EventFields<'_>) -> Result<(ResolvedTime, ResolvedTime)> {
+    if let Some(raw) = fields.start {
+        return resolve_span(raw, fields, Some(existing));
+    }
+    let tzid = fields.tzid.or(existing.start.tzid.as_deref());
+    let start = ResolvedTime {
+        instant: existing.start.instant.ok_or_else(|| {
+            Error::Server("stored event has an unparseable start; set --start to fix it".into())
+        })?,
+        all_day: existing.all_day,
+    };
+    let end = match fields.end {
+        Some(raw) => resolve_end(raw, tzid, start)?,
+        None => match fields.duration_minutes {
+            Some(mins) => ResolvedTime {
+                instant: add_minutes(start.instant, mins)?,
+                all_day: start.all_day,
+            },
+            None => ResolvedTime {
+                instant: existing.end.instant.unwrap_or(start.instant),
+                all_day: existing.all_day,
+            },
+        },
+    };
+    Ok((start, end))
+}
+
+/// Refuse an update that would write a value iCalendar cannot hold, or a
+/// recurrence that would stop expanding. Public so a PREVIEW can refuse what
+/// its CONFIRM would, before the user approves it.
+///
+/// A caller's rule is checked against the start being written. A stored rule
+/// is checked only when the start moves and the rule expanded before the move:
+/// an edit must not break a working series, but a stored rule that never
+/// parsed stays editable, or one odd event could never be changed again.
+pub fn check_update(
+    existing: &Event,
+    fields: &EventFields<'_>,
+) -> Result<(ResolvedTime, ResolvedTime)> {
+    check_structured(fields)?;
+    let span = update_span(existing, fields)?;
+    let tzid = fields.tzid.or(existing.start.tzid.as_deref());
+    let new_start = span.0.spec(tzid);
+    if fields.recurrence.is_some() {
+        check_rule(fields.recurrence, &new_start)?;
+        return Ok(span);
+    }
+    let (Some(rule), Some(source)) = (
+        existing.recurrence.as_deref(),
+        existing.recur_source.as_deref(),
+    ) else {
+        return Ok(span);
+    };
+    // Every rewrite renders DTSTART afresh, so compare what will be written
+    // with what is stored rather than guessing from which fields were passed.
+    let written = new_start.render("DTSTART");
+    let stored = source.lines().find(|line| line.starts_with("DTSTART"));
+    let extra = ical::recur_extra_lines(Some(source));
+    let worked = stored.is_some_and(|dtstart| recur::check_series(dtstart, rule, &extra).is_ok());
+    if stored != Some(written.as_str())
+        && worked
+        && let Err(e) = recur::check_series(&written, rule, &extra)
+    {
+        return Err(Error::Server(format!(
+            "this change rewrites the start as {written} and the series would stop expanding \
+             ({e}); pass `recurrence` with an UNTIL that matches the new start"
+        )));
+    }
+    Ok(span)
+}
+
+/// Refuse a caller's RRULE that would not expand, before it is written. It is
+/// checked the way expansion will read it, against the `DTSTART` being written,
+/// so a rule accepted here is one that shows up.
+fn check_rule(rule: Option<&str>, start: &TimeSpec<'_>) -> Result<()> {
+    let Some(rule) = rule.and_then(ical::rule_value) else {
+        return Ok(());
+    };
+    recur::check_series(&start.render("DTSTART"), rule, &[]).map_err(|reason| {
+        let unexpandable_part = rule.split(';').any(|part| {
+            let key = part
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_uppercase();
+            key.starts_with("X-") || key == "RSCALE"
+        });
+        let hint = if reason.contains("`UNTIL`") {
+            " With a timed start, write UNTIL as a UTC time (UNTIL=20261231T235959Z); \
+             with an all-day start, as a date (UNTIL=20261231)."
+        } else if unexpandable_part {
+            " Remove any X- or RSCALE parts; this calendar cannot expand them."
+        } else {
+            ""
+        };
+        Error::Server(format!(
+            "recurrence {rule:?} is not a rule this calendar can expand: {reason}.{hint}"
+        ))
+    })
+}
+
 /// The most of a successful response this client reads. Every body is held
 /// whole while it is parsed, and a peak read holds it several times over (the
 /// bytes, the text, the XML tree, the events), so this bounds what one server
 /// can make the process allocate. A multistatus runs to a few KB per event, so
 /// it still fits a collection of over ten thousand.
 const MAX_BODY: usize = MAX_BODY_MIB * 1024 * 1024;
+
 pub(crate) const MAX_BODY_MIB: usize = 32;
 
 /// The most of an error response read, of which [`truncate`] keeps a prefix.
@@ -1666,7 +1778,7 @@ async fn read_capped(
 
 /// A user-supplied time resolved to an instant plus its all-day-ness.
 #[derive(Debug, Clone, Copy)]
-struct ResolvedTime {
+pub struct ResolvedTime {
     instant: DateTime<Utc>,
     all_day: bool,
 }
@@ -2516,6 +2628,124 @@ END:VCALENDAR
         assert!(!matches_query(&e, "unrelated"));
         // An empty needle matches everything.
         assert!(matches_query(&e, ""));
+    }
+
+    #[test]
+    fn a_line_break_in_a_structured_value_is_refused() {
+        let url = EventFields {
+            url: Some("https://x.test/\r\nBEGIN:VEVENT"),
+            ..Default::default()
+        };
+        assert!(
+            check_structured(&url)
+                .unwrap_err()
+                .to_string()
+                .contains("url")
+        );
+        let attendees = [Attendee {
+            email: "a@x.test".into(),
+            name: Some("Eve\nX".into()),
+            role: None,
+            status: None,
+        }];
+        let invite = EventFields {
+            attendees: Some(&attendees),
+            ..Default::default()
+        };
+        assert!(check_structured(&invite).is_err());
+        // TEXT values are escaped on the way out, so line breaks are theirs.
+        let text = EventFields {
+            description: Some("one\ntwo"),
+            ..Default::default()
+        };
+        assert!(check_structured(&text).is_ok());
+    }
+
+    fn stored(dtstart: &str, rule: &str) -> Event {
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:S\r\n{dtstart}\r\nRRULE:{rule}\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        ical::parse_events(&ics, "Home", "/c/", "/c/s.ics", None).remove(0)
+    }
+
+    /// Moving the start of a working series must not leave a rule that no
+    /// longer expands; a stored rule that never expanded stays editable.
+    #[test]
+    fn an_update_that_breaks_a_working_series_is_refused() {
+        let bins = stored("DTSTART;VALUE=DATE:20260706", "FREQ=WEEKLY;UNTIL=20261231");
+        let timed = EventFields {
+            start: Some("2026-07-06T09:00:00Z"),
+            all_day: Some(false),
+            ..Default::default()
+        };
+        let err = check_update(&bins, &timed).unwrap_err();
+        assert!(err.to_string().contains("`recurrence`"), "{err}");
+        // Retitling moves nothing, so the stored rule is not re-read.
+        let retitle = EventFields {
+            summary: Some("Bins"),
+            ..Default::default()
+        };
+        assert!(check_update(&bins, &retitle).is_ok());
+
+        // A floating series takes a floating UNTIL; given a zone, it needs a UTC one.
+        let floating = stored(
+            "DTSTART:20260706T090000",
+            "FREQ=WEEKLY;UNTIL=20261231T090000",
+        );
+        let zoned = EventFields {
+            tzid: Some("Europe/London"),
+            ..Default::default()
+        };
+        assert!(check_update(&floating, &zoned).is_err());
+
+        // Any rewrite renders a floating start as UTC, so even a retitle would
+        // break this series.
+        assert!(check_update(&floating, &retitle).is_err());
+
+        let odd = stored("DTSTART:20260706T090000Z", "FREQ=WEEKLY;X-ODD=1");
+        let moved = EventFields {
+            start: Some("2026-07-07T09:00:00Z"),
+            ..Default::default()
+        };
+        assert!(check_update(&odd, &moved).is_ok());
+    }
+
+    #[test]
+    fn a_rule_that_would_not_expand_is_refused_with_the_fix() {
+        let timed = TimeSpec {
+            instant: Utc.with_ymd_and_hms(2026, 7, 6, 8, 0, 0).unwrap(),
+            all_day: false,
+            tzid: Some("Europe/London"),
+        };
+        assert!(check_rule(Some("FREQ=WEEKLY;BYDAY=MO"), &timed).is_ok());
+        assert!(check_rule(Some("FREQ=WEEKLY;UNTIL=20261231T235959Z"), &timed).is_ok());
+        let err = check_rule(Some("FREQ=WEEKLY;UNTIL=20261231"), &timed).unwrap_err();
+        assert!(err.to_string().contains("UNTIL=20261231T235959Z"), "{err}");
+        assert!(check_rule(Some("FREQ=FORTNIGHTLY"), &timed).is_err());
+        let err = check_rule(Some("FREQ=MONTHLY;RSCALE=CHINESE"), &timed).unwrap_err();
+        assert!(err.to_string().contains("RSCALE"), "{err}");
+        let every = |n: u32| (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let dense = format!("FREQ=YEARLY;BYHOUR={};BYMINUTE={}", every(24), every(60));
+        assert!(
+            check_rule(Some(&dense), &timed).is_err(),
+            "would show only its master"
+        );
+
+        let all_day = TimeSpec {
+            all_day: true,
+            ..timed
+        };
+        assert!(check_rule(Some("FREQ=WEEKLY;UNTIL=20261231"), &all_day).is_ok());
+        assert!(check_rule(None, &timed).is_ok());
+        // What is checked is what is written: trimmed, prefix dropped.
+        assert_eq!(
+            ical::rule_value("  RRULE: FREQ=WEEKLY "),
+            Some("FREQ=WEEKLY")
+        );
+        assert_eq!(ical::rule_value("   "), None);
+        let err = check_rule(Some("FREQ=WEEKLY;BYDAYS=MO"), &timed).unwrap_err();
+        assert!(!err.to_string().contains("RSCALE"), "{err}");
     }
 
     #[test]

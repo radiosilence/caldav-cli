@@ -224,6 +224,34 @@ pub fn expand_all(
     Ok(out)
 }
 
+/// Whether a series of `dtstart` (a full `DTSTART` content line), `rule` and
+/// the `extra` recurrence lines parses the way expansion will read it; the
+/// reason when it does not.
+pub fn check_series(
+    dtstart: &str,
+    rule: &str,
+    extra: &[String],
+) -> std::result::Result<(), String> {
+    let mut source = format!("{dtstart}\nRRULE:{rule}");
+    for line in extra {
+        source.push('\n');
+        source.push_str(line);
+    }
+    let set: RRuleSet = pin_dates_to_utc(&source)
+        .parse()
+        .map_err(|e: rrule::RRuleError| e.to_string().trim_end_matches('.').to_string())?;
+    match set
+        .get_rrule()
+        .iter()
+        .any(|rule| period_dates(rule) > MAX_PERIOD_DATES)
+    {
+        true => Err(format!(
+            "it would generate more than {MAX_PERIOD_DATES} dates per period"
+        )),
+        false => Ok(()),
+    }
+}
+
 /// Pin date-valued recurrence anchors to UTC midnight.
 ///
 /// An all-day series' `DTSTART` is a *date* — no timezone, the same day
