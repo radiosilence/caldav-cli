@@ -43,9 +43,12 @@ pub fn to_gql_error(e: LoadError) -> async_graphql::Error {
 
 /// Loads the account's calendar collections.
 ///
-/// Every calendar question — by id, by name, the default, which collections a
-/// range query should span — is answered by filtering this one list, so there is
-/// one loader keyed by `()` and each question is in-memory work on its result.
+/// Every calendar question — by id, by name, which collections a range query
+/// should span — is answered by filtering this one list, so there is one loader
+/// keyed by `()` and each question is in-memory work on its result. The
+/// account's default is flagged only when the listing names it; finding it
+/// otherwise costs a second request, which [`super::types::calendars_with_default`]
+/// makes only for the fields that ask.
 ///
 /// This is the loader that fixes a real bug. [`crate::caldav::CalDavClient`]
 /// memoises the listing for its whole life and clients are pooled per
@@ -59,7 +62,7 @@ impl Loader<()> for CalendarListLoader {
     type Error = LoadError;
 
     async fn load(&self, _keys: &[()]) -> Result<HashMap<(), Arc<Vec<Calendar>>>, Self::Error> {
-        let calendars = self.0.list_calendars().await.map_err(Arc::new)?;
+        let calendars = self.0.calendar_listing().await.map_err(Arc::new)?;
         Ok(HashMap::from([((), Arc::new(calendars))]))
     }
 }

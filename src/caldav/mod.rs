@@ -376,6 +376,15 @@ impl CalDavClient {
     /// don't change.
     #[instrument(skip(self))]
     pub async fn list_calendars(&self) -> Result<Vec<Calendar>> {
+        let mut calendars = self.calendar_listing().await?;
+        self.resolve_default(&mut calendars).await;
+        Ok(calendars)
+    }
+
+    /// The calendar collections, with the default flagged only when the
+    /// listing itself names it. One round trip; [`Self::resolve_default`] is the
+    /// second, for callers that need to know the default.
+    pub async fn calendar_listing(&self) -> Result<Vec<Calendar>> {
         const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:ic="http://apple.com/ns/ical/">
   <d:prop>
@@ -409,18 +418,23 @@ impl CalDavClient {
             let _ = self.inbox.set(inbox);
         }
 
-        // Servers disagree on where they'll answer this. Most volunteer it in
-        // the listing above; RFC 6638 only requires it on the scheduling inbox.
-        // Ask there when the free answer is missing — one extra round trip, and
-        // only when needed.
-        let default = match parse_default_href(&doc) {
-            Some(href) => Some(href),
-            None => self.default_calendar_from_inbox().await,
-        };
-        if let Some(href) = default {
+        if let Some(href) = parse_default_href(&doc) {
             mark_default(&mut calendars, &href);
         }
         Ok(calendars)
+    }
+
+    /// Flag the account's default calendar in `calendars` when the listing did
+    /// not. Servers disagree on where they answer this: most volunteer it in
+    /// the listing, but RFC 6638 only requires it on the scheduling inbox, so
+    /// this asks there, one round trip and only when no calendar is flagged.
+    pub async fn resolve_default(&self, calendars: &mut [Calendar]) {
+        if calendars.iter().any(|c| c.is_default) {
+            return;
+        }
+        if let Some(href) = self.default_calendar_from_inbox().await {
+            mark_default(calendars, &href);
+        }
     }
 
     /// Ask the scheduling inbox for the default calendar, the one place RFC

@@ -77,7 +77,9 @@ impl CalendarMutation {
             color: color.as_deref(),
             order,
         };
-        match client.create_calendar(&name, &fields).await {
+        let written = client.create_calendar(&name, &fields).await;
+        types::calendars_changed(ctx).await?;
+        match written {
             Ok(calendar) => Ok(GqlCalendarResult::done(calendar)),
             Err(e) => Ok(GqlCalendarResult::failed(e.to_string())),
         }
@@ -136,7 +138,9 @@ impl CalendarMutation {
             return Ok(GqlCalendarResult::failed(msg));
         }
 
-        match client.update_calendar(&id, &fields).await {
+        let written = client.update_calendar(&id, &fields).await;
+        types::calendars_changed(ctx).await?;
+        match written {
             Ok(calendar) => Ok(GqlCalendarResult::done(calendar)),
             Err(e) => Ok(GqlCalendarResult::failed(e.to_string())),
         }
@@ -202,7 +206,9 @@ impl CalendarMutation {
             return Ok(GqlCalendarResult::failed(msg));
         }
 
-        match client.delete_calendar(&id).await {
+        let written = client.delete_calendar(&id).await;
+        types::calendars_changed(ctx).await?;
+        match written {
             Ok(calendar) => Ok(GqlCalendarResult::done(calendar)),
             Err(e) => Ok(GqlCalendarResult::failed(e.to_string())),
         }
@@ -226,13 +232,15 @@ impl CalendarMutation {
         #[graphql(desc = "Calendar name or id to make the default")] id: String,
     ) -> Result<GqlCalendarResult> {
         let client = ctx.data::<SharedClient>()?;
-        let previous = types::all_calendars(ctx)
+        let previous = types::calendars_with_default(ctx)
             .await?
             .iter()
             .find(|c| c.is_default)
             .map(|c| c.name.clone());
 
-        match client.set_default_calendar(&id).await {
+        let moved = client.set_default_calendar(&id).await;
+        types::calendars_changed(ctx).await?;
+        match moved {
             Ok(calendar) => Ok(GqlCalendarResult {
                 previous_default: previous,
                 ..GqlCalendarResult::done(calendar)

@@ -66,11 +66,15 @@ impl QueryRoot {
         // The same fallback `createEvent` applies, so asking where an event
         // will go and then creating one can't disagree.
         let id = id.or_else(|| ctx.data_opt::<DefaultCalendar>().and_then(|d| d.0.clone()));
-        let calendars = all_calendars(ctx).await?;
-        Ok(GqlCalendar::from(resolve_calendar(
-            &calendars,
-            id.as_deref(),
-        )?))
+        // Only "the default calendar" needs the account's default resolved; a
+        // blank id means it as much as an absent one.
+        let id = id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        Ok(match id {
+            Some(id) => GqlCalendar::from(resolve_calendar(&all_calendars(ctx).await?, Some(id))?),
+            None => {
+                GqlCalendar::resolved(resolve_calendar(&calendars_with_default(ctx).await?, None)?)
+            }
+        })
     }
 
     /// Events in a time window, across every calendar unless one is named.

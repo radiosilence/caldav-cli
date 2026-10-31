@@ -1,0 +1,1 @@
+- **Listing calendars takes one round trip on iCloud.** Servers that name the default calendar only on the scheduling inbox cost a second request on every read. The GraphQL API now asks for the default only when a query needs it: `isDefault`, `calendar` with no id, or setting a new default.
