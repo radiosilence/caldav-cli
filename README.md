@@ -231,6 +231,10 @@ Two consequences worth knowing, both stated in the schema:
 
 - **`totalCount` is free and exact.** CalDAV has no windowed query — the range
   arrives whole — so the count is a length, not extra work for the server.
+  Expansion is bounded instead: a series yields at most 750 occurrences per
+  window, and a window that would expand to more than 25,000 is refused with an
+  error rather than cut short, so a count that comes back is never a partial
+  one.
 - **Paging is slicing, and a cursor lasts as long as its event.** If the event
   is gone you get a "restart pagination" error, not a quietly different page.
 

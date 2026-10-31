@@ -50,6 +50,14 @@ pub enum Error {
     #[error("Rate limited. Try again later.")]
     RateLimited,
 
+    /// Raised instead of truncating, so a partial expansion is never mistaken
+    /// for the whole window.
+    #[error(
+        "the window holds more than {0} occurrences of recurring events; narrow the \
+         window, name a calendar, or read without expanding recurrences"
+    )]
+    TooManyOccurrences(usize),
+
     #[error("Server error: {0}")]
     Server(String),
 }

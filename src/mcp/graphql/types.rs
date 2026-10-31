@@ -13,14 +13,13 @@ use chrono::{DateTime, Duration, Utc};
 
 use super::connection::{
     EventConnection, EventQuery, PageArgs, event_cursor, events_connection, events_connection_of,
-    page_complexity,
+    load_windows, page_complexity, read_targets,
 };
 use super::filter::{EventFilter, EventSort};
 use super::loaders::{Calendars, EventResources, Resource, to_gql_error};
 use crate::caldav::recur;
 use crate::commands::RangeArgs;
 use crate::models::{Attendee, BusyPeriod, Calendar, Event, EventTime};
-use crate::util;
 
 /// Page size used when a connection names no `first`/`last`.
 pub(crate) const DEFAULT_PAGE: u32 = 25;
@@ -438,7 +437,7 @@ impl GqlEvent {
         }
         .resolve()?;
         let events = match self.0.recurrence {
-            Some(_) => recur::expand_all(vec![self.0.clone()], from, to),
+            Some(_) => recur::expand_all(vec![self.0.clone()], from, to)?,
             None => Vec::new(),
         };
         events_connection_of(
@@ -484,40 +483,17 @@ impl GqlEvent {
         };
         // An event we couldn't anchor to an instant has no window to search.
         let Some((from, to)) = conflict_window(&self.0) else {
-            return events_connection_of(Vec::new(), args, None, None, 0);
+            return events_connection_of(Vec::<Event>::new(), args, None, None, 0);
         };
 
-        let day = events_connection(
-            ctx,
-            PageArgs {
-                after: None,
-                before: None,
-                // The candidates get filtered down to actual overlaps below, so
-                // the day has to arrive whole rather than a page at a time.
-                first: Some(MAX_PAGE as i32),
-                last: None,
-            },
-            EventQuery {
-                calendar,
-                range: RangeArgs {
-                    start: Some(util::format_rfc3339(from)),
-                    end: Some(util::format_rfc3339(to)),
-                    days: None,
-                    tz: None,
-                },
-                expand: true,
-                filter: None,
-                sort: None,
-            },
-        )
-        .await?;
-
-        let calendars_queried = day.additional_fields.calendars_queried;
+        // The whole day, unpaged: candidates are filtered down to actual
+        // overlaps here, so a page of them would lose clashes on a busy day.
+        let targets = read_targets(ctx, calendar.as_deref()).await?;
+        let loaded = load_windows(ctx, &targets, from, to, true).await?;
         let me = event_cursor(&self.0);
-        let clashing: Vec<Event> = day
-            .edges
-            .into_iter()
-            .map(|edge| edge.node.0)
+        let clashing: Vec<&Event> = loaded
+            .iter()
+            .flat_map(|events| events.iter())
             .filter(|other| event_cursor(other) != me && overlaps(&self.0, other))
             .collect();
 
@@ -526,7 +502,7 @@ impl GqlEvent {
             args,
             filter.as_ref(),
             sort.as_deref(),
-            calendars_queried,
+            targets.len() as u64,
         )
     }
 }

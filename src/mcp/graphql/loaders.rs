@@ -115,6 +115,7 @@ impl Loader<Window> for EventWindowLoader {
                 Ok(events) => {
                     out.insert(key, Arc::new(events));
                 }
+                Err(e @ Error::TooManyOccurrences(_)) => return Err(Arc::new(e)),
                 // One unreadable calendar (shared, or a server hiccup) shouldn't
                 // sink the whole query. An absent key resolves to an empty list,
                 // matching what the CLI does with the same failure.

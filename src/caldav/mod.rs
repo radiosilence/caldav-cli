@@ -694,7 +694,7 @@ impl CalDavClient {
         if expand {
             // Idempotent: anything the server already expanded arrives without
             // an RRULE and passes straight through.
-            events = recur::expand_all(events, start, end);
+            events = recur::expand_all(events, start, end)?;
         }
         // Expansion can hand back instances just outside the window; the range
         // the caller asked for is the range they get.
@@ -799,20 +799,16 @@ impl CalDavClient {
             .collect();
         let results = fan_out(calls).await;
 
-        let mut all: Vec<Event> = results
-            .into_iter()
-            .zip(&targets)
-            // One unreadable calendar (shared, or a server hiccup) should not
-            // sink the whole agenda.
-            .filter_map(|(events, cal)| {
-                events
-                    .inspect_err(
-                        |e| tracing::warn!(calendar = %cal.name, error = %e, "skipping calendar"),
-                    )
-                    .ok()
-            })
-            .flatten()
-            .collect();
+        let mut all: Vec<Event> = Vec::new();
+        for (events, cal) in results.into_iter().zip(&targets) {
+            match events {
+                Ok(events) => all.extend(events),
+                Err(e @ Error::TooManyOccurrences(_)) => return Err(e),
+                // One unreadable calendar (shared, or a server hiccup) should
+                // not sink the whole agenda.
+                Err(e) => tracing::warn!(calendar = %cal.name, error = %e, "skipping calendar"),
+            }
+        }
 
         all.sort_by_key(|e| e.start.sort_key());
         all.truncate(limit.min(MAX_EVENTS));
@@ -1712,7 +1708,7 @@ pub fn resolve_occurrence(
         vec![rule_only],
         parsed.instant - Duration::days(1),
         parsed.instant + Duration::days(2),
-    )
+    )?
     .into_iter()
     .filter_map(|e| e.start.instant)
     .collect();
