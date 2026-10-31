@@ -693,7 +693,7 @@ impl CalDavClient {
             // Not every server implements <expand> — iCloud is unreliable
             // here. Retry without it and expand client-side below, so the
             // caller gets occurrences either way.
-            Err(e) if expand => {
+            Err(e) if expand && worth_retrying_unexpanded(&e) => {
                 debug!(error = %e, calendar = %calendar.name, "expand unsupported, retrying");
                 let retry = self.query_body(start, end, false);
                 self.dav(
@@ -1267,11 +1267,26 @@ impl CalDavClient {
                     "something already exists at {dest_url} — the event was not moved"
                 )));
             }
-            Ok(response) => {
+            // The statuses a server answers when it does not do MOVE across
+            // collections. Anything else is a real failure, and copying would
+            // only meet it again, or worse, half succeed.
+            Ok(response) if matches!(response.status().as_u16(), 403 | 405 | 501 | 502) => {
                 let status = response.status().as_u16();
                 debug!(status, "MOVE refused, falling back to copy and delete");
                 self.copy_then_delete(&source_url, &dest_url, existing.etag.as_deref())
                     .await?;
+            }
+            Ok(response) => {
+                return Err(match response.status().as_u16() {
+                    401 => Error::InvalidCredentials("server rejected the username/app password"),
+                    429 => Error::RateLimited,
+                    status => Error::Dav {
+                        method: "MOVE".into(),
+                        url: source_url,
+                        status,
+                        body: error_body(response).await,
+                    },
+                });
             }
             Err(e) => return Err(e.into()),
         }
@@ -1705,6 +1720,23 @@ fn check_rule(rule: Option<&str>, start: &TimeSpec<'_>) -> Result<()> {
             "recurrence {rule:?} is not a rule this calendar can expand: {reason}.{hint}"
         ))
     })
+}
+
+/// Whether a failed `<expand>` query is worth asking again without it.
+///
+/// Servers refuse `<expand>` in ways nobody has catalogued, so this names what
+/// is not a refusal rather than what is. A rate limit fails the same way twice,
+/// and a timeout or a refused connection would double the wait for the same
+/// answer. A 403 arrives as [`Error::InvalidCredentials`] but is retried: by
+/// now discovery has authenticated, so it is a refusal of `<expand>`. A
+/// response too large is retried too: unexpanded, it holds one master per
+/// series rather than one event per occurrence.
+fn worth_retrying_unexpanded(error: &Error) -> bool {
+    match error {
+        Error::RateLimited => false,
+        Error::Http(e) => !(e.is_timeout() || e.is_connect()),
+        _ => true,
+    }
 }
 
 /// The most of a successful response this client reads. Every body is held
