@@ -247,10 +247,19 @@ pub fn expand_all(
 /// way expansion will read it; the reason when it does not.
 pub fn check_rule(dtstart: &str, rule: &str) -> std::result::Result<(), String> {
     let source = format!("{dtstart}\nRRULE:{}", rule.trim_start_matches("RRULE:"));
-    pin_dates_to_utc(&source)
-        .parse::<RRuleSet>()
-        .map(drop)
-        .map_err(|e| e.to_string().trim_end_matches('.').to_string())
+    let set: RRuleSet = pin_dates_to_utc(&source)
+        .parse()
+        .map_err(|e: rrule::RRuleError| e.to_string().trim_end_matches('.').to_string())?;
+    match set
+        .get_rrule()
+        .iter()
+        .any(|rule| period_dates(rule) > MAX_PERIOD_DATES)
+    {
+        true => Err(format!(
+            "it would generate more than {MAX_PERIOD_DATES} dates per period"
+        )),
+        false => Ok(()),
+    }
 }
 
 fn pin_dates_to_utc(source: &str) -> String {

@@ -1044,6 +1044,9 @@ impl CalDavClient {
             .start
             .ok_or_else(|| Error::Server("start is required to create an event".into()))?;
 
+        let (start, end) = resolve_span(start_raw, fields, None)?;
+        check_rule(fields.recurrence, &start.spec(fields.tzid))?;
+
         let cal = self.find_calendar(calendar).await?;
         if cal.read_only {
             return Err(Error::Server(format!(
@@ -1052,8 +1055,6 @@ impl CalDavClient {
             )));
         }
 
-        let (start, end) = resolve_span(start_raw, fields, None)?;
-        check_rule(fields.recurrence, &start.spec(fields.tzid))?;
         let uid = uuid::Uuid::new_v4().to_string();
         let attendees = fields.attendees.unwrap_or(&[]).to_vec();
         let categories = fields.categories.unwrap_or(&[]).to_vec();
@@ -1110,47 +1111,19 @@ impl CalDavClient {
         calendar: Option<&str>,
         fields: &EventFields<'_>,
     ) -> Result<Event> {
+        check_structured(fields)?;
         let existing = self
             .get_event(uid, calendar)
             .await?
             .ok_or_else(|| Error::EventNotFound(uid.to_string()))?;
-        check_structured(fields)?;
+        check_update(&existing, fields)?;
 
         let summary = fields
             .summary
             .or(existing.summary.as_deref())
             .unwrap_or("(no title)");
         let tzid = fields.tzid.or(existing.start.tzid.as_deref());
-
-        // Unspecified start keeps the stored one; unspecified end follows the
-        // stored duration so moving an event doesn't silently resize it.
-        let (start, end) = match fields.start {
-            Some(raw) => resolve_span(raw, fields, Some(&existing))?,
-            None => {
-                let start = ResolvedTime {
-                    instant: existing.start.instant.ok_or_else(|| {
-                        Error::Server(
-                            "stored event has an unparseable start; set --start to fix it".into(),
-                        )
-                    })?,
-                    all_day: existing.all_day,
-                };
-                let end = match fields.end {
-                    Some(raw) => resolve_end(raw, tzid, start)?,
-                    None => match fields.duration_minutes {
-                        Some(mins) => ResolvedTime {
-                            instant: add_minutes(start.instant, mins)?,
-                            all_day: start.all_day,
-                        },
-                        None => ResolvedTime {
-                            instant: existing.end.instant.unwrap_or(start.instant),
-                            all_day: existing.all_day,
-                        },
-                    },
-                };
-                (start, end)
-            }
-        };
+        let (start, end) = update_span(&existing, fields)?;
 
         let attendees = match fields.attendees {
             Some(a) => a.to_vec(),
@@ -1166,10 +1139,6 @@ impl CalDavClient {
             Some(_) => Vec::new(),
             None => ical::recur_extra_lines(existing.recur_source.as_deref()),
         };
-
-        // Only what the caller sent is checked. A stored rule is written back as
-        // the server holds it, or one odd event could never be edited again.
-        check_rule(fields.recurrence, &start.spec(tzid))?;
 
         let ics = ical::build_vcalendar(&VEventSpec {
             uid,
@@ -1610,6 +1579,72 @@ fn check_structured(fields: &EventFields<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The start and end an update would write: the caller's where given, else the
+/// stored ones, with an unspecified end following the stored duration so moving
+/// an event doesn't silently resize it.
+fn update_span(existing: &Event, fields: &EventFields<'_>) -> Result<(ResolvedTime, ResolvedTime)> {
+    if let Some(raw) = fields.start {
+        return resolve_span(raw, fields, Some(existing));
+    }
+    let tzid = fields.tzid.or(existing.start.tzid.as_deref());
+    let start = ResolvedTime {
+        instant: existing.start.instant.ok_or_else(|| {
+            Error::Server("stored event has an unparseable start; set --start to fix it".into())
+        })?,
+        all_day: existing.all_day,
+    };
+    let end = match fields.end {
+        Some(raw) => resolve_end(raw, tzid, start)?,
+        None => match fields.duration_minutes {
+            Some(mins) => ResolvedTime {
+                instant: add_minutes(start.instant, mins)?,
+                all_day: start.all_day,
+            },
+            None => ResolvedTime {
+                instant: existing.end.instant.unwrap_or(start.instant),
+                all_day: existing.all_day,
+            },
+        },
+    };
+    Ok((start, end))
+}
+
+/// Refuse an update that would write a value iCalendar cannot hold, or a
+/// recurrence that would stop expanding. Public so a PREVIEW can refuse what
+/// its CONFIRM would, before the user approves it.
+///
+/// A caller's rule is checked against the start being written. A stored rule
+/// is checked only when the start moves and the rule expanded before the move:
+/// an edit must not break a working series, but a stored rule that never
+/// parsed stays editable, or one odd event could never be changed again.
+pub fn check_update(existing: &Event, fields: &EventFields<'_>) -> Result<()> {
+    check_structured(fields)?;
+    let (start, _) = update_span(existing, fields)?;
+    let tzid = fields.tzid.or(existing.start.tzid.as_deref());
+    let new_start = start.spec(tzid);
+    if fields.recurrence.is_some() {
+        return check_rule(fields.recurrence, &new_start);
+    }
+    let (Some(rule), Some(source)) = (
+        existing.recurrence.as_deref(),
+        existing.recur_source.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    let moved = fields.start.is_some() || fields.all_day.is_some();
+    let old_start = source.lines().find(|line| line.starts_with("DTSTART"));
+    let worked = old_start.is_some_and(|dtstart| recur::check_rule(dtstart, rule).is_ok());
+    match moved && worked {
+        true => check_rule(Some(rule), &new_start).map_err(|e| {
+            Error::Server(format!(
+                "moving the start would stop the series expanding ({e}); pass `recurrence` with \
+                 an UNTIL that matches the new start"
+            ))
+        }),
+        false => Ok(()),
+    }
+}
+
 /// Refuse a caller's RRULE that would not expand, before it is written. It is
 /// checked the way expansion will read it, against the `DTSTART` being written,
 /// so a rule accepted here is one that shows up.
@@ -1618,12 +1653,13 @@ fn check_rule(rule: Option<&str>, start: &TimeSpec<'_>) -> Result<()> {
         return Ok(());
     };
     recur::check_rule(&start.render("DTSTART"), rule).map_err(|reason| {
-        let hint = match reason.contains("`UNTIL`") {
-            true => {
-                " With a timed start, write UNTIL as a UTC time (UNTIL=20261231T235959Z); \
-                 with an all-day start, as a date (UNTIL=20261231)."
-            }
-            false => "",
+        let hint = if reason.contains("`UNTIL`") {
+            " With a timed start, write UNTIL as a UTC time (UNTIL=20261231T235959Z); \
+             with an all-day start, as a date (UNTIL=20261231)."
+        } else if reason.contains("not a valid property parameter") {
+            " Remove any X- or RSCALE parts; this calendar cannot expand them."
+        } else {
+            ""
         };
         Error::Server(format!(
             "recurrence {rule:?} is not a rule this calendar can expand: {reason}.{hint}"
@@ -2516,6 +2552,41 @@ END:VCALENDAR
         assert!(check_structured(&text).is_ok());
     }
 
+    fn stored(dtstart: &str, rule: &str) -> Event {
+        let ics = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:S\r\n{dtstart}\r\nRRULE:{rule}\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        ical::parse_events(&ics, "Home", "/c/", "/c/s.ics", None).remove(0)
+    }
+
+    /// Moving the start of a working series must not leave a rule that no
+    /// longer expands; a stored rule that never expanded stays editable.
+    #[test]
+    fn an_update_that_breaks_a_working_series_is_refused() {
+        let bins = stored("DTSTART;VALUE=DATE:20260706", "FREQ=WEEKLY;UNTIL=20261231");
+        let timed = EventFields {
+            start: Some("2026-07-06T09:00:00Z"),
+            all_day: Some(false),
+            ..Default::default()
+        };
+        let err = check_update(&bins, &timed).unwrap_err();
+        assert!(err.to_string().contains("`recurrence`"), "{err}");
+        // Retitling moves nothing, so the stored rule is not re-read.
+        let retitle = EventFields {
+            summary: Some("Bins"),
+            ..Default::default()
+        };
+        assert!(check_update(&bins, &retitle).is_ok());
+
+        let odd = stored("DTSTART:20260706T090000Z", "FREQ=WEEKLY;X-ODD=1");
+        let moved = EventFields {
+            start: Some("2026-07-07T09:00:00Z"),
+            ..Default::default()
+        };
+        assert!(check_update(&odd, &moved).is_ok());
+    }
+
     #[test]
     fn a_rule_that_would_not_expand_is_refused_with_the_fix() {
         let timed = TimeSpec {
@@ -2528,6 +2599,14 @@ END:VCALENDAR
         let err = check_rule(Some("FREQ=WEEKLY;UNTIL=20261231"), &timed).unwrap_err();
         assert!(err.to_string().contains("UNTIL=20261231T235959Z"), "{err}");
         assert!(check_rule(Some("FREQ=FORTNIGHTLY"), &timed).is_err());
+        let err = check_rule(Some("FREQ=MONTHLY;RSCALE=CHINESE"), &timed).unwrap_err();
+        assert!(err.to_string().contains("RSCALE"), "{err}");
+        let every = |n: u32| (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let dense = format!("FREQ=YEARLY;BYHOUR={};BYMINUTE={}", every(24), every(60));
+        assert!(
+            check_rule(Some(&dense), &timed).is_err(),
+            "would show only its master"
+        );
 
         let all_day = TimeSpec {
             all_day: true,

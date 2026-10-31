@@ -711,7 +711,7 @@ pub fn build_vcalendar(spec: &VEventSpec<'_>) -> String {
     }
     // Already complete content lines, straight off the wire — not escaped, and
     // only meaningful next to the RRULE they qualify.
-    lines.extend(spec.recur_extra.iter().cloned());
+    lines.extend(spec.recur_extra.iter().map(|line| one_line(line)));
     if !spec.categories.is_empty() {
         let joined: Vec<String> = spec.categories.iter().map(|c| escape_text(c)).collect();
         lines.push(format!("CATEGORIES:{}", joined.join(",")));
@@ -986,14 +986,35 @@ DTSTART:20260724T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\nEND:VCALENDAR\
             sequence: 0,
             stamp,
         });
-        let names: Vec<&str> = ics.lines().map(line_name).collect();
-        for injected in ["BEGIN:VTODO", "ATTACH", "RDATE"] {
+        let ics = ics
+            + &build_vcalendar(&VEventSpec {
+                uid: "u",
+                summary: "s",
+                start: TimeSpec { ..at },
+                end: TimeSpec { ..at },
+                description: None,
+                location: None,
+                url: None,
+                status: None,
+                recurrence: None,
+                recur_extra: &["EXDATE:20260101T000000Z\rRDATE:20260102T000000Z".to_string()],
+                attendees: &[],
+                organizer: None,
+                categories: &[],
+                sequence: 0,
+                stamp,
+            });
+        let names: Vec<&str> = ics.split(['\r', '\n']).map(line_name).collect();
+        for injected in ["ATTACH", "RDATE"] {
             assert!(
                 !names.contains(&injected),
                 "{injected} became a property:\n{ics}"
             );
         }
-        assert_eq!(names.iter().filter(|n| **n == "END").count(), 2);
+        // Two documents, each one VCALENDAR around one VEVENT.
+        for delimiter in ["BEGIN", "END"] {
+            assert_eq!(names.iter().filter(|n| **n == delimiter).count(), 4, "{ics}");
+        }
     }
 
     #[test]
