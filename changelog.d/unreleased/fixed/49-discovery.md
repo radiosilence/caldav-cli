@@ -1,0 +1,1 @@
+- **Discovery and UID lookups do less repeated work.** The calendar listing is parsed once rather than up to three times, the scheduling inbox is remembered once found, and a calendar whose server refuses UID filters is not asked again, so later lookups there scan directly instead of being refused first.

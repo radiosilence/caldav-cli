@@ -339,10 +339,13 @@ fn vevent_blocks(lines: &[String]) -> Vec<Vec<ContentLine>> {
 /// The `X-WR-TIMEZONE` id, used to anchor floating times. Falls back to UTC; a
 /// `VTIMEZONE` alone is not consulted.
 fn calendar_default_tz(lines: &[String]) -> Tz {
+    // Only the one property is wanted, so lines are matched on their name
+    // before any of them is parsed.
     lines
         .iter()
+        .filter(|l| line_name(l).trim().eq_ignore_ascii_case("X-WR-TIMEZONE"))
         .filter_map(|l| parse_content_line(l))
-        .find(|l| l.name == "X-WR-TIMEZONE")
+        .next()
         .and_then(|l| l.value.trim().parse::<Tz>().ok())
         .unwrap_or(Tz::UTC)
 }

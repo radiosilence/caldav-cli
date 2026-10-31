@@ -9,7 +9,8 @@
 pub mod ical;
 pub mod recur;
 
-use std::sync::{Arc, LazyLock};
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -160,6 +161,14 @@ pub struct CalDavClient {
     /// cache them for the client's life. Shared with every [`Self::limited`]
     /// view of the client.
     home: Arc<OnceCell<String>>,
+    /// The scheduling inbox, as the calendar listing names it. Cached and
+    /// shared like `home`: it does not move.
+    inbox: Arc<OnceCell<String>>,
+    /// Calendars, by href, whose server has refused a UID `prop-filter`, so
+    /// later lookups there go straight to the scan. Per calendar, because a
+    /// server may refuse it on one collection (a virtual birthday calendar, a
+    /// subscription) and honour it on the rest.
+    uid_filter_refused: Arc<Mutex<HashSet<String>>>,
     /// The permits this view's requests draw on, when it has a limit.
     in_flight: Option<Arc<Semaphore>>,
 }
@@ -185,6 +194,8 @@ impl CalDavClient {
             username,
             password,
             home: Arc::new(OnceCell::new()),
+            inbox: Arc::new(OnceCell::new()),
+            uid_filter_refused: Arc::default(),
             in_flight: None,
         }
     }
@@ -200,6 +211,8 @@ impl CalDavClient {
             username: self.username.clone(),
             password: self.password.clone(),
             home: self.home.clone(),
+            inbox: self.inbox.clone(),
+            uid_filter_refused: self.uid_filter_refused.clone(),
             in_flight: Some(Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS))),
         }
     }
@@ -386,16 +399,23 @@ impl CalDavClient {
                 Some(BODY.into()),
             )
             .await?;
-        let mut calendars = parse_calendars(&xml, home);
+        let doc = roxmltree::Document::parse(&xml)
+            .map_err(|e| Error::Server(format!("the calendar listing could not be read: {e}")))?;
+        let mut calendars = parse_calendars(&doc, home);
         calendars.sort_by_key(|c| c.name.to_lowercase());
+        if self.inbox.get().is_none()
+            && let Some(inbox) = parse_inbox_href(&doc, home)
+        {
+            let _ = self.inbox.set(inbox);
+        }
 
         // Servers disagree on where they'll answer this. Most volunteer it in
         // the listing above; RFC 6638 only requires it on the scheduling inbox.
         // Ask there when the free answer is missing — one extra round trip, and
         // only when needed.
-        let default = match parse_default_href(&xml) {
+        let default = match parse_default_href(&doc) {
             Some(href) => Some(href),
-            None => self.default_calendar_from_inbox(&xml, home).await,
+            None => self.default_calendar_from_inbox().await,
         };
         if let Some(href) = default {
             mark_default(&mut calendars, &href);
@@ -406,17 +426,17 @@ impl CalDavClient {
     /// Ask the scheduling inbox for the default calendar, the one place RFC
     /// 6638 requires it to live. Best-effort: an account with no scheduling
     /// support has no inbox, and a server may refuse the request outright.
-    async fn default_calendar_from_inbox(&self, listing: &str, home: &str) -> Option<String> {
+    async fn default_calendar_from_inbox(&self) -> Option<String> {
         const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
   <d:prop><c:schedule-default-calendar-URL/></d:prop>
 </d:propfind>"#;
 
-        let inbox = parse_inbox_href(listing, home)?;
+        let inbox = self.inbox.get()?;
         let xml = self
             .dav(
                 "PROPFIND",
-                &inbox,
+                inbox,
                 Some("0"),
                 "application/xml",
                 Some(BODY.into()),
@@ -424,7 +444,7 @@ impl CalDavClient {
             .await
             .inspect_err(|e| debug!(error = %e, "no default calendar from the scheduling inbox"))
             .ok()?;
-        parse_default_href(&xml)
+        parse_default_href(&roxmltree::Document::parse(&xml).ok()?)
     }
 
     /// Resolve a calendar by id, display name, or href. With no name, the
@@ -694,6 +714,9 @@ impl CalDavClient {
     /// The scheduling inbox collection (RFC 6638 §2.2.1), the one place the spec
     /// requires the default-calendar property to live.
     async fn scheduling_inbox(&self) -> Result<String> {
+        if let Some(inbox) = self.inbox.get() {
+            return Ok(inbox.clone());
+        }
         const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
   <d:prop><d:resourcetype/></d:prop>
@@ -709,13 +732,18 @@ impl CalDavClient {
                 Some(BODY.into()),
             )
             .await?;
-        parse_inbox_href(&xml, home).ok_or_else(|| {
-            Error::Server(
-                "this account has no scheduling inbox, so it has no default-calendar \
+        let inbox = roxmltree::Document::parse(&xml)
+            .ok()
+            .and_then(|doc| parse_inbox_href(&doc, home))
+            .ok_or_else(|| {
+                Error::Server(
+                    "this account has no scheduling inbox, so it has no default-calendar \
                  property to set"
-                    .into(),
-            )
-        })
+                        .into(),
+                )
+            })?;
+        let _ = self.inbox.set(inbox.clone());
+        Ok(inbox)
     }
 
     // ---- Reading events ----
@@ -930,6 +958,15 @@ impl CalDavClient {
             Err(e) => debug!(error = %e, "href guess failed, falling back to a UID query"),
         }
 
+        let refused = self
+            .uid_filter_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&calendar.href);
+        if refused {
+            return self.scan_for_uid(uid, calendar).await;
+        }
+
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
@@ -961,6 +998,10 @@ impl CalDavClient {
             // UID actually equals what was asked for.
             Ok(xml) => Ok(pick_uid(parse_event_responses(&xml, calendar), uid)),
             Err(Error::Dav { status, .. }) if refuses_uid_filter(status) => {
+                self.uid_filter_refused
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(calendar.href.clone());
                 tracing::warn!(
                     calendar = %calendar.name,
                     status,
@@ -2296,8 +2337,7 @@ fn pick_default(calendars: &[Calendar]) -> Option<&Calendar> {
 /// element, and a server echoes the property back empty in the 404 propstat of
 /// every collection that hasn't got it — so the first element carrying the name
 /// is not necessarily the one carrying the value.
-fn parse_default_href(xml: &str) -> Option<String> {
-    let doc = roxmltree::Document::parse(xml).ok()?;
+fn parse_default_href(doc: &roxmltree::Document) -> Option<String> {
     doc.descendants()
         .filter(|n| n.has_tag_name((CALDAV_NS, "schedule-default-calendar-URL")))
         .find_map(|n| {
@@ -2312,8 +2352,7 @@ fn parse_default_href(xml: &str) -> Option<String> {
 }
 
 /// The scheduling inbox collection, if this account has one.
-fn parse_inbox_href(xml: &str, home: &str) -> Option<String> {
-    let doc = roxmltree::Document::parse(xml).ok()?;
+fn parse_inbox_href(doc: &roxmltree::Document, home: &str) -> Option<String> {
     doc.descendants()
         .filter(|n| n.has_tag_name((DAV_NS, "response")))
         .find(|response| {
@@ -2350,10 +2389,7 @@ fn mark_default(calendars: &mut [Calendar], href: &str) {
     }
 }
 
-fn parse_calendars(xml: &str, home: &str) -> Vec<Calendar> {
-    let Ok(doc) = roxmltree::Document::parse(xml) else {
-        return Vec::new();
-    };
+fn parse_calendars(doc: &roxmltree::Document, home: &str) -> Vec<Calendar> {
     let home_path = util::href_path(home);
     let mut out = Vec::new();
 
@@ -2539,9 +2575,10 @@ mod tests {
     /// The same pipeline `list_calendars` runs: parse, sort, then flag the
     /// default the server named.
     fn parse_listing(xml: &str) -> Vec<Calendar> {
-        let mut c = parse_calendars(xml, "/1234/calendars/");
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let mut c = parse_calendars(&doc, "/1234/calendars/");
         c.sort_by_key(|c| c.name.to_lowercase());
-        if let Some(href) = parse_default_href(xml) {
+        if let Some(href) = parse_default_href(&doc) {
             mark_default(&mut c, &href);
         }
         c
@@ -2621,7 +2658,8 @@ mod tests {
     #[test]
     fn finds_the_scheduling_inbox_to_ask_when_the_listing_is_silent() {
         // Servers that only answer on the inbox: we must be able to find it.
-        let inbox = parse_inbox_href(CALENDARS_XML, "https://p42.example.com/1234/calendars/");
+        let doc = roxmltree::Document::parse(CALENDARS_XML).unwrap();
+        let inbox = parse_inbox_href(&doc, "https://p42.example.com/1234/calendars/");
         assert_eq!(
             inbox.as_deref(),
             Some("https://p42.example.com/1234/calendars/inbox/")
