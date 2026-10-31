@@ -787,6 +787,28 @@ async fn the_default_calendar_is_read_only_when_asked_for() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     assert_eq!(defaults, ["Team"]);
+
+    // "The default calendar" is the inbox's answer too, blank id or none.
+    let data = h
+        .run(r#"{ a: calendar { name } b: calendar(id: " ") { name } }"#)
+        .await;
+    assert_eq!(
+        (data["a"]["name"].as_str(), data["b"]["name"].as_str()),
+        (Some("Team"), Some("Team"))
+    );
+
+    // And it is what setting a new default reports as displaced.
+    Mock::given(method("PROPPATCH"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(""))
+        .mount(&h.server)
+        .await;
+    let data = h
+        .run(r#"mutation { setDefaultCalendar(id: "Home") { success previousDefault error } }"#)
+        .await;
+    assert_eq!(
+        data["setDefaultCalendar"]["previousDefault"], "Team",
+        "{data}"
+    );
 }
 
 #[tokio::test]

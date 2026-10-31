@@ -16,7 +16,7 @@ use super::connection::{
     load_windows, page_complexity, prepare_filter, read_targets, wants_events,
 };
 use super::filter::{EventFilter, EventSort};
-use super::loaders::{Calendars, DefaultCalendars, EventResources, Resource, to_gql_error};
+use super::loaders::{Calendars, EventResources, Resource, to_gql_error};
 use crate::caldav::recur;
 use crate::commands::RangeArgs;
 use crate::models::{Attendee, BusyPeriod, Calendar, Event, EventTime};
@@ -41,17 +41,42 @@ pub(crate) async fn all_calendars(ctx: &Context<'_>) -> Result<std::sync::Arc<Ve
         .ok_or_else(|| async_graphql::Error::new("Calendar listing unavailable"))
 }
 
+/// The request's calendar listing with the account's default flagged, filled
+/// the first time a field asks. A slot rather than a loader so it can be
+/// emptied when a mutation moves the default, and so it reads the listing in
+/// the same tick as every other field and shares its one fetch.
+#[derive(Default)]
+pub struct DefaultListing(tokio::sync::Mutex<Option<std::sync::Arc<Vec<Calendar>>>>);
+
+impl DefaultListing {
+    pub(crate) async fn forget(&self) {
+        *self.0.lock().await = None;
+    }
+}
+
 /// The listing with the account's default flagged, which may cost a second
-/// round trip. Only fields that need the default use this; the rest use
-/// [`all_calendars`].
+/// round trip when the listing does not name it. Only fields that need the
+/// default use this; the rest use [`all_calendars`].
 pub(crate) async fn calendars_with_default(
     ctx: &Context<'_>,
 ) -> Result<std::sync::Arc<Vec<Calendar>>> {
-    ctx.data::<DefaultCalendars>()?
-        .load_one(())
-        .await
-        .map_err(to_gql_error)?
-        .ok_or_else(|| async_graphql::Error::new("Calendar listing unavailable"))
+    let mut slot = ctx.data::<DefaultListing>()?.0.lock().await;
+    if let Some(calendars) = slot.as_ref() {
+        return Ok(calendars.clone());
+    }
+    let listing = all_calendars(ctx).await?;
+    let resolved = match listing.iter().any(|c| c.is_default) {
+        true => listing,
+        false => {
+            let mut calendars = (*listing).clone();
+            ctx.data::<super::SharedClient>()?
+                .resolve_default(&mut calendars)
+                .await;
+            std::sync::Arc::new(calendars)
+        }
+    };
+    *slot = Some(resolved.clone());
+    Ok(resolved)
 }
 
 // ============ Output Types ============
@@ -116,11 +141,22 @@ impl GqlViewer {
 }
 
 /// A calendar collection. Navigate into it with `events { ... }`.
-pub struct GqlCalendar(pub Calendar);
+///
+/// The flag records whether `is_default` is already known: true for a calendar
+/// read through a path that resolves the default (a mutation's result, the
+/// default lookup), false for one from the plain listing.
+pub struct GqlCalendar(pub Calendar, bool);
 
 impl From<Calendar> for GqlCalendar {
     fn from(c: Calendar) -> Self {
-        Self(c)
+        Self(c, false)
+    }
+}
+
+impl GqlCalendar {
+    /// A calendar whose `is_default` has already been resolved.
+    pub fn resolved(c: Calendar) -> Self {
+        Self(c, true)
     }
 }
 
@@ -162,8 +198,8 @@ impl GqlCalendar {
     /// The account's own default calendar, per the server. New events land here
     /// unless the user picked another one or `calendar` is given.
     async fn is_default(&self, ctx: &Context<'_>) -> Result<bool> {
-        if self.0.is_default {
-            return Ok(true);
+        if self.0.is_default || self.1 {
+            return Ok(self.0.is_default);
         }
         Ok(calendars_with_default(ctx)
             .await?
@@ -696,7 +732,7 @@ impl GqlCalendarResult {
     pub fn done(calendar: Calendar) -> Self {
         Self {
             success: true,
-            calendar: Some(calendar.into()),
+            calendar: Some(GqlCalendar::resolved(calendar)),
             preview: None,
             confirmation_token: None,
             previous_default: None,

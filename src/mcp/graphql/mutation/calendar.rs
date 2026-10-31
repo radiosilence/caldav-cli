@@ -232,7 +232,10 @@ impl CalendarMutation {
             .find(|c| c.is_default)
             .map(|c| c.name.clone());
 
-        match client.set_default_calendar(&id).await {
+        let moved = client.set_default_calendar(&id).await;
+        // Later fields in this request must see the new default.
+        ctx.data::<types::DefaultListing>()?.forget().await;
+        match moved {
             Ok(calendar) => Ok(GqlCalendarResult {
                 previous_default: previous,
                 ..GqlCalendarResult::done(calendar)

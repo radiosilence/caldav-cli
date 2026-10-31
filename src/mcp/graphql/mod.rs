@@ -89,7 +89,7 @@ pub fn request(
         .data(filter::FilterBudget::default())
         .data(DefaultCalendar(default_calendar))
         .data(loaders.calendar)
-        .data(loaders.default)
+        .data(types::DefaultListing::default())
         .data(loaders.window)
         .data(loaders.resource)
         .data(loaders.uid)
