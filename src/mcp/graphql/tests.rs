@@ -190,7 +190,7 @@ impl Harness {
     }
 
     fn client(&self) -> Arc<CalDavClient> {
-        Arc::new(CalDavClient::new(
+        Arc::new(CalDavClient::with_own_pool(
             self.server.uri(),
             "me@example.com".into(),
             "app-password".into(),
@@ -527,7 +527,7 @@ async fn overlapping_events_are_reported_as_conflicts() {
         .await;
 
     let schema = build_schema();
-    let client = Arc::new(CalDavClient::new(
+    let client = Arc::new(CalDavClient::with_own_pool(
         server.uri(),
         "me@example.com".into(),
         "app-password".into(),
@@ -1233,7 +1233,7 @@ const VIEWER: &str = "{ viewer { status username serverUrl principal detail } }"
 /// Asserts the whole point of the field as it goes: it answers, always.
 async fn viewer_of(server: &MockServer) -> Value {
     let schema = build_schema();
-    let client = Arc::new(CalDavClient::new(
+    let client = Arc::new(CalDavClient::with_own_pool(
         server.uri(),
         "me@example.com".into(),
         "app-password".into(),

@@ -1,0 +1,1 @@
+- **Tests that talk to a mock server no longer share a connection pool across runtimes.** Their clients each have their own pool, so a connection opened in one test's runtime is never handed to another, which failed CI with "dispatch task is gone" when a port was reused. Tests that never complete a connection still use the shared pool.
